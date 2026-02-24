@@ -1,0 +1,32 @@
+# WP-Guardian .gitignore
+# Secrets & runtime data — NEVER commit these
+wp-guardian.conf
+whitelist.conf
+tripwires.txt
+logfiles.txt
+CLAUDE.md
+
+# Runtime state
+state/
+logs/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# OS files
+.DS_Store
+*.swp
+*~
+Thumbs.db
+
+# Editor/IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Backups
+*.bak
+*.orig

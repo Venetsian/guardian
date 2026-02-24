@@ -1,0 +1,185 @@
+[general]
+# WP-Guardian Configuration
+# Copy this file to wp-guardian.conf and edit as needed.
+# IMPORTANT: wp-guardian.conf contains API tokens — keep chmod 600!
+
+# Run in dry-run mode (log actions but don't actually block)
+dry_run = false
+
+# Main log level: DEBUG, INFO, WARNING, ERROR
+log_level = INFO
+
+# Path to logfiles list (one access log path per line)
+# Use --discover-logs-save to auto-populate this file
+logfiles_list = /opt/wp-guardian/logfiles.txt
+
+# How often to run periodic tasks (cleanup, summary) in seconds
+periodic_interval = 60
+
+[thresholds]
+# Detection thresholds — hits within time_window triggers a block
+# Set to 0 to disable a specific check
+
+time_window = 300
+
+# Web module
+wp_login_threshold = 10
+xmlrpc_threshold = 5
+author_enum_threshold = 8
+php_404_threshold = 20
+general_404_threshold = 50
+
+# Login isolation — bots that ONLY hit wp-login.php without loading CSS
+# Threshold: how many wp-login.php requests with zero CSS loads = block
+login_isolation_threshold = 3
+# Detection window in seconds (how long to wait for a CSS load before deciding)
+login_isolation_window = 120
+# How long to keep tracking data (hours) — longer = better escalation for repeat offenders
+login_isolation_retention_hours = 48
+
+# SMTP module
+smtp_auth_fail_threshold = 5
+smtp_nonexistent_user_threshold = 3
+
+# IMAP/POP3 module
+imap_auth_fail_threshold = 5
+imap_nonexistent_user_threshold = 3
+
+# SSH module (most aggressive)
+ssh_fail_threshold = 3
+ssh_invalid_user_instant_block = true
+
+[escalation]
+# Tier 1: first offense
+tier1_duration = 24h
+
+# Tier 2: repeat offender (returns within tier2_lookback after tier1 expires)
+tier2_duration = 30d
+tier2_lookback = 7d
+
+# Tier 3: persistent threat
+tier3_permanent = true
+
+[cidr]
+# CIDR /24 aggregation — auto-block entire subnet when enough IPs are blocked
+enabled = true
+# How many unique blocked IPs in a /24 before blocking the whole range
+threshold = 5
+# Duration for CIDR blocks (30d recommended, 'permanent' for aggressive mode)
+duration = 30d
+
+[firewall]
+# Which firewall backend to use:
+#   csf       = ConfigServer Firewall (blocks on this server)
+#   firewalld = firewalld — default on RHEL/AlmaLinux/CyberPanel 2.4+
+#   nftables  = nftables directly (modern Linux without firewalld)
+#   mikrotik  = MikroTik RouterOS (blocks at network edge via SSH)
+#   pfsense   = pfSense (blocks at network edge via REST API)
+#   opnsense  = OPNsense (blocks at network edge via REST API)
+# See backends/README.md for adding custom backends
+backend = csf
+
+[mikrotik]
+# Only used when [firewall] backend = mikrotik
+host = 192.168.2.1
+port = 22
+user = guardian
+key_file = /root/.ssh/mikrotik_guardian
+
+# Address list names on MikroTik
+list_tier1 = wp-block-24h
+list_tier2 = wp-block-30d
+list_tier3 = wp-block-permanent
+list_cidr = wp-block-cidr
+
+# Existing friendly list to check (never block these)
+friendly_list = friendly
+
+[csf]
+# CSF-specific settings (currently uses defaults)
+# CSF reads its allow/deny lists from /etc/csf/
+
+[firewalld]
+# Only used when [firewall] backend = firewalld
+# zone: firewalld zone to add rules to (default: public)
+zone = public
+
+[nftables]
+# Only used when [firewall] backend = nftables
+# priority: chain priority (lower = evaluated earlier, default: -10)
+priority = -10
+
+[pfsense]
+# Used when [firewall] backend = pfsense or opnsense
+# host: IP or hostname of the firewall
+host = 192.168.1.1
+port = 443
+# API credentials (create in System > User Manager > API Keys)
+api_key =
+api_secret =
+# Platform: pfsense or opnsense (auto-detect if empty)
+platform =
+# SSL verification (set to true if using a valid cert)
+verify_ssl = false
+# Alias names on the firewall (must create these manually first)
+# Create a Host alias for individual IPs and a Network alias for CIDRs
+# Then add a firewall rule to block traffic from both aliases
+alias_name = wp_guardian_blocked
+alias_cidr = wp_guardian_cidr
+
+[whitelist]
+# Path to whitelist file (one IP or CIDR per line, # for comments)
+file = /opt/wp-guardian/whitelist.conf
+
+[geoip]
+# MaxMind GeoLite2 database (future feature)
+enabled = false
+database_path = /opt/wp-guardian/state/geoip/GeoLite2-City.mmdb
+
+# Learning mode duration (days) — alerts only, no geo-based blocking
+learning_days = 7
+
+# Baseline retention (days)
+baseline_retention = 90
+
+[telegram]
+# Telegram bot alerts — run --telegram-setup to configure
+enabled = false
+bot_token =
+chat_id =
+
+# Rate limiting
+max_alerts_per_minute = 10
+
+# Quiet hours (don't send low-priority alerts)
+# Format: HH:MM-HH:MM in server local time
+# quiet_hours = 23:00-07:00
+
+[auth_tracking]
+# How long a successful WordPress login grants "trusted" status (hours)
+wp_trust_duration = 24
+
+[log_paths]
+# Override auto-detected log paths if needed
+# mail_log = /var/log/maillog
+# secure_log = /var/log/secure
+
+[database]
+path = /opt/wp-guardian/state/guardian.db
+
+# Data retention
+auth_retention_days = 90
+ip_history_retention_days = 180
+
+[log_analysis]
+# Automated log discovery and tripwire analysis
+# When enabled, runs periodically inside the daemon
+
+# Auto-discover new access log files
+auto_discover = false
+discover_interval = 24h
+
+# Auto-run log analyzer and incrementally import new tripwires
+# IMPORTANT: This NEVER flushes old tripwires — only adds new ones
+auto_analyze = false
+interval = 24h

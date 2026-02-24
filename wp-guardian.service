@@ -1,0 +1,18 @@
+[Unit]
+Description=WP-Guardian Security Monitoring Daemon
+Documentation=https://github.com/wp-guardian
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/wp-guardian/wp-guardian.py
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wp-guardian
+WorkingDirectory=/opt/wp-guardian
+
+[Install]
+WantedBy=multi-user.target

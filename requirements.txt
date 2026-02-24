@@ -1,0 +1,11 @@
+# WP-Guardian Dependencies
+# Python 3.6+ required
+#
+# Only non-stdlib dependencies are listed here.
+# Everything else (sqlite3, subprocess, logging, threading, etc.) ships with Python.
+
+# HTTP client — used by Telegram alerts and pfSense/OPNsense backend
+requests>=2.18.0
+
+# Install:
+#   pip3 install -r requirements.txt --break-system-packages
