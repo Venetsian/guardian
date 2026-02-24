@@ -238,11 +238,78 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
             FIREWALL_BACKEND="mikrotik"
             echo ""
             print_step "MikroTik configuration:"
+            echo ""
             MK_HOST=$(ask "    Router IP" "192.168.2.1")
             MK_PORT=$(ask "    SSH port" "22")
             MK_USER=$(ask "    SSH user" "guardian")
-            MK_KEY=$(ask "    SSH key path" "/root/.ssh/mikrotik_guardian")
             MK_FRIENDLY=$(ask "    Friendly address list name" "friendly")
+
+            # --- SSH Key ---
+            echo ""
+            echo -e "    ${BOLD}SSH Key Setup${NC}"
+            echo "    WP-Guardian connects to MikroTik via SSH using key-based auth."
+            echo ""
+
+            # Check for existing keys
+            DEFAULT_KEY="/root/.ssh/mikrotik_guardian"
+            if [[ -f "$DEFAULT_KEY" ]]; then
+                echo "    Found existing key: ${DEFAULT_KEY}"
+                MK_KEY=$(ask "    SSH private key path" "$DEFAULT_KEY")
+            else
+                # Look for any existing SSH keys
+                EXISTING_KEYS=$(ls /root/.ssh/id_* 2>/dev/null | grep -v '\.pub$' || true)
+                if [[ -n "$EXISTING_KEYS" ]]; then
+                    echo "    Existing SSH keys found:"
+                    echo "$EXISTING_KEYS" | while read -r k; do
+                        echo "      - $k"
+                    done
+                    echo ""
+                fi
+
+                echo "    Options:"
+                echo "      1) Enter path to an existing SSH key"
+                echo "      2) Generate a new key pair for MikroTik"
+                echo ""
+                KEY_CHOICE=$(ask "    Choice" "1")
+
+                if [[ "$KEY_CHOICE" == "2" ]]; then
+                    MK_KEY="$DEFAULT_KEY"
+                    echo ""
+                    print_step "Generating SSH key pair..."
+                    ssh-keygen -t rsa -b 4096 -f "$MK_KEY" -N "" -q
+                    print_ok "Key generated: ${MK_KEY}"
+                    echo ""
+                    echo "    Now import the public key to MikroTik:"
+                    echo "      1. Copy ${MK_KEY}.pub to MikroTik (via WinBox or SCP)"
+                    echo "      2. In MikroTik, run:"
+                    echo "         /user ssh-keys import public-key-file=$(basename "${MK_KEY}").pub user=${MK_USER}"
+                    echo ""
+                    read -r -p "    Press Enter when done (or skip and do it later)..."
+                else
+                    MK_KEY=$(ask "    SSH private key path" "$DEFAULT_KEY")
+                fi
+            fi
+
+            # Verify key exists
+            if [[ ! -f "$MK_KEY" ]]; then
+                print_warn "Key file not found: ${MK_KEY}"
+                print_warn "Make sure to create it before starting WP-Guardian."
+            else
+                print_ok "SSH key found: ${MK_KEY}"
+
+                # Offer to test the connection
+                if ask_yn "    Test MikroTik connection now?" "y"; then
+                    echo ""
+                    print_step "Testing SSH to ${MK_USER}@${MK_HOST}:${MK_PORT}..."
+                    TEST_RESULT=$(ssh -i "$MK_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o "Port=${MK_PORT}" -o BatchMode=yes "${MK_USER}@${MK_HOST}" "/system identity print" 2>&1) && {
+                        print_ok "Connected! Router identity: ${TEST_RESULT}"
+                    } || {
+                        print_warn "Connection failed: ${TEST_RESULT}"
+                        print_warn "Check key, user, and MikroTik SSH settings."
+                        print_warn "You can fix this later in wp-guardian.conf"
+                    }
+                fi
+            fi
             ;;
         5)
             echo ""
@@ -382,19 +449,48 @@ else
 fi
 
 echo ""
-echo "  Add any additional IPs to always allow (comma-separated)."
-echo "  These are typically your own IP, office IPs, or monitoring services."
-EXTRA_IPS=$(ask "  Extra IPs to whitelist (or Enter to skip)" "")
+echo "  Add IPs or CIDR ranges that should never be blocked."
+echo "  These are typically your own IP, office IPs, VPN ranges, or monitoring services."
+echo ""
+echo "  You can enter:"
+echo "    - Single IPs:      203.0.113.50"
+echo "    - CIDR ranges:     10.0.0.0/24"
+echo "    - Multiple values:  203.0.113.50, 10.0.0.0/24, 192.168.1.100"
+echo ""
+echo "  Enter IPs/CIDRs (comma or space separated), or press Enter to skip."
+echo "  Type 'done' on an empty line to finish if entering multiple lines."
+echo ""
 
-if [[ -n "$EXTRA_IPS" ]]; then
-    IFS=',' read -ra IP_ARRAY <<< "$EXTRA_IPS"
-    for ip in "${IP_ARRAY[@]}"; do
+WHITELIST_COUNT=0
+while true; do
+    read -r -p "  > " EXTRA_IPS
+
+    # Empty line or 'done' = finished
+    if [[ -z "$EXTRA_IPS" || "$EXTRA_IPS" == "done" ]]; then
+        break
+    fi
+
+    # Split on commas, spaces, or both
+    for ip in $(echo "$EXTRA_IPS" | tr ',' ' '); do
         ip=$(echo "$ip" | tr -d ' ')
-        if [[ -n "$ip" ]]; then
+        if [[ -z "$ip" ]]; then
+            continue
+        fi
+
+        # Basic validation: looks like an IP or CIDR
+        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then
             echo "${ip}    # Added during install" >> "${INSTALL_DIR}/whitelist.conf"
+            WHITELIST_COUNT=$((WHITELIST_COUNT + 1))
+        else
+            print_warn "Skipped invalid entry: ${ip}"
         fi
     done
-    print_ok "Added ${#IP_ARRAY[@]} IP(s) to whitelist"
+
+    echo "  (Enter more, or press Enter to finish)"
+done
+
+if [[ "$WHITELIST_COUNT" -gt 0 ]]; then
+    print_ok "Added ${WHITELIST_COUNT} entry/entries to whitelist"
 fi
 
 # ===========================================================================
