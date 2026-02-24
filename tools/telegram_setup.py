@@ -42,22 +42,31 @@ def validate_token(token):
         return False, str(e)
 
 
-def poll_for_chat_id(token, timeout=120):
-    """
-    Poll getUpdates to find the chat_id from a user message.
-    The user should send any message to the bot while this runs.
-    """
+def clear_pending_updates(token):
+    """Clear any pending updates so we only see new messages."""
     url = f"https://api.telegram.org/bot{token}/getUpdates"
-
-    # First, clear old updates by getting the latest offset
     try:
         resp = requests.get(url, params={'limit': 1, 'offset': -1}, timeout=10)
         data = resp.json()
-        offset = 0
         if data.get('ok') and data.get('result'):
-            offset = data['result'][-1]['update_id'] + 1
+            # Acknowledge all existing updates by setting offset past the last one
+            last_id = data['result'][-1]['update_id']
+            requests.get(url, params={'offset': last_id + 1, 'limit': 0}, timeout=10)
+            return last_id + 1
     except Exception:
-        offset = 0
+        pass
+    return 0
+
+
+def poll_for_chat_id(token, initial_offset=0, timeout=120):
+    """
+    Poll getUpdates to find the chat_id from a user message.
+    The user should send any message to the bot while this runs.
+    Call clear_pending_updates() BEFORE asking the user to send a message,
+    then pass the returned offset here.
+    """
+    url = f"https://api.telegram.org/bot{token}/getUpdates"
+    offset = initial_offset
 
     start_time = time.time()
     print("\n  Waiting for your message...")
@@ -226,13 +235,20 @@ def telegram_setup_wizard(config_path=None):
     print()
     print("  STEP 2: Your Chat ID")
     print("  -" * 25)
+
+    # Clear any old updates BEFORE asking the user to send a message
+    # This prevents the race condition where the user's message gets
+    # cleared as an "old" update
+    print("  Preparing to listen for messages...")
+    initial_offset = clear_pending_updates(token)
+
     print(f"  Now send ANY message to your bot: @{bot_username}")
     print("  (Open Telegram, find your bot, and send 'hello' or anything)")
     print()
 
     proceed = _input("  Press Enter when you've sent a message to the bot...")
 
-    chat_info = poll_for_chat_id(token, timeout=120)
+    chat_info = poll_for_chat_id(token, initial_offset=initial_offset, timeout=120)
 
     if not chat_info:
         print("\n  Timed out waiting for a message.")
