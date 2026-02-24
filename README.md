@@ -7,7 +7,7 @@ WP-Guardian monitors web, SMTP, IMAP/POP3, and SSH logs, automatically blocks at
 ## Features
 
 - **Multi-service monitoring** — web access logs, mail (Postfix + Dovecot), SSH
-- **Pluggable firewall backends** — CSF (server-level) or MikroTik (network edge), extensible for other routers
+- **Pluggable firewall backends** — CSF, firewalld, nftables, MikroTik, pfSense/OPNsense
 - **Smart detection pipeline** — structural tripwires, known webshells, login isolation (CSS-based bot detection), brute force thresholds, PHP scanning detection, author enumeration, 404 storms
 - **Three-tier escalation** — 24h block, 30d block, permanent ban with automatic tier advancement
 - **CIDR /24 aggregation** — auto-blocks entire subnets when coordinated scanning is detected
@@ -15,12 +15,15 @@ WP-Guardian monitors web, SMTP, IMAP/POP3, and SSH logs, automatically blocks at
 - **Telegram alerts** — real-time notifications for every block, with daily summaries
 - **Automated tripwire discovery** — learns attack patterns from your access logs
 - **Auto log discovery** — finds and monitors new access logs automatically
+- **Update & rollback** — `git pull` + one command to update, with automatic backups
 
 ## Quick Start
 
+Clone directly to `/opt/wp-guardian` so that future updates work with `git pull`:
+
 ```bash
-git clone https://github.com/YOUR_USERNAME/wp-guardian.git
-cd wp-guardian
+sudo git clone https://github.com/Venetsian/guardian.git /opt/wp-guardian
+cd /opt/wp-guardian
 sudo bash install.sh
 ```
 
@@ -33,7 +36,7 @@ For detailed step-by-step instructions, see [INSTALL.md](INSTALL.md).
 ```
 Internet
     |
-[Firewall]  <-- WP-Guardian blocks here (CSF or MikroTik)
+[Firewall]  <-- WP-Guardian blocks here
     |
 [Your Server]
     |
@@ -54,7 +57,9 @@ python3 wp-guardian.py                           # Run daemon
 python3 wp-guardian.py --dry-run                 # Watch only, don't block
 systemctl start|stop|restart|status wp-guardian  # Service control
 
-# Status
+# Version & status
+python3 wp-guardian.py --version                 # App version
+python3 wp-guardian.py --db-version              # Schema version
 python3 wp-guardian.py --status                  # Overview
 python3 wp-guardian.py --history 1.2.3.4         # IP history
 python3 wp-guardian.py --test-backend            # Test firewall connectivity
@@ -79,6 +84,11 @@ python3 wp-guardian.py --telegram-test           # Send test message
 
 # Unblock
 python3 wp-guardian.py --unblock 1.2.3.4
+
+# Update
+cd /opt/wp-guardian && git pull && sudo bash update.sh
+sudo bash update.sh --rollback                   # Rollback last update
+bash update.sh --status                          # Show versions
 ```
 
 ## Detection Pipeline
@@ -107,15 +117,18 @@ WP-Guardian supports pluggable firewall backends. Choose one in `wp-guardian.con
 
 ```ini
 [firewall]
-backend = csf       # or: mikrotik
+backend = csf       # or: firewalld, nftables, mikrotik, pfsense, opnsense
 ```
 
 | Backend | Blocks At | Best For |
 |---------|-----------|----------|
 | CSF | Server (iptables) | Standalone servers with CSF installed |
+| firewalld | Server (rich rules) | RHEL/AlmaLinux, CyberPanel 2.4+ |
+| nftables | Server (nft sets) | Modern Linux, minimal setups |
 | MikroTik | Network edge (router) | Dedicated networks with MikroTik hardware |
+| pfSense / OPNsense | Network edge (appliance) | Networks with pfSense/OPNsense firewalls |
 
-See [backends/README.md](backends/README.md) for creating custom backends (nftables, pfSense, etc.).
+See [backends/README.md](backends/README.md) for creating custom backends.
 
 ## File Structure
 
@@ -123,6 +136,8 @@ See [backends/README.md](backends/README.md) for creating custom backends (nftab
 /opt/wp-guardian/
 ├── wp-guardian.py          # Main daemon + CLI
 ├── wp-guardian.conf        # Configuration (chmod 600!)
+├── VERSION                 # Application version
+├── update.sh               # Update with backup/rollback
 ├── whitelist.conf          # Never-block IPs
 ├── tripwires.txt           # Attack paths from log analysis
 ├── logfiles.txt            # Monitored access log paths
@@ -130,18 +145,24 @@ See [backends/README.md](backends/README.md) for creating custom backends (nftab
 │   ├── database.py         # SQLite data layer
 │   ├── config.py           # Config loader
 │   ├── whitelist.py        # Three-source whitelist manager
-│   └── blocker.py          # Block decision engine
+│   ├── blocker.py          # Block decision engine
+│   └── migrator.py         # Database migration runner
 ├── backends/
 │   ├── base.py             # Firewall backend interface (ABC)
-│   ├── factory.py          # Backend instantiation
+│   ├── factory.py          # Backend registry + instantiation
 │   ├── csf.py              # CSF backend
+│   ├── firewalld.py        # firewalld backend
+│   ├── nftables.py         # nftables backend
 │   ├── mikrotik.py         # MikroTik backend
+│   ├── pfsense.py          # pfSense / OPNsense backend
 │   └── README.md           # Backend developer guide
 ├── actions/
 │   └── telegram.py         # Telegram alerts
 ├── tools/
 │   ├── telegram_setup.py   # Interactive Telegram setup
 │   └── log-analyzer.sh     # Tripwire discovery
+├── migrations/
+│   └── *.sql               # Database migrations
 ├── state/
 │   └── guardian.db          # SQLite database
 └── logs/
@@ -155,7 +176,7 @@ See [backends/README.md](backends/README.md) for creating custom backends (nftab
 - SQLite3 (built into Python)
 - `requests` Python module (for Telegram alerts)
 - Root access
-- CSF or MikroTik router
+- One supported firewall (CSF, firewalld, nftables, MikroTik, or pfSense/OPNsense)
 
 ## License
 
@@ -165,8 +186,8 @@ MIT License. See [LICENSE](LICENSE).
 
 Contributions welcome! Areas where help is especially appreciated:
 
-- New firewall backends (nftables, iptables, UFW, pfSense, OPNsense)
 - Geographic anomaly detection (schema exists, implementation needed)
 - AbuseIPDB integration
 - Additional log format parsers (Apache, Nginx direct)
 - Testing on different Linux distributions
+- New firewall backends

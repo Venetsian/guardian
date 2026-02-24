@@ -280,45 +280,50 @@ if systemctl is-active --quiet wp-guardian 2>/dev/null; then
 fi
 
 # ===========================================================================
-# Step 3: Copy new files
+# Step 3: Copy new files (skip if source IS the install dir, e.g. git pull)
 # ===========================================================================
-print_step "Installing new files..."
+if [[ "$SOURCE_DIR" == "$INSTALL_DIR" ]]; then
+    print_ok "Running in-place (git pull) — skipping file copy"
+    chmod +x "${INSTALL_DIR}/wp-guardian.py"
+else
+    print_step "Installing new files..."
 
-# Main script
-cp "${SOURCE_DIR}/wp-guardian.py" "${INSTALL_DIR}/"
-chmod +x "${INSTALL_DIR}/wp-guardian.py"
+    # Main script
+    cp "${SOURCE_DIR}/wp-guardian.py" "${INSTALL_DIR}/"
+    chmod +x "${INSTALL_DIR}/wp-guardian.py"
 
-# VERSION file
-cp "${SOURCE_DIR}/VERSION" "${INSTALL_DIR}/" 2>/dev/null || true
+    # VERSION file
+    cp "${SOURCE_DIR}/VERSION" "${INSTALL_DIR}/" 2>/dev/null || true
 
-# Modules
-for dir in modules actions backends tools; do
-    if [[ -d "${SOURCE_DIR}/${dir}" ]]; then
-        mkdir -p "${INSTALL_DIR}/${dir}"
-        cp "${SOURCE_DIR}/${dir}/"*.py "${INSTALL_DIR}/${dir}/" 2>/dev/null || true
+    # Modules
+    for dir in modules actions backends tools; do
+        if [[ -d "${SOURCE_DIR}/${dir}" ]]; then
+            mkdir -p "${INSTALL_DIR}/${dir}"
+            cp "${SOURCE_DIR}/${dir}/"*.py "${INSTALL_DIR}/${dir}/" 2>/dev/null || true
+        fi
+    done
+
+    # Shell scripts in tools/
+    if [[ -d "${SOURCE_DIR}/tools" ]]; then
+        cp "${SOURCE_DIR}/tools/"*.sh "${INSTALL_DIR}/tools/" 2>/dev/null || true
+        chmod +x "${INSTALL_DIR}/tools/"*.sh 2>/dev/null || true
     fi
-done
 
-# Shell scripts in tools/
-if [[ -d "${SOURCE_DIR}/tools" ]]; then
-    cp "${SOURCE_DIR}/tools/"*.sh "${INSTALL_DIR}/tools/" 2>/dev/null || true
-    chmod +x "${INSTALL_DIR}/tools/"*.sh 2>/dev/null || true
+    # Migrations
+    if [[ -d "${SOURCE_DIR}/migrations" ]]; then
+        mkdir -p "${INSTALL_DIR}/migrations"
+        cp "${SOURCE_DIR}/migrations/"*.sql "${INSTALL_DIR}/migrations/" 2>/dev/null || true
+        cp "${SOURCE_DIR}/migrations/README.md" "${INSTALL_DIR}/migrations/" 2>/dev/null || true
+    fi
+
+    print_ok "Files updated"
 fi
 
-# Migrations
-if [[ -d "${SOURCE_DIR}/migrations" ]]; then
-    mkdir -p "${INSTALL_DIR}/migrations"
-    cp "${SOURCE_DIR}/migrations/"*.sql "${INSTALL_DIR}/migrations/" 2>/dev/null || true
-    cp "${SOURCE_DIR}/migrations/README.md" "${INSTALL_DIR}/migrations/" 2>/dev/null || true
-fi
-
-# Systemd service file
-if [[ -f "${SOURCE_DIR}/wp-guardian.service" ]]; then
-    cp "${SOURCE_DIR}/wp-guardian.service" /etc/systemd/system/
+# Systemd service file (always update — goes to /etc/systemd/system/)
+if [[ -f "${INSTALL_DIR}/wp-guardian.service" ]]; then
+    cp "${INSTALL_DIR}/wp-guardian.service" /etc/systemd/system/
     systemctl daemon-reload
 fi
-
-print_ok "Files updated"
 
 # ===========================================================================
 # Step 4: Run database migrations

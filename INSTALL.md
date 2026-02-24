@@ -9,7 +9,7 @@ Before installing, make sure you have:
 - **Linux server** (tested on AlmaLinux/CentOS/Rocky, should work on Ubuntu/Debian)
 - **Python 3.6+** with `sqlite3` module (included with most distributions)
 - **Root access** (the daemon monitors system logs)
-- **A firewall** — either CSF (ConfigServer Firewall) or a MikroTik router
+- **A firewall** — CSF, firewalld, nftables, MikroTik router, or pfSense/OPNsense
 - **WordPress sites** with access logs (OpenLiteSpeed, Apache, Nginx)
 
 Optional:
@@ -19,9 +19,11 @@ Optional:
 
 ## Quick Install
 
+Clone directly to `/opt/wp-guardian` so that future updates work with `git pull`:
+
 ```bash
-git clone https://github.com/YOUR_USERNAME/wp-guardian.git
-cd wp-guardian
+sudo git clone https://github.com/Venetsian/guardian.git /opt/wp-guardian
+cd /opt/wp-guardian
 sudo bash install.sh
 ```
 
@@ -31,20 +33,13 @@ The installer will walk you through configuration interactively. If you prefer m
 
 ## Detailed Installation
 
-### Step 1: Download
+### Step 1: Clone the Repository
+
+**Important:** Clone directly to `/opt/wp-guardian/` — this is the standard install path and enables easy updates via `git pull`.
 
 ```bash
-cd /root
-git clone https://github.com/YOUR_USERNAME/wp-guardian.git
-cd wp-guardian
-```
-
-Or download and extract:
-
-```bash
-wget https://github.com/YOUR_USERNAME/wp-guardian/archive/main.tar.gz
-tar xzf main.tar.gz
-cd wp-guardian-main
+sudo git clone https://github.com/Venetsian/guardian.git /opt/wp-guardian
+cd /opt/wp-guardian
 ```
 
 ### Step 2: Run the Installer
@@ -53,11 +48,11 @@ cd wp-guardian-main
 sudo bash install.sh
 ```
 
-The installer will:
+The installer detects that it's running from `/opt/wp-guardian` and skips file copying (the files are already in place from `git clone`). It will:
 
 1. Check Python version and dependencies
-2. Create `/opt/wp-guardian/` directory structure
-3. Ask which firewall backend to use (CSF or MikroTik)
+2. Create the directory structure (state, logs, etc.)
+3. Ask which firewall backend to use
 4. Offer to set up Telegram alerts
 5. Create a whitelist with your server IPs
 6. Discover access logs on your server
@@ -65,9 +60,9 @@ The installer will:
 
 ### Step 3: Choose Your Firewall Backend
 
-WP-Guardian supports two firewall backends. Choose one:
+WP-Guardian supports five firewall backends. Choose one during installation:
 
-#### Option A: CSF (ConfigServer Firewall)
+#### Option 1: CSF (ConfigServer Firewall)
 
 Best for standalone servers that already have CSF installed.
 
@@ -76,21 +71,44 @@ Best for standalone servers that already have CSF installed.
 - Supports CIDR /24 subnet blocking
 - No external hardware needed
 
-**CSF must be installed first:**
+**Note:** CSF reached end-of-life in August 2025. CyberPanel 2.4+ has switched to firewalld. If you're on a newer CyberPanel, use the firewalld backend instead.
 
 ```bash
 # Check if CSF is installed
 csf -v
-
-# If not, install it (CentOS/AlmaLinux):
-cd /usr/src
-wget https://download.configserver.com/csf.tgz
-tar xzf csf.tgz
-cd csf
-bash install.sh
 ```
 
-#### Option B: MikroTik Router
+#### Option 2: firewalld
+
+Default on RHEL/AlmaLinux/CentOS and CyberPanel 2.4+. If your server runs CyberPanel, this is likely what you have.
+
+- Uses `firewall-cmd` rich rules
+- Supports temporary and permanent blocks
+- Zone-configurable (default: `public`)
+
+```bash
+# Check if firewalld is running
+systemctl status firewalld
+
+# If not installed:
+yum install firewalld
+systemctl enable --now firewalld
+```
+
+#### Option 3: nftables (direct)
+
+Modern Linux packet filtering without a frontend. Good for minimal setups.
+
+- Creates a dedicated `wp_guardian` table with named sets
+- Uses element timeouts for automatic expiry
+- No additional software needed (nftables is built into modern kernels)
+
+```bash
+# Check if nft is available
+nft --version
+```
+
+#### Option 4: MikroTik Router
 
 Best for networks with a MikroTik router in front of the server. Blocks at the network edge before traffic reaches the server.
 
@@ -138,6 +156,24 @@ Best for networks with a MikroTik router in front of the server. Blocks at the n
    /ip firewall address-list add list=friendly address=YOUR_OFFICE_IP comment="Office"
    ```
 
+#### Option 5: pfSense / OPNsense
+
+For networks with a pfSense or OPNsense firewall appliance. Blocks at the network edge via REST API.
+
+- Auto-detects pfSense vs OPNsense
+- Uses firewall aliases for blocking
+- Requires API key and secret
+- You must create the block aliases and a firewall rule manually on the appliance before use
+
+**Setup:**
+
+1. Enable the REST API on your pfSense/OPNsense appliance
+2. Create an API key and secret
+3. Create two firewall aliases (e.g., `wp_guardian_blocked` and `wp_guardian_cidr`)
+4. Create a block rule that drops traffic from those aliases
+
+The installer will prompt for the API connection details.
+
 ---
 
 ## Step 4: Set Up Telegram Alerts (Recommended)
@@ -156,7 +192,7 @@ Telegram alerts let you know about blocked IPs, daily summaries, and system issu
 
 ### 4.2: Find Your Chat ID
 
-This is the trickiest part. WP-Guardian includes a setup wizard that does this for you:
+WP-Guardian includes a setup wizard that does this for you:
 
 ```bash
 python3 /opt/wp-guardian/wp-guardian.py --telegram-setup
@@ -261,6 +297,50 @@ python3 /opt/wp-guardian/wp-guardian.py --status
 
 ---
 
+## Updating
+
+Since WP-Guardian is installed via `git clone` to `/opt/wp-guardian`, updates are simple:
+
+```bash
+cd /opt/wp-guardian
+git pull
+sudo bash update.sh
+```
+
+The update script will:
+
+1. Create a timestamped backup (code + database)
+2. Stop the service if running
+3. Skip file copy (files are already updated by `git pull`)
+4. Run any pending database migrations
+5. Verify the installation
+6. Restart the service
+
+### Rollback
+
+If something goes wrong after an update:
+
+```bash
+sudo bash /opt/wp-guardian/update.sh --rollback
+```
+
+This restores both code files and the database from the latest backup.
+
+### Check Versions
+
+```bash
+# Show current and backup versions
+bash /opt/wp-guardian/update.sh --status
+
+# Show app version
+python3 /opt/wp-guardian/wp-guardian.py --version
+
+# Show database schema version
+python3 /opt/wp-guardian/wp-guardian.py --db-version
+```
+
+---
+
 ## Configuration Reference
 
 The config file is at `/opt/wp-guardian/wp-guardian.conf`. Key sections:
@@ -271,9 +351,12 @@ The config file is at `/opt/wp-guardian/wp-guardian.conf`. Key sections:
 | `[thresholds]` | Detection sensitivity for all modules |
 | `[escalation]` | Tier durations (24h, 30d, permanent) |
 | `[cidr]` | Subnet /24 auto-aggregation |
-| `[firewall]` | Which backend: `csf` or `mikrotik` |
+| `[firewall]` | Which backend to use |
 | `[mikrotik]` | MikroTik SSH connection details |
 | `[csf]` | CSF-specific settings |
+| `[firewalld]` | firewalld zone configuration |
+| `[nftables]` | nftables priority settings |
+| `[pfsense]` | pfSense/OPNsense API connection |
 | `[telegram]` | Bot token, chat ID, rate limits |
 | `[whitelist]` | Path to whitelist file |
 | `[auth_tracking]` | WordPress login trust duration |
@@ -292,7 +375,9 @@ python3 wp-guardian.py                     # Run live
 python3 wp-guardian.py --dry-run           # Watch only
 systemctl start|stop|restart wp-guardian   # Service control
 
-# Status & History
+# Version & Status
+python3 wp-guardian.py --version           # App version
+python3 wp-guardian.py --db-version        # Schema version
 python3 wp-guardian.py --status            # Current stats
 python3 wp-guardian.py --history IP        # IP block history
 python3 wp-guardian.py --test-backend      # Test firewall connectivity
@@ -318,6 +403,14 @@ python3 wp-guardian.py --telegram-test     # Send test message
 
 # Manual Unblock
 python3 wp-guardian.py --unblock IP
+
+# Database
+python3 wp-guardian.py --migrate           # Run pending migrations
+
+# Update
+cd /opt/wp-guardian && git pull && sudo bash update.sh
+sudo bash update.sh --rollback             # Rollback last update
+bash update.sh --status                    # Show versions
 ```
 
 ---
@@ -327,7 +420,10 @@ python3 wp-guardian.py --unblock IP
 **"Firewall backend failed to initialize"**
 
 - CSF: Make sure `csf` command is available (`which csf`). Install CSF if needed.
+- firewalld: Check that it's running (`systemctl status firewalld`).
+- nftables: Check that `nft` is available (`nft --version`).
 - MikroTik: Test SSH manually: `ssh -i /root/.ssh/mikrotik_guardian guardian@192.168.2.1 "/system identity print"`
+- pfSense/OPNsense: Verify API connectivity and credentials.
 
 **"No access logs found"**
 
@@ -355,18 +451,6 @@ python3 wp-guardian.py --unblock IP
 
 ---
 
-## Upgrading
-
-```bash
-cd /path/to/wp-guardian-source
-git pull
-sudo bash install.sh
-# The installer preserves your existing config
-systemctl restart wp-guardian
-```
-
----
-
 ## Adding a New Firewall Backend
 
-See `backends/README.md` for instructions on creating custom backends for other firewalls and routers (nftables, iptables, pfSense, etc.).
+See `backends/README.md` for instructions on creating custom backends.

@@ -112,43 +112,49 @@ print_step "Creating directories..."
 mkdir -p "${INSTALL_DIR}"/{modules,actions,backends,state,logs,tools,state/geoip}
 
 # ===========================================================================
-# Copy files
+# Copy files (skip if running from the install directory, e.g. git clone)
 # ===========================================================================
-print_step "Installing files..."
-cp "${SCRIPT_DIR}/wp-guardian.py" "${INSTALL_DIR}/"
-cp "${SCRIPT_DIR}/modules/"*.py "${INSTALL_DIR}/modules/"
-cp "${SCRIPT_DIR}/actions/"*.py "${INSTALL_DIR}/actions/"
-cp "${SCRIPT_DIR}/backends/"*.py "${INSTALL_DIR}/backends/"
+GIT_INSTALL=false
+if [[ "$SCRIPT_DIR" == "$INSTALL_DIR" ]]; then
+    GIT_INSTALL=true
+    print_ok "Running from ${INSTALL_DIR} (git clone) — skipping file copy"
+else
+    print_step "Installing files..."
+    cp "${SCRIPT_DIR}/wp-guardian.py" "${INSTALL_DIR}/"
+    cp "${SCRIPT_DIR}/modules/"*.py "${INSTALL_DIR}/modules/"
+    cp "${SCRIPT_DIR}/actions/"*.py "${INSTALL_DIR}/actions/"
+    cp "${SCRIPT_DIR}/backends/"*.py "${INSTALL_DIR}/backends/"
 
-# Copy VERSION file
-if [[ -f "${SCRIPT_DIR}/VERSION" ]]; then
-    cp "${SCRIPT_DIR}/VERSION" "${INSTALL_DIR}/"
-fi
+    # Copy VERSION file
+    if [[ -f "${SCRIPT_DIR}/VERSION" ]]; then
+        cp "${SCRIPT_DIR}/VERSION" "${INSTALL_DIR}/"
+    fi
 
-# Copy migrations
-if [[ -d "${SCRIPT_DIR}/migrations" ]]; then
-    mkdir -p "${INSTALL_DIR}/migrations"
-    cp "${SCRIPT_DIR}/migrations/"*.sql "${INSTALL_DIR}/migrations/" 2>/dev/null || true
-    cp "${SCRIPT_DIR}/migrations/README.md" "${INSTALL_DIR}/migrations/" 2>/dev/null || true
-fi
+    # Copy migrations
+    if [[ -d "${SCRIPT_DIR}/migrations" ]]; then
+        mkdir -p "${INSTALL_DIR}/migrations"
+        cp "${SCRIPT_DIR}/migrations/"*.sql "${INSTALL_DIR}/migrations/" 2>/dev/null || true
+        cp "${SCRIPT_DIR}/migrations/README.md" "${INSTALL_DIR}/migrations/" 2>/dev/null || true
+    fi
 
-# Copy update script
-if [[ -f "${SCRIPT_DIR}/update.sh" ]]; then
-    cp "${SCRIPT_DIR}/update.sh" "${INSTALL_DIR}/"
-    chmod +x "${INSTALL_DIR}/update.sh"
-fi
+    # Copy update script
+    if [[ -f "${SCRIPT_DIR}/update.sh" ]]; then
+        cp "${SCRIPT_DIR}/update.sh" "${INSTALL_DIR}/"
+        chmod +x "${INSTALL_DIR}/update.sh"
+    fi
 
-# Copy tools
-if [[ -d "${SCRIPT_DIR}/tools" ]]; then
-    cp "${SCRIPT_DIR}/tools/"*.py "${INSTALL_DIR}/tools/" 2>/dev/null || true
-fi
-if [[ -f "${SCRIPT_DIR}/log-analyzer.sh" ]]; then
-    cp "${SCRIPT_DIR}/log-analyzer.sh" "${INSTALL_DIR}/tools/"
-    chmod +x "${INSTALL_DIR}/tools/log-analyzer.sh"
-fi
-if [[ -f "${SCRIPT_DIR}/tools/log-analyzer.sh" ]]; then
-    cp "${SCRIPT_DIR}/tools/log-analyzer.sh" "${INSTALL_DIR}/tools/"
-    chmod +x "${INSTALL_DIR}/tools/log-analyzer.sh"
+    # Copy tools
+    if [[ -d "${SCRIPT_DIR}/tools" ]]; then
+        cp "${SCRIPT_DIR}/tools/"*.py "${INSTALL_DIR}/tools/" 2>/dev/null || true
+    fi
+    if [[ -f "${SCRIPT_DIR}/log-analyzer.sh" ]]; then
+        cp "${SCRIPT_DIR}/log-analyzer.sh" "${INSTALL_DIR}/tools/"
+        chmod +x "${INSTALL_DIR}/tools/log-analyzer.sh"
+    fi
+    if [[ -f "${SCRIPT_DIR}/tools/log-analyzer.sh" ]]; then
+        cp "${SCRIPT_DIR}/tools/log-analyzer.sh" "${INSTALL_DIR}/tools/"
+        chmod +x "${INSTALL_DIR}/tools/log-analyzer.sh"
+    fi
 fi
 
 # Make main script executable
@@ -291,10 +297,10 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
     # --- Generate config ---
     print_step "Generating wp-guardian.conf..."
 
-    if [[ -f "${SCRIPT_DIR}/wp-guardian.conf.example" ]]; then
+    if [[ -f "${INSTALL_DIR}/wp-guardian.conf.example" ]]; then
+        cp "${INSTALL_DIR}/wp-guardian.conf.example" "${INSTALL_DIR}/wp-guardian.conf"
+    elif [[ -f "${SCRIPT_DIR}/wp-guardian.conf.example" ]]; then
         cp "${SCRIPT_DIR}/wp-guardian.conf.example" "${INSTALL_DIR}/wp-guardian.conf"
-    elif [[ -f "${SCRIPT_DIR}/wp-guardian.conf" ]]; then
-        cp "${SCRIPT_DIR}/wp-guardian.conf" "${INSTALL_DIR}/wp-guardian.conf"
     fi
 
     # Update config with user's choices
@@ -423,12 +429,16 @@ chmod 700 "${INSTALL_DIR}"
 # Systemd service
 # ===========================================================================
 print_step "Installing systemd service..."
-if [[ -f "${SCRIPT_DIR}/wp-guardian.service" ]]; then
+if [[ -f "${INSTALL_DIR}/wp-guardian.service" ]]; then
+    cp "${INSTALL_DIR}/wp-guardian.service" /etc/systemd/system/
+    systemctl daemon-reload
+    print_ok "Service installed"
+elif [[ -f "${SCRIPT_DIR}/wp-guardian.service" ]]; then
     cp "${SCRIPT_DIR}/wp-guardian.service" /etc/systemd/system/
     systemctl daemon-reload
     print_ok "Service installed"
 else
-    print_warn "wp-guardian.service not found in source directory"
+    print_warn "wp-guardian.service not found"
 fi
 
 # ===========================================================================
@@ -466,5 +476,9 @@ echo "    6. View live logs:"
 echo "       journalctl -u wp-guardian -f"
 echo ""
 echo "  To update in the future:"
+if [[ "$GIT_INSTALL" == "true" ]]; then
+echo "    cd ${INSTALL_DIR} && git pull && sudo bash update.sh"
+else
 echo "    cd /path/to/new-source && sudo bash update.sh"
+fi
 echo ""
