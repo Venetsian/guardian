@@ -1,5 +1,40 @@
 # WP-Guardian Changelog
 
+## v1.1.0 — Telegram Interactive Commands (2026-02-25)
+
+### New Feature: Telegram Command Handler
+
+WP-Guardian can now receive commands via Telegram, not just send alerts. A new polling thread uses the Telegram `getUpdates` API with long-polling — no webhooks, no open ports.
+
+**Available commands:**
+
+- `/status` — current block counts by tier, IPs tracked, auth sessions, tripwires
+- `/unblock <ip>` — remove block and reset tier to 0
+- `/whitelist <ip>` — add IP to whitelist permanently
+- `/whitelist <ip> <duration>` — add temporarily (e.g., `24h`, `7d`, `30d`)
+- `/whitelist remove <ip>` — remove from whitelist
+- `/whitelist list` — show all entries with expiry info
+- `/history <ip>` — full IP history with recent block log
+- `/help` — list available commands
+
+**Security:** Only messages from the configured `chat_id` are processed. All other messages are silently ignored.
+
+**Configuration:**
+
+```ini
+[telegram]
+commands_enabled = true
+commands_poll_timeout = 30
+```
+
+### Files Changed
+
+- **Added** `actions/telegram_commands.py` — `TelegramCommander` class
+- **Modified** `wp-guardian.py` — wired command handler into daemon lifecycle (init, start, shutdown)
+- **Modified** `wp-guardian.conf` — added `commands_enabled` and `commands_poll_timeout` options
+
+---
+
 ## v1.0.0 — Initial Public Release (2026-02-24)
 
 ### Core Features

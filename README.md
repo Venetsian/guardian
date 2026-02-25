@@ -13,6 +13,7 @@ WP-Guardian monitors web, SMTP, IMAP/POP3, and SSH logs, automatically blocks at
 - **CIDR /24 aggregation** — auto-blocks entire subnets when coordinated scanning is detected
 - **Authenticated user protection** — WordPress-logged-in users are never auto-blocked
 - **Telegram alerts** — real-time notifications for every block, with daily summaries
+- **Telegram commands** — manage blocks and whitelists remotely via Telegram chat (`/status`, `/unblock`, `/whitelist`, `/history`)
 - **Automated tripwire discovery** — learns attack patterns from your access logs
 - **Auto log discovery** — finds and monitors new access logs automatically
 - **Update & rollback** — `git pull` + one command to update, with automatic backups
@@ -91,6 +92,31 @@ sudo bash update.sh --rollback                   # Rollback last update
 bash update.sh --status                          # Show versions
 ```
 
+## Telegram Commands
+
+When `commands_enabled = true` in your `[telegram]` config, WP-Guardian polls for incoming Telegram messages and responds to commands. No webhooks or open ports needed — it uses Telegram's `getUpdates` long-polling.
+
+**Security:** Only messages from the configured `chat_id` are processed. All other messages are silently ignored.
+
+```
+/status                      — block counts, IPs tracked, auth sessions, tripwires
+/unblock <ip>                — remove block and reset tier
+/whitelist <ip>              — add permanently
+/whitelist <ip> <duration>   — add temporarily (24h, 7d, 30d)
+/whitelist remove <ip>       — remove from whitelist
+/whitelist list              — show all entries
+/history <ip>                — full IP history with recent blocks
+/help                        — list commands
+```
+
+Enable in `wp-guardian.conf`:
+
+```ini
+[telegram]
+commands_enabled = true
+commands_poll_timeout = 30    # long-poll timeout in seconds
+```
+
 ## Detection Pipeline
 
 Each web access log line goes through these checks in order (first match wins):
@@ -157,7 +183,8 @@ See [backends/README.md](backends/README.md) for creating custom backends.
 │   ├── pfsense.py          # pfSense / OPNsense backend
 │   └── README.md           # Backend developer guide
 ├── actions/
-│   └── telegram.py         # Telegram alerts
+│   ├── telegram.py         # Telegram alerts
+│   └── telegram_commands.py # Telegram command handler
 ├── tools/
 │   ├── telegram_setup.py   # Interactive Telegram setup
 │   └── log-analyzer.sh     # Tripwire discovery

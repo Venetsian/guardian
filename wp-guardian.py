@@ -25,6 +25,7 @@ from modules.whitelist import WhitelistManager
 from modules.blocker import Blocker
 from backends.factory import create_backend
 from actions.telegram import TelegramAlerter
+from actions.telegram_commands import TelegramCommander
 
 
 def get_version(base_dir=None):
@@ -594,6 +595,9 @@ class Guardian:
         # Initialize blocker
         self.blocker = Blocker(self.config, self.db, self.whitelist, self.firewall, self.telegram)
 
+        # Initialize Telegram command handler
+        self.telegram_cmd = TelegramCommander(self.config, self.db, self.blocker, self.whitelist)
+
         # Load tripwires
         tripwire_file = os.path.join(self.base_dir, 'tripwires.txt')
         self.tripwires = load_tripwire_file(tripwire_file)
@@ -611,6 +615,7 @@ class Guardian:
         self.logger.info(f"Dry-run mode: {dry_run}")
         self.logger.info(f"Firewall backend: {backend_type}")
         self.logger.info(f"Telegram: {'enabled' if self.telegram.enabled else 'disabled'}")
+        self.logger.info(f"Telegram commands: {'enabled' if self.telegram_cmd.enabled else 'disabled'}")
         self.logger.info(f"Whitelist entries: {len(file_ips)}")
         self.logger.info(f"Tripwires: {len(self.tripwires)}")
 
@@ -670,6 +675,9 @@ class Guardian:
             self.logger.warning(f"Secure log not found: {secure_log}")
 
         self.logger.info(f"Guardian running with {len(self.tailers)} log tailer(s)")
+
+        # Start Telegram command handler (polling thread)
+        self.telegram_cmd.start()
 
         # Periodic task settings
         last_cleanup = 0
@@ -820,6 +828,9 @@ class Guardian:
 
         self.logger.info("WP-Guardian shutting down...")
         self.running = False
+
+        # Stop Telegram command polling
+        self.telegram_cmd.stop()
 
         for tailer in self.tailers:
             tailer.stop()
