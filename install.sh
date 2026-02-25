@@ -359,6 +359,16 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
             TELEGRAM_TOKEN=$(ask "    Bot token (or press Enter to skip)" "")
             TELEGRAM_CHAT_ID=$(ask "    Chat ID (or press Enter to skip)" "")
         fi
+
+        echo ""
+        echo "  Telegram commands let you manage WP-Guardian from your chat:"
+        echo "    /status, /unblock, /whitelist, /history, /help"
+        echo "  Only messages from your chat_id are processed."
+        echo ""
+        TELEGRAM_COMMANDS="false"
+        if ask_yn "  Enable Telegram commands?" "y"; then
+            TELEGRAM_COMMANDS="true"
+        fi
     fi
 
     # --- Generate config ---
@@ -404,6 +414,9 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
     fi
     if [[ "$TELEGRAM_ENABLED" == "true" ]]; then
         sed -i "/^\[telegram\]/,/^\[/ s|^enabled = .*|enabled = true|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+    fi
+    if [[ "${TELEGRAM_COMMANDS:-false}" == "true" ]]; then
+        sed -i "/^\[telegram\]/,/^\[/ s|^commands_enabled = .*|commands_enabled = true|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
     fi
 
     print_ok "Config generated"

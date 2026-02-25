@@ -151,6 +151,13 @@ chat_id =
 # Rate limiting
 max_alerts_per_minute = 10
 
+# Interactive commands via Telegram (receive commands, not just send alerts)
+# Requires bot_token and chat_id to be configured
+# SECURITY: Only messages from the configured chat_id are processed
+commands_enabled = false
+# Long-poll timeout in seconds (how long to wait for new messages)
+commands_poll_timeout = 30
+
 # Quiet hours (don't send low-priority alerts)
 # Format: HH:MM-HH:MM in server local time
 # quiet_hours = 23:00-07:00
