@@ -90,6 +90,9 @@ python3 wp-guardian.py --unblock 1.2.3.4
 cd /opt/wp-guardian && git pull && sudo bash update.sh
 sudo bash update.sh --rollback                   # Rollback last update
 bash update.sh --status                          # Show versions
+
+# If git pull fails with "local changes would be overwritten"
+cd /opt/wp-guardian && git checkout -- . && git pull && sudo bash update.sh
 ```
 
 ## Telegram Commands

@@ -284,13 +284,16 @@ fi
 # ===========================================================================
 if [[ "$SOURCE_DIR" == "$INSTALL_DIR" ]]; then
     print_ok "Running in-place (git pull) — skipping file copy"
-    chmod +x "${INSTALL_DIR}/wp-guardian.py"
+
+    # Prevent filemode changes from blocking future git pulls
+    if [[ -d "${INSTALL_DIR}/.git" ]]; then
+        git -C "${INSTALL_DIR}" config core.fileMode false
+    fi
 else
     print_step "Installing new files..."
 
     # Main script
     cp "${SOURCE_DIR}/wp-guardian.py" "${INSTALL_DIR}/"
-    chmod +x "${INSTALL_DIR}/wp-guardian.py"
 
     # VERSION file
     cp "${SOURCE_DIR}/VERSION" "${INSTALL_DIR}/" 2>/dev/null || true
