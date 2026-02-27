@@ -5,6 +5,7 @@ Uses getUpdates long-polling — no webhooks, no open ports.
 """
 
 import logging
+import os
 import time
 import re
 import threading
@@ -27,7 +28,7 @@ class TelegramCommander:
     All other messages are silently ignored.
     """
 
-    def __init__(self, config, db, blocker, whitelist):
+    def __init__(self, config, db, blocker, whitelist, tripwires=None, base_dir=None):
         self.enabled = config.getboolean('telegram', 'commands_enabled', fallback=False)
         self.bot_token = config.get('telegram', 'bot_token', fallback='')
         self.chat_id = config.get('telegram', 'chat_id', fallback='')
@@ -36,6 +37,8 @@ class TelegramCommander:
         self.db = db
         self.blocker = blocker
         self.whitelist = whitelist
+        self.tripwires = tripwires  # Shared set reference from Guardian
+        self.base_dir = base_dir or '/opt/wp-guardian'
 
         self.running = False
         self._thread = None
@@ -193,6 +196,8 @@ class TelegramCommander:
             '/unblock': self._cmd_unblock,
             '/whitelist': self._cmd_whitelist,
             '/history': self._cmd_history,
+            '/tripwires': self._cmd_tripwires,
+            '/remove': self._cmd_remove,
             '/help': self._cmd_help,
         }
 
@@ -441,6 +446,117 @@ class TelegramCommander:
 
         self._reply(msg)
 
+    def _cmd_tripwires(self, args):
+        """Handle /tripwires [search] command."""
+        total = self.db.count_tripwires()
+
+        if not args:
+            # No search term — show summary + top 10
+            top = self.db.search_tripwires(pattern=None, limit=10)
+            lines = [
+                "<b>Active Tripwires</b> ({total} total)".format(total=total),
+                "━━━━━━━━━━━━━━━━━━━━━",
+                "<b>Top 10 by hits:</b>"
+            ]
+            for t in top:
+                lines.append("<code>{path}</code> ({hits} hits)".format(
+                    path=t['path'], hits=t['hit_count']
+                ))
+            lines.append("")
+            lines.append("Search: /tripwires &lt;term&gt;")
+            self._reply('\n'.join(lines))
+            return
+
+        # Search by pattern
+        search = ' '.join(args).strip()
+        results = self.db.search_tripwires(pattern=search, limit=30)
+
+        if not results:
+            self._reply(
+                "No tripwires matching \"{search}\" (of {total} total).".format(
+                    search=search, total=total
+                )
+            )
+            return
+
+        lines = [
+            "<b>Tripwires matching \"{search}\"</b> ({count}/{total})".format(
+                search=search, count=len(results), total=total
+            ),
+            "━━━━━━━━━━━━━━━━━━━━━"
+        ]
+        for t in results:
+            lines.append("<code>{path}</code> ({hits} hits)".format(
+                path=t['path'], hits=t['hit_count']
+            ))
+
+        if len(results) == 30:
+            lines.append("\n(showing first 30 results)")
+
+        self._reply('\n'.join(lines))
+
+    def _cmd_remove(self, args):
+        """Handle /remove <path> — remove a tripwire from DB, memory, and file."""
+        if not args:
+            self._reply(
+                "Usage: /remove &lt;path&gt;\n"
+                "Example: /remove /old-plugin.php\n\n"
+                "Removes a tripwire from database, memory, and tripwires.txt."
+            )
+            return
+
+        path = ' '.join(args).strip().lower()
+
+        # Validate: must look like a PHP path
+        if not path.endswith('.php'):
+            self._reply("Invalid path: tripwires are PHP files only (must end with .php)")
+            return
+
+        if not path.startswith('/'):
+            path = '/' + path
+
+        # Remove from database
+        removed_from_db = self.db.remove_tripwire(path)
+
+        # Remove from tripwires.txt file
+        removed_from_file = False
+        tripwire_file = os.path.join(self.base_dir, 'tripwires.txt')
+        try:
+            if os.path.exists(tripwire_file):
+                with open(tripwire_file, 'r') as f:
+                    lines = f.readlines()
+                new_lines = [line for line in lines if line.strip().lower() != path]
+                if len(new_lines) < len(lines):
+                    with open(tripwire_file, 'w') as f:
+                        f.writelines(new_lines)
+                    removed_from_file = True
+        except Exception as e:
+            logger.error(f"Failed to update tripwires.txt: {e}")
+
+        # Remove from in-memory set
+        removed_from_memory = False
+        if self.tripwires is not None and path in self.tripwires:
+            self.tripwires.discard(path)
+            removed_from_memory = True
+
+        if removed_from_db or removed_from_file or removed_from_memory:
+            sources = []
+            if removed_from_db:
+                sources.append("database")
+            if removed_from_file:
+                sources.append("tripwires.txt")
+            if removed_from_memory:
+                sources.append("memory")
+            self._reply(
+                "Removed tripwire <code>{path}</code>\n"
+                "From: {sources}".format(path=path, sources=', '.join(sources))
+            )
+        else:
+            self._reply(
+                "Tripwire not found: <code>{path}</code>\n"
+                "Use /tripwires &lt;search&gt; to find tripwires.".format(path=path)
+            )
+
     def _cmd_help(self, args):
         """Handle /help command."""
         msg = (
@@ -452,6 +568,8 @@ class TelegramCommander:
             "/whitelist remove &lt;ip&gt; — remove from whitelist\n"
             "/whitelist list — show all entries\n"
             "/history &lt;ip&gt; — full IP history\n"
+            "/tripwires [search] — list/search tripwires\n"
+            "/remove &lt;path&gt; — remove a tripwire\n"
             "/help — this message"
         )
         self._reply(msg)

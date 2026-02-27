@@ -186,7 +186,5 @@ ip_history_retention_days = 180
 auto_discover = false
 discover_interval = 24h
 
-# Auto-run log analyzer and incrementally import new tripwires
-# IMPORTANT: This NEVER flushes old tripwires — only adds new ones
-auto_analyze = false
-interval = 24h
+# Auto-analysis removed — use --analyze-tripwires for manual review
+# See: python3 wp-guardian.py --analyze-tripwires

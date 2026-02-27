@@ -71,7 +71,11 @@ python3 wp-guardian.py --whitelist-add 1.2.3.4
 python3 wp-guardian.py --whitelist-remove 1.2.3.4
 
 # Tripwires
-python3 wp-guardian.py --auto-analyze                        # Auto-discover + import
+python3 wp-guardian.py --analyze-tripwires                   # Discover NEW candidates (manual review)
+python3 wp-guardian.py --list-tripwires                      # Show top tripwires by hits
+python3 wp-guardian.py --list-tripwires admin                # Search tripwires by pattern
+python3 wp-guardian.py --remove-tripwire /path.php           # Remove a single tripwire
+python3 wp-guardian.py --import-tripwires FILE               # Full import from file
 python3 wp-guardian.py --import-tripwires-incremental FILE   # Add new only
 python3 wp-guardian.py --flush tripwires                     # Clear all
 
@@ -109,6 +113,8 @@ When `commands_enabled = true` in your `[telegram]` config, WP-Guardian polls fo
 /whitelist remove <ip>       — remove from whitelist
 /whitelist list              — show all entries
 /history <ip>                — full IP history with recent blocks
+/tripwires [search]          — list/search active tripwires
+/remove <path>               — remove a tripwire path
 /help                        — list commands
 ```
 

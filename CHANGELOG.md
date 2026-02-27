@@ -1,5 +1,33 @@
 # WP-Guardian Changelog
 
+## v1.3.0 — Tripwire Management (2026-02-28)
+
+### Tripwire Removal & Manual Review
+
+Replaced automatic tripwire importing with a manual-review workflow to prevent false positives. Added dynamic tripwire removal via CLI and Telegram.
+
+**1. Replaced `--auto-analyze` with `--analyze-tripwires`**
+- Old behavior: ran log analyzer and auto-imported results without review
+- New behavior: runs log analyzer, filters against existing tripwires, shows only NEW candidates
+- Saves new candidates to `state/new-tripwires.txt` for review before manual import
+- Removed periodic auto-analysis from the daemon main loop
+- Removed `auto_analyze` and `interval` config options from `[log_analysis]`
+
+**2. Dynamic tripwire removal**
+- New CLI: `--remove-tripwire /path.php` — removes from database, `tripwires.txt`, and memory
+- New CLI: `--list-tripwires [pattern]` — search/list tripwires by pattern with hit counts
+- New database methods: `remove_tripwire()`, `search_tripwires()`, `count_tripwires()`
+
+**3. Telegram commands for tripwire management**
+- `/tripwires` — shows total count + top 10 by hits
+- `/tripwires <search>` — searches paths containing the term (max 30 results)
+- `/remove <path>` — removes a tripwire from database, file, and memory
+- TelegramCommander now receives shared tripwires set for live memory updates
+
+**Files changed:** `wp-guardian.py`, `modules/database.py`, `actions/telegram_commands.py`, `wp-guardian.conf`, `wp-guardian.conf.example`, `install.sh`, `README.md`, `INSTALL.md`, `CLAUDE.md`, `CHANGELOG.md`, `VERSION`
+
+---
+
 ## v1.2.0 — Whitelist Protection Improvements (2026-02-27)
 
 ### Whitelist Defense-in-Depth

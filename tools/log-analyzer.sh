@@ -198,6 +198,7 @@ if [[ -n "$OUTPUT_FILE" ]]; then
         if (path == "/api.php") next
         if (path == "/ajax.php") next
         if (path == "/public.php") next
+        if (path == "/panel.php") next
         if (path == "/cron.php") next
         if (path == "/rss.php") next
         if (path == "/feed.php") next

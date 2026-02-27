@@ -391,6 +391,40 @@ class GuardianDB:
         cursor = self.conn.execute("SELECT path FROM tripwires")
         return set(row['path'] for row in cursor.fetchall())
 
+    def remove_tripwire(self, path):
+        """Remove a tripwire path from the database.
+        Returns True if the path existed and was removed, False if not found."""
+        path = path.strip().lower()
+        cursor = self.conn.execute("SELECT 1 FROM tripwires WHERE path = ?", (path,))
+        if cursor.fetchone() is None:
+            return False
+        self.conn.execute("DELETE FROM tripwires WHERE path = ?", (path,))
+        self.conn.commit()
+        logger.info(f"Removed tripwire: {path}")
+        return True
+
+    def search_tripwires(self, pattern=None, limit=50):
+        """Search tripwires by path pattern. Returns rows ordered by hit_count DESC."""
+        if pattern:
+            pattern = '%' + pattern.strip().lower() + '%'
+            cursor = self.conn.execute(
+                "SELECT path, category, hit_count FROM tripwires "
+                "WHERE active = 1 AND path LIKE ? ORDER BY hit_count DESC LIMIT ?",
+                (pattern, limit)
+            )
+        else:
+            cursor = self.conn.execute(
+                "SELECT path, category, hit_count FROM tripwires "
+                "WHERE active = 1 ORDER BY hit_count DESC LIMIT ?",
+                (limit,)
+            )
+        return cursor.fetchall()
+
+    def count_tripwires(self):
+        """Return total count of active tripwires."""
+        cursor = self.conn.execute("SELECT COUNT(*) FROM tripwires WHERE active = 1")
+        return cursor.fetchone()[0]
+
     # ------------------------------------------------------------------
     # Whitelist
     # ------------------------------------------------------------------

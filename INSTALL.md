@@ -253,15 +253,19 @@ The command searches common locations:
 Tripwires are PHP paths that bots commonly probe. WP-Guardian can discover these from your existing logs:
 
 ```bash
-# Analyze logs and add tripwires (keeps existing ones)
-python3 /opt/wp-guardian/wp-guardian.py --auto-analyze
+# Discover NEW tripwire candidates (shows only paths not already tracked)
+python3 /opt/wp-guardian/wp-guardian.py --analyze-tripwires
+
+# Review the output, then import (new candidates are saved to state/new-tripwires.txt)
+python3 /opt/wp-guardian/wp-guardian.py --import-tripwires-incremental state/new-tripwires.txt
 ```
 
-Or run the log analyzer manually:
+You can also manage tripwires individually:
 
 ```bash
-bash /opt/wp-guardian/tools/log-analyzer.sh -o /tmp/tripwires.txt
-python3 /opt/wp-guardian/wp-guardian.py --import-tripwires-incremental /tmp/tripwires.txt
+python3 /opt/wp-guardian/wp-guardian.py --list-tripwires           # Top tripwires by hits
+python3 /opt/wp-guardian/wp-guardian.py --list-tripwires admin     # Search by pattern
+python3 /opt/wp-guardian/wp-guardian.py --remove-tripwire /path.php  # Remove a false positive
 ```
 
 ---
@@ -388,7 +392,9 @@ python3 wp-guardian.py --whitelist-add IP  # Add IP
 python3 wp-guardian.py --whitelist-remove IP
 
 # Tripwires
-python3 wp-guardian.py --auto-analyze                      # Discover + import
+python3 wp-guardian.py --analyze-tripwires                  # Discover NEW candidates (manual review)
+python3 wp-guardian.py --list-tripwires [pattern]          # List/search tripwires
+python3 wp-guardian.py --remove-tripwire /path.php         # Remove a single tripwire
 python3 wp-guardian.py --import-tripwires FILE             # Full import
 python3 wp-guardian.py --import-tripwires-incremental FILE # Add new only
 python3 wp-guardian.py --flush tripwires                   # Clear all tripwires

@@ -618,9 +618,6 @@ class Guardian:
         # Initialize blocker
         self.blocker = Blocker(self.config, self.db, self.whitelist, self.firewall, self.telegram)
 
-        # Initialize Telegram command handler
-        self.telegram_cmd = TelegramCommander(self.config, self.db, self.blocker, self.whitelist)
-
         # Load tripwires
         tripwire_file = os.path.join(self.base_dir, 'tripwires.txt')
         self.tripwires = load_tripwire_file(tripwire_file)
@@ -628,6 +625,12 @@ class Guardian:
         db_tripwires = self.db.load_tripwires()
         self.tripwires.update(db_tripwires.keys())
         self.logger.info(f"Loaded {len(self.tripwires)} tripwire paths")
+
+        # Initialize Telegram command handler (after tripwires so we can pass the set)
+        self.telegram_cmd = TelegramCommander(
+            self.config, self.db, self.blocker, self.whitelist,
+            self.tripwires, self.base_dir
+        )
 
         # Ensure firewall rules exist (backend-specific setup)
         if self.firewall:
@@ -707,7 +710,6 @@ class Guardian:
         last_summary = 0
         last_tracker_cleanup = 0
         last_log_discovery = 0
-        last_auto_analyze = 0
         last_whitelist_check = 0
         last_friendly_refresh = 0
         cleanup_interval = 3600        # Hourly
@@ -716,11 +718,7 @@ class Guardian:
         whitelist_check_interval = 60  # Every 60 seconds
         friendly_refresh_interval = 300  # Every 5 minutes
 
-        # Auto-analysis settings
-        auto_analyze_enabled = self.config.getboolean('log_analysis', 'auto_analyze', fallback=False)
-        auto_analyze_interval = parse_duration(
-            self.config.get('log_analysis', 'interval', fallback='24h')
-        )
+        # Auto-discovery settings
         auto_discover_enabled = self.config.getboolean('log_analysis', 'auto_discover', fallback=False)
         discover_interval = parse_duration(
             self.config.get('log_analysis', 'discover_interval', fallback='24h')
@@ -780,11 +778,6 @@ class Guardian:
                     self._auto_discover_logs()
                     last_log_discovery = now
 
-                # Auto analysis
-                if auto_analyze_enabled and now - last_auto_analyze > auto_analyze_interval:
-                    self._auto_analyze()
-                    last_auto_analyze = now
-
                 time.sleep(1)
 
         except KeyboardInterrupt:
@@ -823,51 +816,74 @@ class Guardian:
         except Exception as e:
             self.logger.error(f"Auto log discovery failed: {e}")
 
-    def _auto_analyze(self):
-        """Periodic tripwire analysis — run log analyzer and incrementally import."""
-        try:
-            analyzer_path = os.path.join(self.base_dir, 'tools', 'log-analyzer.sh')
-            if not os.path.exists(analyzer_path):
-                self.logger.warning("Log analyzer not found, skipping auto-analysis")
-                return
+    def _analyze_tripwires(self):
+        """Run log analyzer and show NEW tripwire candidates (does not import)."""
+        analyzer_path = os.path.join(self.base_dir, 'tools', 'log-analyzer.sh')
+        if not os.path.exists(analyzer_path):
+            print(f"Log analyzer not found: {analyzer_path}")
+            return
 
-            # Run analyzer to temp file
-            tmp_output = os.path.join(self.base_dir, 'state', 'auto-tripwires.tmp')
-            result = subprocess.run(
-                ['bash', analyzer_path, '-o', tmp_output],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True,
-                timeout=300
-            )
+        # Run analyzer to temp file
+        tmp_output = os.path.join(self.base_dir, 'state', 'auto-tripwires.tmp')
+        print("Running log analyzer...")
+        result = subprocess.run(
+            ['bash', analyzer_path, '-o', tmp_output],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=300
+        )
 
-            if result.returncode != 0:
-                self.logger.warning(f"Log analyzer returned non-zero: {result.stderr}")
+        if result.returncode != 0:
+            print(f"Warning: log analyzer returned non-zero exit code")
+            if result.stderr:
+                print(f"  stderr: {result.stderr.strip()}")
 
-            if os.path.exists(tmp_output):
-                added = self.db.import_tripwires_incremental(tmp_output)
-                os.remove(tmp_output)
+        if not os.path.exists(tmp_output):
+            print("No output from log analyzer.")
+            return
 
-                if added > 0:
-                    # Reload tripwires into memory
-                    db_tripwires = self.db.load_tripwires()
-                    tripwire_file = os.path.join(self.base_dir, 'tripwires.txt')
-                    self.tripwires = load_tripwire_file(tripwire_file)
-                    self.tripwires.update(db_tripwires.keys())
+        # Load candidates from analyzer output
+        candidates = set()
+        with open(tmp_output, 'r') as f:
+            for line in f:
+                path = line.strip().lower()
+                if path and not path.startswith('#'):
+                    candidates.add(path)
 
-                    self.logger.info(f"Auto-analysis: added {added} new tripwires")
-                    self.telegram.send(
-                        f"🔍 <b>WP-Guardian — Auto-Analysis</b>\n"
-                        f"Added {added} new tripwire path(s).\n"
-                        f"Total active: {len(self.tripwires)}",
-                        priority='INFO'
-                    )
-                else:
-                    self.logger.debug("Auto-analysis: no new tripwires found")
-        except subprocess.TimeoutExpired:
-            self.logger.error("Auto-analysis timed out (300s)")
-        except Exception as e:
-            self.logger.error(f"Auto-analysis failed: {e}")
+        os.remove(tmp_output)
+
+        # Filter against existing tripwires (DB + file)
+        existing = self.db.get_all_tripwire_paths()
+        tripwire_file = os.path.join(self.base_dir, 'tripwires.txt')
+        file_paths = load_tripwire_file(tripwire_file)
+        existing.update(file_paths)
+
+        new_paths = sorted(candidates - existing)
+
+        print(f"Analyzer found {len(candidates)} total candidates.")
+        print(f"Existing tripwires: {len(existing)}")
+        print(f"NEW candidates: {len(new_paths)}")
+
+        if not new_paths:
+            print("\nNo new tripwires to review.")
+            return
+
+        # Display new candidates
+        print(f"\n{'PATH':<70s}")
+        print("-" * 70)
+        for path in new_paths:
+            print(f"  {path}")
+
+        # Save to file for review and import
+        output_file = os.path.join(self.base_dir, 'state', 'new-tripwires.txt')
+        with open(output_file, 'w') as f:
+            for path in new_paths:
+                f.write(path + '\n')
+
+        print(f"\nSaved to: {output_file}")
+        print(f"Review the file, remove any false positives, then import:")
+        print(f"  python3 {os.path.join(self.base_dir, 'wp-guardian.py')} --import-tripwires-incremental {output_file}")
 
     def _shutdown(self, signum=None, frame=None):
         """Graceful shutdown."""
@@ -938,8 +954,12 @@ def main():
                         help='Find access logs on this server')
     parser.add_argument('--discover-logs-save', action='store_true',
                         help='Find access logs and save to logfiles.txt')
-    parser.add_argument('--auto-analyze', action='store_true',
-                        help='Run log analyzer and incrementally import new tripwires')
+    parser.add_argument('--analyze-tripwires', action='store_true',
+                        help='Run log analyzer and show NEW tripwire candidates (does not import)')
+    parser.add_argument('--remove-tripwire', metavar='PATH',
+                        help='Remove a tripwire path from DB and file')
+    parser.add_argument('--list-tripwires', nargs='?', const='', metavar='PATTERN',
+                        help='List tripwires (optionally filter by pattern)')
     parser.add_argument('--telegram-setup', action='store_true',
                         help='Interactive Telegram bot setup wizard')
     parser.add_argument('--telegram-test', action='store_true',
@@ -1105,10 +1125,75 @@ def main():
         print(f"Incremental import: {added} new tripwires added")
         return
 
-    if args.auto_analyze:
-        print("Running log analyzer and incremental import...")
-        guardian._auto_analyze()
-        print("Done.")
+    if args.analyze_tripwires:
+        guardian._analyze_tripwires()
+        return
+
+    if args.remove_tripwire:
+        path = args.remove_tripwire.strip().lower()
+        if not path.startswith('/'):
+            path = '/' + path
+        removed_from_db = guardian.db.remove_tripwire(path)
+
+        # Also remove from tripwires.txt file
+        tripwire_file = os.path.join(base_dir, 'tripwires.txt')
+        removed_from_file = False
+        if os.path.exists(tripwire_file):
+            with open(tripwire_file, 'r') as f:
+                lines = f.readlines()
+            new_lines = [line for line in lines if line.strip().lower() != path]
+            if len(new_lines) < len(lines):
+                with open(tripwire_file, 'w') as f:
+                    f.writelines(new_lines)
+                removed_from_file = True
+
+        # Also remove from in-memory set
+        guardian.tripwires.discard(path)
+
+        if removed_from_db or removed_from_file:
+            parts = []
+            if removed_from_db:
+                parts.append("database")
+            if removed_from_file:
+                parts.append("tripwires.txt")
+            print(f"Removed tripwire '{path}' from: {', '.join(parts)}")
+        else:
+            print(f"Tripwire not found: {path}")
+        return
+
+    if args.list_tripwires is not None:
+        pattern = args.list_tripwires if args.list_tripwires else None
+        total = guardian.db.count_tripwires()
+
+        # Also count file-only tripwires
+        tripwire_file = os.path.join(base_dir, 'tripwires.txt')
+        file_paths = load_tripwire_file(tripwire_file)
+
+        if pattern:
+            results = guardian.db.search_tripwires(pattern=pattern, limit=50)
+            # Also search file-only paths
+            file_matches = [p for p in sorted(file_paths) if pattern.lower() in p]
+            db_paths = set(r['path'] for r in results)
+            file_only_matches = [p for p in file_matches if p not in db_paths]
+
+            print(f"\nTripwires matching \"{pattern}\" (of {total} in DB + {len(file_paths)} in file):")
+            print(f"{'PATH':<70s} {'HITS':>6s}  SOURCE")
+            print("-" * 90)
+            for t in results:
+                source = "db+file" if t['path'] in file_paths else "db"
+                print(f"  {t['path']:<68s} {t['hit_count']:>6d}  {source}")
+            for p in file_only_matches[:50 - len(results)]:
+                print(f"  {p:<68s} {'?':>6s}  file")
+        else:
+            limit = 20
+            results = guardian.db.search_tripwires(pattern=None, limit=limit)
+            print(f"\nActive Tripwires: {total} in DB, {len(file_paths)} in file")
+            print(f"\nTop {limit} by hit count:")
+            print(f"{'PATH':<70s} {'HITS':>6s}  {'CATEGORY':<15s}")
+            print("-" * 95)
+            for t in results:
+                print(f"  {t['path']:<68s} {t['hit_count']:>6d}  {t['category']}")
+            print(f"\nSearch: --list-tripwires <pattern>")
         return
 
     if args.whitelist_add:
