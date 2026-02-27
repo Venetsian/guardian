@@ -114,6 +114,10 @@ class MikroTikBackend(FirewallBackend):
 
         logger.info(f"Loaded friendly list: {len(self._friendly_ips)} entries")
 
+    def refresh_friendly_list(self):
+        """Reload the friendly address list from MikroTik."""
+        self._load_friendly_list()
+
     def is_friendly(self, ip):
         """Check if IP is in MikroTik's friendly list."""
         return self._check_friendly(ip, self._friendly_ips)

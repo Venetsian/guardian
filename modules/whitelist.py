@@ -33,6 +33,68 @@ class WhitelistManager:
         logger.info(f"Whitelist initialized: {len(self._file_exact)} exact IPs, "
                     f"{len(self._file_networks)} CIDR ranges from file")
 
+    def reload_file(self, filepath):
+        """Re-read whitelist file and rebuild in-memory sets.
+        Uses atomic reference swaps (GIL-safe) so readers never see partial state."""
+        from modules.config import load_whitelist_file
+        new_ips = load_whitelist_file(filepath)
+
+        new_networks = []
+        new_exact = set()
+        for entry in new_ips:
+            if '/' in entry:
+                try:
+                    new_networks.append(ipaddress.ip_network(entry, strict=False))
+                except ValueError:
+                    logger.warning(f"Invalid CIDR in whitelist: {entry}")
+            else:
+                new_exact.add(entry)
+
+        # Atomic reference swaps
+        self._file_networks = new_networks
+        self._file_exact = new_exact
+        self.file_ips = new_ips
+
+        logger.info(f"Whitelist reloaded: {len(new_exact)} exact IPs, "
+                    f"{len(new_networks)} CIDR ranges from file")
+
+    def contains_whitelisted_ip(self, subnet_prefix):
+        """Check if any whitelisted IP falls within a /24 subnet prefix.
+        subnet_prefix should be like '192.0.2.' (with trailing dot).
+        Checks file exact IPs, file CIDRs (overlap), and DB whitelist entries."""
+        # Check file exact IPs
+        for ip in self._file_exact:
+            if ip.startswith(subnet_prefix):
+                return True
+
+        # Check file CIDR ranges for overlap with this /24
+        subnet_cidr = subnet_prefix + '0/24'
+        try:
+            subnet_net = ipaddress.ip_network(subnet_cidr, strict=False)
+            for network in self._file_networks:
+                if network.overlaps(subnet_net):
+                    return True
+        except ValueError:
+            pass
+
+        # Check DB whitelist entries
+        try:
+            rows = self.db.get_whitelist()
+            for row in rows:
+                wl_ip = row['ip']
+                if '/' in wl_ip:
+                    try:
+                        if ipaddress.ip_network(wl_ip, strict=False).overlaps(subnet_net):
+                            return True
+                    except ValueError:
+                        pass
+                elif wl_ip.startswith(subnet_prefix):
+                    return True
+        except Exception:
+            pass
+
+        return False
+
     def is_whitelisted(self, ip):
         """Check if IP is whitelisted from any source."""
         # 1. Check file-based exact match

@@ -43,7 +43,8 @@ class Blocker:
         """
         # Safety: never block whitelisted IPs
         if self.whitelist.is_whitelisted(ip):
-            logger.debug(f"Skipping whitelisted IP: {ip}")
+            site_tag = f" site={site}" if site else ""
+            logger.info(f"WHITELIST SKIP ip={ip} service={service} reason={reason}{site_tag}")
             return False
 
         # Make sure IP is tracked in DB
@@ -132,6 +133,12 @@ class Blocker:
 
         # Check if already blocked on the firewall
         if self.firewall.is_cidr_blocked(subnet_cidr):
+            self._blocked_subnets.add(subnet_cidr)
+            return
+
+        # Safety: never block a subnet containing whitelisted IPs
+        if self.whitelist.contains_whitelisted_ip(subnet_prefix):
+            logger.warning(f"CIDR block skipped for {subnet_cidr} — contains whitelisted IPs")
             self._blocked_subnets.add(subnet_cidr)
             return
 

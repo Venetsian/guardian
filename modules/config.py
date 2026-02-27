@@ -84,7 +84,11 @@ def load_whitelist_file(filepath):
         for line in f:
             line = line.strip()
             if line and not line.startswith('#'):
-                ips.add(line)
+                # Strip inline comments (e.g., "1.2.3.4 # my office")
+                if '#' in line:
+                    line = line[:line.index('#')].strip()
+                if line:
+                    ips.add(line)
 
     logger.info(f"Loaded {len(ips)} entries from whitelist file")
     return ips
@@ -102,7 +106,11 @@ def load_tripwire_file(filepath):
         for line in f:
             line = line.strip()
             if line and not line.startswith('#'):
-                paths.add(line.lower())
+                # Strip inline comments
+                if '#' in line:
+                    line = line[:line.index('#')].strip()
+                if line:
+                    paths.add(line.lower())
 
     logger.info(f"Loaded {len(paths)} tripwire paths from file")
     return paths

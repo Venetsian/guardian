@@ -123,10 +123,11 @@ class HitTracker:
 class WebDetector:
     """Parses web access logs and detects attacks."""
 
-    def __init__(self, config, blocker, db, tripwires):
+    def __init__(self, config, blocker, db, tripwires, whitelist=None):
         self.blocker = blocker
         self.db = db
         self.tripwires = tripwires
+        self.whitelist = whitelist
         self.time_window = config.getint('thresholds', 'time_window', fallback=300)
 
         # Thresholds
@@ -216,6 +217,13 @@ class WebDetector:
 
         # Clean path — remove query string, lowercase
         clean_path = re.sub(r'\?.*$', '', path).lower()
+
+        # ----- WHITELIST EARLY BYPASS -----
+        # Skip all detection for whitelisted IPs, but still record successful WP logins
+        if self.whitelist and self.whitelist.is_whitelisted(ip):
+            if method == 'POST' and 'wp-login.php' in clean_path and status == '302':
+                self.db.record_auth(ip, 'wordpress', 'unknown', site='', country='', city='')
+            return
 
         # ----- LOGIN ISOLATION: track CSS loads (real browser signal) -----
         if clean_path.endswith('.css'):
@@ -334,9 +342,10 @@ class WebDetector:
 class MailDetector:
     """Parses /var/log/maillog for SMTP and IMAP/POP3 attacks."""
 
-    def __init__(self, config, blocker, db):
+    def __init__(self, config, blocker, db, whitelist=None):
         self.blocker = blocker
         self.db = db
+        self.whitelist = whitelist
         self.time_window = config.getint('thresholds', 'time_window', fallback=300)
 
         self.smtp_threshold = config.getint('thresholds', 'smtp_auth_fail_threshold', fallback=5)
@@ -355,6 +364,8 @@ class MailDetector:
                 ip_match = re.search(r'\[(\d+\.\d+\.\d+\.\d+)\]', line)
             if ip_match:
                 ip = ip_match.group(1)
+                if self.whitelist and self.whitelist.is_whitelisted(ip):
+                    return
                 count = self.hits_smtp.add(ip)
                 if count >= self.smtp_threshold:
                     self.blocker.block(ip, f"SMTP auth brute force ({count} in {self.time_window}s)", service='smtp')
@@ -375,6 +386,8 @@ class MailDetector:
             ip_match = re.search(r'rip=(\d+\.\d+\.\d+\.\d+)', line)
             if ip_match:
                 ip = ip_match.group(1)
+                if self.whitelist and self.whitelist.is_whitelisted(ip):
+                    return
                 count = self.hits_imap.add(ip)
                 if count >= self.imap_threshold:
                     service = 'imap' if 'imap-login' in line else 'pop3'
@@ -400,9 +413,10 @@ class MailDetector:
 class SSHDetector:
     """Parses /var/log/secure for SSH attacks."""
 
-    def __init__(self, config, blocker, db):
+    def __init__(self, config, blocker, db, whitelist=None):
         self.blocker = blocker
         self.db = db
+        self.whitelist = whitelist
         self.time_window = config.getint('thresholds', 'time_window', fallback=300)
 
         self.ssh_threshold = config.getint('thresholds', 'ssh_fail_threshold', fallback=3)
@@ -420,6 +434,8 @@ class SSHDetector:
             ip_match = re.search(r'from (\d+\.\d+\.\d+\.\d+)', line)
             if ip_match and self.instant_block_invalid:
                 ip = ip_match.group(1)
+                if self.whitelist and self.whitelist.is_whitelisted(ip):
+                    return
                 user_match = re.search(r'[Ii]nvalid user (\S+)', line)
                 username = user_match.group(1) if user_match else 'unknown'
                 self.blocker.block(ip, f"SSH invalid user: {username}", service='ssh')
@@ -430,6 +446,8 @@ class SSHDetector:
             ip_match = re.search(r'from (\d+\.\d+\.\d+\.\d+)', line)
             if ip_match:
                 ip = ip_match.group(1)
+                if self.whitelist and self.whitelist.is_whitelisted(ip):
+                    return
                 count = self.hits_ssh.add(ip)
                 if count >= self.ssh_threshold:
                     self.blocker.block(ip, f"SSH brute force ({count} in {self.time_window}s)", service='ssh')
@@ -587,10 +605,15 @@ class Guardian:
         self.telegram = TelegramAlerter(self.config)
 
         # Initialize whitelist
-        wl_file = self.config.get('whitelist', 'file',
-                                  fallback=os.path.join(self.base_dir, 'whitelist.conf'))
-        file_ips = load_whitelist_file(wl_file)
+        self._whitelist_file = self.config.get('whitelist', 'file',
+                                               fallback=os.path.join(self.base_dir, 'whitelist.conf'))
+        file_ips = load_whitelist_file(self._whitelist_file)
         self.whitelist = WhitelistManager(self.db, self.firewall, file_ips)
+        self._whitelist_mtime = 0
+        try:
+            self._whitelist_mtime = os.path.getmtime(self._whitelist_file)
+        except OSError:
+            pass
 
         # Initialize blocker
         self.blocker = Blocker(self.config, self.db, self.whitelist, self.firewall, self.telegram)
@@ -649,7 +672,7 @@ class Guardian:
         # Start web log tailing
         web_logs = self._load_web_logs()
         if web_logs:
-            web_detector = WebDetector(self.config, self.blocker, self.db, self.tripwires)
+            web_detector = WebDetector(self.config, self.blocker, self.db, self.tripwires, self.whitelist)
             web_tailer = LogTailer(web_logs, web_detector, name='web', track_site=True)
             web_tailer.start()
             self.tailers.append(web_tailer)
@@ -657,7 +680,7 @@ class Guardian:
         # Start mail log tailing
         mail_log = self.config.get('log_paths', 'mail_log', fallback='/var/log/maillog')
         if os.path.exists(mail_log):
-            mail_detector = MailDetector(self.config, self.blocker, self.db)
+            mail_detector = MailDetector(self.config, self.blocker, self.db, self.whitelist)
             mail_tailer = LogTailer([mail_log], mail_detector, name='mail')
             mail_tailer.start()
             self.tailers.append(mail_tailer)
@@ -667,7 +690,7 @@ class Guardian:
         # Start SSH log tailing
         secure_log = self.config.get('log_paths', 'secure_log', fallback='/var/log/secure')
         if os.path.exists(secure_log):
-            ssh_detector = SSHDetector(self.config, self.blocker, self.db)
+            ssh_detector = SSHDetector(self.config, self.blocker, self.db, self.whitelist)
             ssh_tailer = LogTailer([secure_log], ssh_detector, name='ssh')
             ssh_tailer.start()
             self.tailers.append(ssh_tailer)
@@ -685,9 +708,13 @@ class Guardian:
         last_tracker_cleanup = 0
         last_log_discovery = 0
         last_auto_analyze = 0
+        last_whitelist_check = 0
+        last_friendly_refresh = 0
         cleanup_interval = 3600        # Hourly
         summary_interval = 86400       # Daily
         tracker_interval = 300         # Every 5 minutes
+        whitelist_check_interval = 60  # Every 60 seconds
+        friendly_refresh_interval = 300  # Every 5 minutes
 
         # Auto-analysis settings
         auto_analyze_enabled = self.config.getboolean('log_analysis', 'auto_analyze', fallback=False)
@@ -726,6 +753,27 @@ class Guardian:
                 # Clean up in-memory trackers
                 if now - last_tracker_cleanup > tracker_interval:
                     last_tracker_cleanup = now
+
+                # Whitelist file auto-reload
+                if now - last_whitelist_check > whitelist_check_interval:
+                    try:
+                        current_mtime = os.path.getmtime(self._whitelist_file)
+                        if current_mtime != self._whitelist_mtime:
+                            self.whitelist.reload_file(self._whitelist_file)
+                            self._whitelist_mtime = current_mtime
+                            self.logger.info(f"Whitelist file changed, reloaded from {self._whitelist_file}")
+                    except OSError:
+                        pass
+                    last_whitelist_check = now
+
+                # Refresh firewall friendly list
+                if now - last_friendly_refresh > friendly_refresh_interval:
+                    if self.firewall and self.firewall.supports_friendly_list:
+                        try:
+                            self.firewall.refresh_friendly_list()
+                        except Exception as e:
+                            self.logger.error(f"Friendly list refresh failed: {e}")
+                    last_friendly_refresh = now
 
                 # Auto log discovery
                 if auto_discover_enabled and now - last_log_discovery > discover_interval:

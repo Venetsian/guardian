@@ -164,6 +164,14 @@ class FirewallBackend(ABC):
                     return True
         return False
 
+    def refresh_friendly_list(self):
+        """
+        Reload the backend's friendly/never-block list.
+        Called periodically by the main loop to pick up changes.
+        No-op by default — override if the backend maintains a friendly list.
+        """
+        pass
+
     def ensure_firewall_rules(self):
         """
         Called once on daemon startup.
