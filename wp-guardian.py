@@ -1332,10 +1332,29 @@ class Guardian:
             ))
 
     def hunt_compromises(self, days=7, auto_act=False):
-        """--hunt-compromises — replay detector logic against historical data."""
+        """--hunt-compromises — replay the live detector's sliding-window logic
+        against historical auth data.
+
+        The live DistributedAuthDetector evaluates each account against a
+        sliding window of width [compromise_detection] window_seconds (default
+        3600 = 1 hour). The hunt has to do the same or it will surface
+        mobile-user false positives — a legitimate T-Mobile CGNAT user might
+        use 30+ IPs spread over a week, but never more than a handful within
+        any single hour.
+
+        Algorithm:
+          1) Cheap prefilter: ignore accounts whose 7-day totals can't
+             possibly hit any threshold (no rule can trip if the account's
+             entire history is smaller than the smallest threshold).
+          2) For each surviving candidate, slide a window anchored on each
+             of its own auth timestamps and compute the peak counts.
+             We don't need to anchor on arbitrary moments — a window's peak
+             can only shift at an auth event boundary.
+          3) Report accounts whose PEAK window counts cross any threshold.
+        """
         if not self.config.getboolean('compromise_detection', 'enabled', fallback=False):
             print("")
-            print("Note: [compromise_detection] enabled=false. Using default thresholds for hunt.")
+            print("Note: [compromise_detection] enabled=false. Using configured thresholds for hunt anyway.")
 
         threshold_c = self.config.getint('compromise_detection', 'threshold_distinct_countries', fallback=3)
         threshold_a = self.config.getint('compromise_detection', 'threshold_distinct_asns', fallback=5)
@@ -1351,11 +1370,18 @@ class Guardian:
         total_users = cur['u']
 
         print("")
-        print(f"Scanning {total_auths} successful auths across {total_users} distinct usernames (last {days} days)...")
+        print(f"Scanning {total_auths} successful auths across {total_users} distinct usernames")
+        print(f"(last {days} days, sliding-window={window}s, "
+              f"thresholds: {threshold_c} countries / {threshold_a} ASNs / {threshold_i} IPs)")
         print("")
 
-        # Pull accounts where *any* rule might trip using a cheap aggregate
-        candidate_cursor = self.db.conn.execute(
+        # ---- Step 1: cheap prefilter over the whole range ------------------
+        # If the account's 7-day total count can't cross any threshold, no
+        # 1-hour window ever will (a window's count is bounded by the total).
+        # This lets us skip the expensive per-account sliding walk for the
+        # vast majority of users.
+        min_threshold = min(threshold_c, threshold_a, threshold_i)
+        prefilter_cursor = self.db.conn.execute(
             "SELECT username, "
             "       COUNT(DISTINCT ip) AS ips, "
             "       COUNT(DISTINCT CASE WHEN geoip_country != '' THEN geoip_country END) AS countries, "
@@ -1366,47 +1392,102 @@ class Guardian:
             "ORDER BY ips DESC",
             (cutoff, threshold_i, threshold_c, threshold_a)
         )
-        candidates = candidate_cursor.fetchall()
+        prefilter_hits = prefilter_cursor.fetchall()
 
-        if not candidates:
+        if not prefilter_hits:
             print("No accounts triggered compromise rules over the last {d} days.".format(d=days))
             return
 
-        print(f"Found {len(candidates)} account(s) that triggered compromise rules:")
+        print(f"Prefilter: {len(prefilter_hits)} account(s) with 7-day totals that could cross a threshold.")
+        print(f"Running sliding-{window}s-window replay on each...")
         print("")
 
+        # ---- Step 2: sliding-window replay per candidate -------------------
         findings = []
-        idx = 0
-        for row in candidates:
+        false_positives = []  # accounts that survived prefilter but peak < threshold
+        for row in prefilter_hits:
             user = row['username']
-            if row['countries'] >= threshold_c:
-                rule = 'countries'
-                metric = row['countries']
-            elif row['asns'] >= threshold_a:
-                rule = 'asns'
-                metric = row['asns']
-            else:
-                rule = 'ips'
-                metric = row['ips']
+            peak = self._peak_window_counts(user, cutoff, window)
 
-            idx += 1
+            triggered_rule = None
+            # Same precedence as the live detector: countries first, then ASN, then IP
+            if peak['countries'] >= threshold_c:
+                triggered_rule = 'countries'
+            elif peak['asns'] >= threshold_a:
+                triggered_rule = 'asns'
+            elif peak['ips'] >= threshold_i:
+                triggered_rule = 'ips'
+
+            if triggered_rule:
+                findings.append({
+                    'username': user,
+                    'rule': triggered_rule,
+                    'counts': peak,
+                    'totals': {
+                        'ips': row['ips'],
+                        'countries': row['countries'],
+                        'asns': row['asns'],
+                    },
+                    'anchor_ts': peak['anchor_ts'],
+                })
+            else:
+                false_positives.append({
+                    'username': user,
+                    'peak': peak,
+                    'totals': {
+                        'ips': row['ips'],
+                        'countries': row['countries'],
+                        'asns': row['asns'],
+                    },
+                })
+
+        if not findings:
+            print(f"No accounts triggered compromise rules within any {window}s sliding window.")
+            if false_positives:
+                print("")
+                print(f"{len(false_positives)} account(s) had high 7-day totals but no single-window hit:")
+                print("(these are the accounts that would have been false positives under a total-range hunt)")
+                print("")
+                print("{u:<40s}  {pi:>8s}  {pc:>8s}  {pa:>8s}  {ti:>8s}  {tc:>8s}  {ta:>8s}".format(
+                    u='Username', pi='peak_ips', pc='peak_cc', pa='peak_asn',
+                    ti='tot_ips', tc='tot_cc', ta='tot_asn'
+                ))
+                print("-" * 100)
+                for fp in false_positives[:20]:
+                    p = fp['peak']
+                    t = fp['totals']
+                    print("{u:<40.40s}  {pi:>8d}  {pc:>8d}  {pa:>8d}  {ti:>8d}  {tc:>8d}  {ta:>8d}".format(
+                        u=fp['username'],
+                        pi=p['ips'], pc=p['countries'], pa=p['asns'],
+                        ti=t['ips'], tc=t['countries'], ta=t['asns'],
+                    ))
+            return
+
+        print(f"Found {len(findings)} account(s) that triggered compromise rules within the sliding window:")
+        print("")
+
+        for idx, finding in enumerate(findings, start=1):
+            user = finding['username']
+            rule = finding['rule']
+            peak = finding['counts']
+            totals = finding['totals']
+            anchor = time.strftime('%Y-%m-%d %H:%M', time.localtime(finding['anchor_ts']))
+
             print(f"[{idx}] {user}")
-            print(f"    Trigger: {rule}={metric} (threshold {threshold_c}c/{threshold_a}a/{threshold_i}i), window={window}s")
-            print(f"    Distinct IPs:       {row['ips']}")
-            print(f"    Distinct countries: {row['countries']}")
-            print(f"    Distinct ASNs:      {row['asns']}")
+            print(f"    Peak {window}s window starting {anchor}:")
+            print(f"      Distinct IPs       : {peak['ips']:>4d}   (7d total: {totals['ips']})")
+            print(f"      Distinct countries : {peak['countries']:>4d}   (7d total: {totals['countries']})")
+            print(f"      Distinct ASNs      : {peak['asns']:>4d}   (7d total: {totals['asns']})")
+            print(f"    Triggered rule: {rule}")
             if self.db.has_open_compromise(user):
                 print(f"    Status: already has OPEN compromise event")
             print("")
-            findings.append({
-                'username': user,
-                'rule': rule,
-                'counts': {
-                    'countries': row['countries'],
-                    'asns': row['asns'],
-                    'ips': row['ips'],
-                },
-            })
+
+        if false_positives:
+            print(f"Prefilter caught {len(false_positives)} additional account(s) with high 7-day totals")
+            print(f"but no single-window threshold hit (typically legitimate mobile/CGNAT users).")
+            print(f"These are NOT being flagged — the sliding window cleared them.")
+            print("")
 
         if auto_act:
             print("--auto-act flag set: applying configured compromise_action...")
@@ -1426,6 +1507,81 @@ class Guardian:
         else:
             print("Run with --auto-act to apply the configured compromise_action.")
             print("Run with --auth-map <user> to see the full per-IP breakdown.")
+
+    def _peak_window_counts(self, username, cutoff_ts, window_seconds):
+        """Slide a window of width `window_seconds` over a user's auth history
+        (from `cutoff_ts` onward) and return the peak counts across all window
+        positions.
+
+        We only need to anchor windows at actual auth event timestamps — a
+        window's distinct-count can only change when an event enters or leaves
+        the window, and the local maxima occur at event arrivals.
+
+        Returns a dict compatible with db.distinct_auth_counts() output plus
+        an `anchor_ts` key marking where the peak was found.
+        """
+        # Pull the full sorted history for this user within the hunt range.
+        rows = self.db.conn.execute(
+            "SELECT timestamp, ip, geoip_country, geoip_asn "
+            "FROM auth_sessions "
+            "WHERE username = ? AND timestamp >= ? "
+            "ORDER BY timestamp ASC",
+            (username, int(cutoff_ts))
+        ).fetchall()
+
+        if not rows:
+            return {'countries': 0, 'asns': 0, 'ips': 0, 'anchor_ts': 0}
+
+        # Two-pointer sliding window, walking `right` forward and bumping
+        # `left` when window span exceeds window_seconds.
+        left = 0
+        ips = {}
+        countries = {}
+        asns = {}
+        peak = {'countries': 0, 'asns': 0, 'ips': 0, 'anchor_ts': rows[0]['timestamp']}
+
+        def add(d, key):
+            if not key:
+                return
+            d[key] = d.get(key, 0) + 1
+
+        def remove(d, key):
+            if not key:
+                return
+            cnt = d.get(key, 0)
+            if cnt <= 1:
+                d.pop(key, None)
+            else:
+                d[key] = cnt - 1
+
+        for right in range(len(rows)):
+            r = rows[right]
+            add(ips, r['ip'])
+            add(countries, r['geoip_country'])
+            add(asns, r['geoip_asn'] if r['geoip_asn'] and r['geoip_asn'] > 0 else None)
+
+            # Shrink window from the left while span > window_seconds
+            while rows[right]['timestamp'] - rows[left]['timestamp'] > window_seconds:
+                lr = rows[left]
+                remove(ips, lr['ip'])
+                remove(countries, lr['geoip_country'])
+                remove(asns, lr['geoip_asn'] if lr['geoip_asn'] and lr['geoip_asn'] > 0 else None)
+                left += 1
+
+            # Record peaks
+            ci = len(ips)
+            cc = len(countries)
+            ca = len(asns)
+            # Primary ranking: countries > asns > ips (match live detector's
+            # rule precedence). Use a triple-max, anchoring the timestamp on
+            # whichever metric is currently at its global peak.
+            if ci > peak['ips'] or cc > peak['countries'] or ca > peak['asns']:
+                peak['ips'] = max(peak['ips'], ci)
+                peak['countries'] = max(peak['countries'], cc)
+                peak['asns'] = max(peak['asns'], ca)
+                peak['anchor_ts'] = rows[left]['timestamp']
+
+        return peak
 
     def list_compromise_events_cli(self, open_only=False, limit=50):
         rows = self.db.list_compromise_events(open_only=open_only, limit=limit)
