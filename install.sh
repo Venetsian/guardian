@@ -534,16 +534,43 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
     fi
 
     # v1.4 — Mail backend
+    # Write mail_backend values via Python configparser so passwords containing
+    # sed-meaningful characters ($, &, /, |, newlines, quotes) are handled as
+    # literal text. The password never touches the shell as an unquoted value.
     if [[ "${MAIL_BACKEND_TYPE:-none}" != "none" ]]; then
-        # Escape characters that are meaningful in sed replacement strings
-        esc_password=$(printf '%s\n' "${MAIL_BACKEND_PASSWORD}" | sed -e 's/[\/&|]/\\&/g')
-        sed -i "/^\[mail_backend\]/,/^\[/ s|^type = .*|type = ${MAIL_BACKEND_TYPE}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
-        sed -i "/^\[mail_backend\]/,/^\[/ s|^host = .*|host = ${MAIL_BACKEND_HOST}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
-        sed -i "/^\[mail_backend\]/,/^\[/ s|^port = .*|port = ${MAIL_BACKEND_PORT}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
-        sed -i "/^\[mail_backend\]/,/^\[/ s|^database = .*|database = ${MAIL_BACKEND_DB}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
-        sed -i "/^\[mail_backend\]/,/^\[/ s|^user = .*|user = ${MAIL_BACKEND_USER}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
-        sed -i "/^\[mail_backend\]/,/^\[/ s|^password = .*|password = ${esc_password}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
-        sed -i "/^\[mail_backend\]/,/^\[/ s|^table = .*|table = ${MAIL_BACKEND_TABLE}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        MAIL_BACKEND_PASSWORD="${MAIL_BACKEND_PASSWORD}" \
+        MAIL_BACKEND_TYPE="${MAIL_BACKEND_TYPE}" \
+        MAIL_BACKEND_HOST="${MAIL_BACKEND_HOST}" \
+        MAIL_BACKEND_PORT="${MAIL_BACKEND_PORT}" \
+        MAIL_BACKEND_DB="${MAIL_BACKEND_DB}" \
+        MAIL_BACKEND_USER="${MAIL_BACKEND_USER}" \
+        MAIL_BACKEND_TABLE="${MAIL_BACKEND_TABLE}" \
+        CONF_PATH="${INSTALL_DIR}/wp-guardian.conf" \
+        python3 - <<'PYEOF' || print_warn "Failed to write mail_backend config"
+import configparser, os, sys
+path = os.environ['CONF_PATH']
+cp = configparser.ConfigParser()
+cp.read(path)
+if not cp.has_section('mail_backend'):
+    cp.add_section('mail_backend')
+for k, env in (
+    ('type',           'MAIL_BACKEND_TYPE'),
+    ('host',           'MAIL_BACKEND_HOST'),
+    ('port',           'MAIL_BACKEND_PORT'),
+    ('database',       'MAIL_BACKEND_DB'),
+    ('user',           'MAIL_BACKEND_USER'),
+    ('password',       'MAIL_BACKEND_PASSWORD'),
+    ('table',          'MAIL_BACKEND_TABLE'),
+):
+    v = os.environ.get(env)
+    if v is not None:
+        cp.set('mail_backend', k, v)
+with open(path, 'w') as f:
+    cp.write(f)
+print('mail_backend config written ({n} chars in password)'.format(
+    n=len(os.environ.get('MAIL_BACKEND_PASSWORD', ''))
+))
+PYEOF
     fi
 
     # v1.4 — Profile

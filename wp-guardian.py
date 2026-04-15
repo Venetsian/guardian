@@ -402,9 +402,12 @@ class MailDetector:
                     self.blocker.block(ip, f"SMTP auth brute force ({count} in {self.time_window}s)", service='smtp')
             return
 
-        # SMTP successful auth — record for geo tracking
-        if 'sasl_username=' in line:
-            ip_match = re.search(r'\[(\d+\.\d+\.\d+\.\d+)\]', line)
+        # SMTP successful auth — record for geo tracking.
+        # Gated on `sasl_method=` which Postfix only logs on real successes
+        # (the auth failed case above has already returned, but this is
+        # defence-in-depth so the two paths agree with the backfill tool).
+        if 'sasl_method=' in line:
+            ip_match = re.search(r'client=[^,\s]*\[(\d+\.\d+\.\d+\.\d+)\]', line)
             user_match = re.search(r'sasl_username=(\S+)', line)
             if ip_match and user_match:
                 ip = ip_match.group(1)

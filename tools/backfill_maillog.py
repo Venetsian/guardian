@@ -34,8 +34,12 @@ from modules.database import GuardianDB  # noqa: E402
 from modules.geoip import GeoIPResolver  # noqa: E402
 
 
+# Postfix logs `sasl_method=` ONLY on successful SMTP auths — it's set after
+# SASL completes. Failed-auth lines contain `sasl_username=` too (the client's
+# attempted username) but NEVER `sasl_method=`. We require sasl_method= here
+# so we don't record every failed SMTP auth as a "success".
 SMTP_SUCCESS_RE = re.compile(
-    r'\[(?P<ip>\d+\.\d+\.\d+\.\d+)\].*sasl_username=(?P<user>\S+)'
+    r'client=[^,\s]*\[(?P<ip>\d+\.\d+\.\d+\.\d+)\].*sasl_method=\S+.*sasl_username=(?P<user>\S+)'
 )
 IMAP_SUCCESS_RE = re.compile(
     r'Login: user=<(?P<user>[^>]+)>.*rip=(?P<ip>\d+\.\d+\.\d+\.\d+)'
@@ -79,23 +83,48 @@ def open_log(path):
 
 
 def gather_log_files(main_path, also_rotated):
-    """Return list of log files to scan, oldest first."""
+    """Return list of log files to scan, oldest first.
+
+    Handles two rotated-log naming conventions:
+      - Debian/Ubuntu: maillog.1, maillog.2.gz, maillog.3.gz, ...
+      - RHEL/AlmaLinux logrotate dateext: maillog-YYYYMMDD, maillog-YYYYMMDD.gz
+
+    For the dash-date form we sort oldest-first by the date suffix.
+    For the numeric form we sort oldest-first by descending numeric suffix.
+    """
     files = []
+
     if also_rotated:
-        patterns = [main_path + '.*']
-        for pattern in patterns:
-            for p in glob.glob(pattern):
-                if os.path.isfile(p):
-                    files.append(p)
-        # sort rotated files — maillog.1 newest among rotated, maillog.10 oldest.
-        # Oldest first means higher numeric suffixes first.
-        def rotated_key(p):
+        # Numeric-suffix rotated files (maillog.1, maillog.2.gz, ...)
+        numeric = []
+        for p in glob.glob(main_path + '.*'):
+            if os.path.isfile(p):
+                base = os.path.basename(p)
+                # Skip if it's actually a dash-date file that happened to glob-match
+                suffix_parts = base[len(os.path.basename(main_path)) + 1:].split('.')
+                if suffix_parts and suffix_parts[0].isdigit():
+                    numeric.append(p)
+
+        def numeric_key(p):
             base = os.path.basename(p)
             for part in base.split('.')[::-1]:
                 if part.isdigit():
                     return -int(part)
             return 0
-        files.sort(key=rotated_key)
+        numeric.sort(key=numeric_key)
+
+        # Dash-date rotated files (maillog-YYYYMMDD, maillog-YYYYMMDD.gz)
+        # E.g. /var/log/maillog → /var/log/maillog-20260329
+        dated = []
+        date_re = re.compile(r'-(\d{8})(?:\.gz)?$')
+        for p in glob.glob(main_path + '-*'):
+            if os.path.isfile(p) and date_re.search(p):
+                dated.append(p)
+        dated.sort()  # lexical sort on YYYYMMDD == chronological, oldest first
+
+        files.extend(numeric)
+        files.extend(dated)
+
     if os.path.isfile(main_path):
         files.append(main_path)
     return files
@@ -133,13 +162,17 @@ def process_file(path, db, geoip, cutoff_ts, dry_run, stats):
             user = None
             service = None
 
-            if 'sasl_username=' in line:
+            # SMTP: gated on sasl_method= (only present on real successes).
+            # Extra belt-and-braces: skip any line that contains the
+            # string 'authentication failed' just in case a future Postfix
+            # variant logs sasl_method= on a failure path.
+            if 'sasl_method=' in line and 'authentication failed' not in line:
                 m = SMTP_SUCCESS_RE.search(line)
                 if m:
                     ip = m.group('ip')
                     user = m.group('user')
                     service = 'smtp'
-            elif 'Login: user=' in line:
+            elif 'Login: user=' in line and 'dovecot' in line:
                 m = IMAP_SUCCESS_RE.search(line)
                 if m:
                     ip = m.group('ip')
