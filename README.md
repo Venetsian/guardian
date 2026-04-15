@@ -6,14 +6,17 @@ WP-Guardian monitors web, SMTP, IMAP/POP3, and SSH logs, automatically blocks at
 
 ## Features
 
-- **Multi-service monitoring** — web access logs, mail (Postfix + Dovecot), SSH
+- **Multi-service monitoring** — web access logs, mail (Postfix + Dovecot), Roundcube webmail, SSH
 - **Pluggable firewall backends** — CSF, firewalld, nftables, MikroTik, pfSense/OPNsense
 - **Smart detection pipeline** — structural tripwires, known webshells, login isolation (CSS-based bot detection), brute force thresholds, PHP scanning detection, author enumeration, 404 storms
+- **Credential compromise detection (v1.4+)** — `DistributedAuthDetector` catches the classic distributed credential-abuse botnet pattern (same mailbox authenticating from many countries/ASNs/IPs in a short window), automatically blocks source IPs, and disables the mailbox in the mail backend
+- **GeoIP enrichment (v1.4+)** — every auth event and block is tagged with country, city, ASN, and ASN organization via MaxMind GeoLite2
 - **Three-tier escalation** — 24h block, 30d block, permanent ban with automatic tier advancement
 - **CIDR /24 aggregation** — auto-blocks entire subnets when coordinated scanning is detected
 - **Authenticated user protection** — WordPress-logged-in users are never auto-blocked
-- **Telegram alerts** — real-time notifications for every block, with daily summaries
-- **Telegram commands** — manage blocks and whitelists remotely via Telegram chat (`/status`, `/unblock`, `/whitelist`, `/history`)
+- **Telegram alerts** — real-time notifications for every block, plus three alert modes (verbose/digest/quiet) as of v1.4
+- **Telegram commands** — manage blocks, whitelists, and compromise events remotely via Telegram chat (`/status`, `/unblock`, `/whitelist`, `/history`, `/authmap`, `/suspects`, `/disable`, `/enable`, `/compromises`, `/resolve`)
+- **Per-account auth map (v1.4+)** — `--auth-map`, `--auth-suspects`, `--hunt-compromises` for investigating account activity and surfacing pre-existing compromises
 - **Automated tripwire discovery** — learns attack patterns from your access logs
 - **Auto log discovery** — finds and monitors new access logs automatically
 - **Update & rollback** — `git pull` + one command to update, with automatic backups

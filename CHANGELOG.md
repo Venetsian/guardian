@@ -1,5 +1,117 @@
 # WP-Guardian Changelog
 
+## v1.4.0 — Mail Hardening Release (2026-04-15)
+
+Headline feature: **DistributedAuthDetector** catches the classic distributed
+credential-abuse botnet pattern (same account, many countries/ASNs/IPs in a
+short window) and automatically disables the mailbox + blocks attacker IPs.
+
+### Major features
+
+- **DistributedAuthDetector** — fires on every successful auth when the same
+  username crosses a distinct-countries / distinct-ASNs / distinct-IPs
+  threshold over a sliding window. Triggers the configured compromise action.
+- **GeoIP enrichment** — auth events and blocks now carry country, city,
+  ASN, and ASN organization (MaxMind GeoLite2-City + GeoLite2-ASN, LRU-cached).
+- **RoundcubeDetector** — tails Roundcube `errors.log` and threshold-blocks
+  failed webmail logins.
+- **CompromiseAction** — orchestrates the response: records a compromise
+  event, blocks all attacker IPs from the window, disables the mailbox via
+  MailBackend, sends an immediate Telegram alert (never digested).
+- **MailBackend / MariaDB integration** — new `[mail_backend]` section lets
+  Guardian disable/enable mailboxes in a Postfixadmin/Mailcow-style
+  `virtual_users` table via a least-privilege SQL user.
+- **Per-account auth map** — `--auth-map`, `--auth-suspects`,
+  `--hunt-compromises` plus matching Telegram commands.
+- **Telegram alert modes** — `verbose` (v1.3 behavior, default), `digest`
+  (tier-1/2 blocks aggregated into hourly summaries), `quiet` (only
+  high-priority events immediate). Compromise / tier-3 / CIDR /24 /
+  BLOCK FAILED are always immediate regardless of mode.
+- **Profile config** — `[profile] mode = steady | migration`. Migration mode
+  loosens brute-force thresholds for post-cutover periods while keeping
+  country/ASN compromise rules tight.
+- **Compromise hunt CLI** — `--hunt-compromises` replays detector logic
+  against historical data; `--auto-act` optionally applies the configured
+  compromise action.
+- **Mailbox management CLI + Telegram** — `--disable-mailbox`,
+  `--enable-mailbox`, `--list-compromise-events`, `--resolve-compromise`,
+  and `/disable`, `/enable`, `/compromises`, `/resolve`.
+- **Backfill tool** — `tools/backfill_maillog.py` imports recent maillog
+  history (current + rotated .gz) into `auth_sessions` so detectors and
+  `--auth-map` have data on day one.
+- **Internal DB dialect layer** — `_SQLDialect` abstraction marks the
+  SQLite-specific surface as foundation for a v1.5 pluggable MySQL backend.
+
+### New CLI commands
+
+- `--auth-map <user>`, `--auth-suspects`, `--hunt-compromises [--auto-act]`
+- `--disable-mailbox <user>`, `--enable-mailbox <user>`, `--reason "..."`
+- `--list-compromise-events [--open-only]`, `--resolve-compromise <id> [--note]`
+- `--days N`, `--min-ips N` modifiers
+
+### New Telegram commands
+
+- `/authmap <user> [days]`, `/suspects [days] [minips]`
+- `/disable <user> [reason]`, `/enable <user>`
+- `/compromises [open]`, `/resolve <event_id> [note]`
+
+### New config
+
+- `[profile]` — `mode` (steady|migration)
+- `[compromise_detection]` — `enabled`, `window_seconds`,
+  `threshold_distinct_countries`, `threshold_distinct_asns`,
+  `threshold_distinct_ips`, `action`, `suppression_seconds`, `exclude_usernames`
+- `[mail_backend]` — `type`, `host`, `port`, `database`, `user`, `password`,
+  `table`, `email_column`, `enabled_column`
+- `[geoip]` — `city_database_path`, `asn_database_path`, `cache_size`,
+  `on_missing_db` (replaces v1.3 `database_path`)
+- `[telegram]` — `alert_mode`, `digest_interval`, `digest_max_events`
+- `[thresholds]` — `roundcube_fail_threshold`
+- `[log_paths]` — `roundcube_log`
+
+### New database schema (migrations 002–005)
+
+- `auth_sessions.geoip_asn`, `auth_sessions.geoip_asn_org`
+- `ip_history.geoip_asn`, `ip_history.geoip_asn_org`
+- Indexes: `idx_auth_username_ts`, `idx_auth_country_ts`
+- `compromise_events` table + indexes
+- `mailbox_actions` audit log
+- `alert_digest_buffer` for digest-mode Telegram alerts
+- `CURRENT_SCHEMA_VERSION` bumped from 1 to 5
+
+### New dependencies (optional)
+
+- `geoip2>=4.7.0` — required only when `[geoip] enabled = true`
+- `PyMySQL>=1.0.0` — required only when `[mail_backend] type != none`
+
+Both lazy-imported. Existing v1.3 deployments upgrading via `git pull`
+see zero behavioral change until they opt in.
+
+### Files added
+
+- `modules/geoip.py`, `modules/mail_backend.py`, `modules/compromise.py`,
+  `modules/digest.py`
+- `migrations/002_geoip_asn_columns.sql`,
+  `migrations/003_compromise_events_table.sql`,
+  `migrations/004_mailbox_actions_table.sql`,
+  `migrations/005_alert_digest_buffer.sql`
+- `tools/backfill_maillog.py`
+
+### Files changed
+
+- `wp-guardian.py` — new detectors, Guardian wiring, CLI handlers, profile
+- `modules/database.py` — schema, `_SQLDialect`, v1.4 query methods
+- `modules/migrator.py` — `CURRENT_SCHEMA_VERSION = 5`
+- `modules/blocker.py` — digest buffer routing
+- `actions/telegram.py` — `alert_compromise()`
+- `actions/telegram_commands.py` — six new v1.4 commands
+- `wp-guardian.conf`, `wp-guardian.conf.example` — new sections
+- `requirements.txt` — geoip2, PyMySQL
+- `install.sh` — GeoIP, compromise detection, mail backend, profile, alert mode prompts
+- `VERSION` — 1.4.0
+
+---
+
 ## v1.3.0 — Tripwire Management (2026-02-28)
 
 ### Tripwire Removal & Manual Review

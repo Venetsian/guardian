@@ -155,6 +155,48 @@ class TelegramAlerter:
         )
         self.send(msg, priority='CRITICAL')
 
+    def alert_compromise(self, username, service, trigger_rule, counts,
+                         ips_blocked, mailbox_disabled, event_id):
+        """Alert about a detected credential compromise (v1.4+).
+
+        Always sent immediately — never digested.
+        """
+        trigger_labels = {
+            'countries': 'distinct countries',
+            'asns': 'distinct ASNs',
+            'ips': 'distinct IPs',
+        }
+        label = trigger_labels.get(trigger_rule, trigger_rule)
+        trigger_count = counts.get(trigger_rule, 0)
+
+        disable_line = "✅ disabled" if mailbox_disabled else "⚠️ NOT disabled (disable manually)"
+
+        msg = (
+            "🔴 <b>COMPROMISE DETECTED</b>\n"
+            "Account: <code>{user}</code>\n"
+            "Service: {svc}\n"
+            "Trigger: {tc} {label} in the last window\n"
+            "Distinct IPs: {ips}\n"
+            "Distinct countries: {countries}\n"
+            "Distinct ASNs: {asns}\n"
+            "\n"
+            "IPs blocked: {b}\n"
+            "Mailbox: {dl}\n"
+            "Event ID: {eid}\n"
+            "\n"
+            "Review: <code>wp-guardian.py --auth-map {user}</code>"
+        ).format(
+            user=username, svc=service,
+            tc=trigger_count, label=label,
+            ips=counts.get('ips', 0),
+            countries=counts.get('countries', 0),
+            asns=counts.get('asns', 0),
+            b=ips_blocked,
+            dl=disable_line,
+            eid=event_id,
+        )
+        self.send(msg, priority='CRITICAL')
+
     def alert_daily_summary(self, stats):
         """Send daily summary."""
         msg = (

@@ -35,6 +35,14 @@ class Blocker:
         # Backend name for logging
         self._backend_name = config.get('firewall', 'backend', fallback='csf')
 
+        # Digest buffer (set later by Guardian.__init__). When present,
+        # routine blocks (tier 1/2) may be buffered instead of sent immediately.
+        self.digest_buffer = None
+
+    def set_digest_buffer(self, digest_buffer):
+        """Wire in the digest buffer for alert routing."""
+        self.digest_buffer = digest_buffer
+
     def block(self, ip, reason, service='web', country='', city='', site=''):
         """
         Main blocking entry point.
@@ -92,8 +100,24 @@ class Blocker:
             logger.info(f"BLOCKED {ip} tier={tier} duration={duration} via={self._backend_name} "
                        f"service={service}{site_tag} reason={reason}")
 
-            # Telegram alert for ALL blocks
-            self.telegram.alert_block(ip, tier, reason, service, country, city, site)
+            # Telegram alert routing:
+            # - tier 3 blocks are always immediate
+            # - in verbose mode or when no digest buffer, send immediately
+            # - in digest/quiet modes, tier 1/2 routine blocks go to the buffer
+            event_type = 'tier3_block' if tier >= 3 else 'block'
+            severity = 'high' if tier >= 2 else 'medium'
+            if self.digest_buffer and not self.digest_buffer.is_immediate(event_type, severity):
+                summary = "T{t} {svc} {ip}: {r}".format(
+                    t=tier, svc=service, ip=ip, r=reason[:100]
+                )
+                payload = {
+                    'ip': ip, 'tier': tier, 'service': service,
+                    'country': country, 'city': city, 'site': site,
+                    'reason': reason,
+                }
+                self.digest_buffer.queue(event_type, severity, summary, payload=payload)
+            else:
+                self.telegram.alert_block(ip, tier, reason, service, country, city, site)
 
             # Check if this block pushes a /24 subnet over the CIDR threshold
             if self.cidr_enabled and self.firewall.supports_cidr:

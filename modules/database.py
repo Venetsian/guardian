@@ -6,9 +6,32 @@ SQLite schema setup and data access layer.
 import sqlite3
 import time
 import os
+import json
 import logging
 
 logger = logging.getLogger('wp-guardian.db')
+
+
+class _SQLDialect:
+    """
+    Minimal abstraction over SQLite-vs-MySQL syntax differences.
+    v1.4 ships with SQLite-only implementation. v1.5 adds MySQL.
+
+    Foundation for the pluggable-backend refactor. Bare SQL strings
+    in this module should reference these constants when they need
+    the dialect-specific form, so swapping drivers later touches
+    a small, well-defined surface.
+    """
+
+    PLACEHOLDER = '?'  # SQLite. v1.5 MySQL: '%s'
+    AUTOINC_PRIMARY_KEY = 'INTEGER PRIMARY KEY AUTOINCREMENT'  # v1.5 MySQL: 'INT AUTO_INCREMENT PRIMARY KEY'
+    INSERT_OR_IGNORE = 'INSERT OR IGNORE'  # v1.5 MySQL: 'INSERT IGNORE'
+
+    @staticmethod
+    def time_minus(seconds):
+        """SQL fragment for 'now minus N seconds'."""
+        # SQLite: datetime('now', '-Ns'). MySQL: NOW() - INTERVAL N SECOND.
+        return "datetime('now', '-{n} seconds')".format(n=int(seconds))
 
 
 class GuardianDB:
@@ -43,7 +66,9 @@ class GuardianDB:
                 last_block_reason  TEXT DEFAULT '',
                 last_block_service TEXT DEFAULT '',
                 geoip_country   TEXT DEFAULT '',
-                geoip_city      TEXT DEFAULT ''
+                geoip_city      TEXT DEFAULT '',
+                geoip_asn       INTEGER DEFAULT 0,
+                geoip_asn_org   TEXT DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS auth_sessions (
@@ -54,12 +79,68 @@ class GuardianDB:
                 username    TEXT NOT NULL,
                 site        TEXT DEFAULT '',
                 geoip_country TEXT DEFAULT '',
-                geoip_city  TEXT DEFAULT ''
+                geoip_city  TEXT DEFAULT '',
+                geoip_asn   INTEGER DEFAULT 0,
+                geoip_asn_org TEXT DEFAULT ''
             );
 
             CREATE INDEX IF NOT EXISTS idx_auth_ip ON auth_sessions(ip);
             CREATE INDEX IF NOT EXISTS idx_auth_service_user ON auth_sessions(service, username);
             CREATE INDEX IF NOT EXISTS idx_auth_timestamp ON auth_sessions(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_auth_username_ts ON auth_sessions(username, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_auth_country_ts ON auth_sessions(geoip_country, timestamp);
+
+            CREATE TABLE IF NOT EXISTS compromise_events (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                detected_at         INTEGER NOT NULL,
+                username            TEXT NOT NULL,
+                service             TEXT NOT NULL,
+                trigger_rule        TEXT NOT NULL,
+                trigger_count       INTEGER NOT NULL,
+                window_seconds      INTEGER NOT NULL,
+                distinct_ips        INTEGER NOT NULL,
+                distinct_countries  INTEGER NOT NULL,
+                distinct_asns       INTEGER NOT NULL,
+                sample_ips          TEXT DEFAULT '',
+                sample_countries    TEXT DEFAULT '',
+                action_taken        TEXT NOT NULL,
+                mailbox_disabled    INTEGER DEFAULT 0,
+                ips_blocked_count   INTEGER DEFAULT 0,
+                notes               TEXT DEFAULT '',
+                resolved_at         INTEGER DEFAULT 0,
+                resolved_by         TEXT DEFAULT ''
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_compromise_username ON compromise_events(username);
+            CREATE INDEX IF NOT EXISTS idx_compromise_detected ON compromise_events(detected_at);
+            CREATE INDEX IF NOT EXISTS idx_compromise_open ON compromise_events(resolved_at);
+
+            CREATE TABLE IF NOT EXISTS mailbox_actions (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                performed_at            INTEGER NOT NULL,
+                username                TEXT NOT NULL,
+                action                  TEXT NOT NULL,
+                actor                   TEXT NOT NULL,
+                reason                  TEXT DEFAULT '',
+                related_compromise_id   INTEGER DEFAULT 0,
+                success                 INTEGER NOT NULL,
+                error_message           TEXT DEFAULT ''
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_mailbox_actions_username ON mailbox_actions(username);
+            CREATE INDEX IF NOT EXISTS idx_mailbox_actions_performed ON mailbox_actions(performed_at);
+
+            CREATE TABLE IF NOT EXISTS alert_digest_buffer (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                queued_at       INTEGER NOT NULL,
+                event_type      TEXT NOT NULL,
+                severity        TEXT NOT NULL,
+                summary         TEXT NOT NULL,
+                payload_json    TEXT DEFAULT '',
+                flushed         INTEGER DEFAULT 0
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_digest_unflushed ON alert_digest_buffer(flushed, queued_at);
 
             CREATE TABLE IF NOT EXISTS account_baselines (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -156,9 +237,23 @@ class GuardianDB:
         cursor = self.conn.execute("SELECT * FROM ip_history WHERE ip = ?", (ip,))
         return cursor.fetchone()
 
-    def track_ip(self, ip, service='web', country='', city=''):
-        """Record a hit for an IP. Creates entry if new."""
+    def track_ip(self, ip, service='web', country='', city='', geo=None):
+        """Record a hit for an IP. Creates entry if new.
+
+        Accepts either legacy country=/city= kwargs or a geo dict with keys
+        country/city/asn/asn_org (v1.4+). A geo dict takes precedence.
+        """
         now = int(time.time())
+
+        if geo:
+            country = geo.get('country', country) or country
+            city = geo.get('city', city) or city
+            asn = int(geo.get('asn', 0) or 0)
+            asn_org = geo.get('asn_org', '') or ''
+        else:
+            asn = 0
+            asn_org = ''
+
         existing = self.get_ip(ip)
 
         if existing:
@@ -166,14 +261,18 @@ class GuardianDB:
                 UPDATE ip_history
                 SET last_seen = ?, total_hits = total_hits + 1,
                     geoip_country = COALESCE(NULLIF(?, ''), geoip_country),
-                    geoip_city = COALESCE(NULLIF(?, ''), geoip_city)
+                    geoip_city = COALESCE(NULLIF(?, ''), geoip_city),
+                    geoip_asn = CASE WHEN ? > 0 THEN ? ELSE geoip_asn END,
+                    geoip_asn_org = COALESCE(NULLIF(?, ''), geoip_asn_org)
                 WHERE ip = ?
-            """, (now, country, city, ip))
+            """, (now, country, city, asn, asn, asn_org, ip))
         else:
             self.conn.execute("""
-                INSERT INTO ip_history (ip, first_seen, last_seen, total_hits, geoip_country, geoip_city)
-                VALUES (?, ?, ?, 1, ?, ?)
-            """, (ip, now, now, country, city))
+                INSERT INTO ip_history
+                    (ip, first_seen, last_seen, total_hits,
+                     geoip_country, geoip_city, geoip_asn, geoip_asn_org)
+                VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+            """, (ip, now, now, country, city, asn, asn_org))
 
         self.conn.commit()
 
@@ -259,14 +358,47 @@ class GuardianDB:
     # ------------------------------------------------------------------
     # Authenticated Sessions
     # ------------------------------------------------------------------
-    def record_auth(self, ip, service, username, site='', country='', city=''):
-        """Record a successful authentication."""
-        now = int(time.time())
+    def record_auth(self, ip, service, username, site='', country='', city='',
+                    geo=None, timestamp=None):
+        """Record a successful authentication.
+
+        Accepts either legacy country=/city= kwargs (v1.3) or a geo dict
+        with keys country/city/asn/asn_org (v1.4+). If both are provided,
+        keys present in the geo dict take precedence.
+
+        An explicit `timestamp` may be provided for historical inserts
+        (used by the backfill tool). Defaults to current time.
+        """
+        if timestamp is None:
+            timestamp = int(time.time())
+
+        if geo:
+            country = geo.get('country', country) or country
+            city = geo.get('city', city) or city
+            asn = int(geo.get('asn', 0) or 0)
+            asn_org = geo.get('asn_org', '') or ''
+        else:
+            asn = 0
+            asn_org = ''
+
         self.conn.execute("""
-            INSERT INTO auth_sessions (ip, timestamp, service, username, site, geoip_country, geoip_city)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (ip, now, service, username, site, country, city))
+            INSERT INTO auth_sessions
+                (ip, timestamp, service, username, site,
+                 geoip_country, geoip_city, geoip_asn, geoip_asn_org)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (ip, int(timestamp), service, username, site,
+              country, city, asn, asn_org))
         self.conn.commit()
+
+    def auth_session_exists(self, ip, username, timestamp, tolerance=2):
+        """Idempotency check for the backfill tool.
+        Returns True if a near-identical auth row already exists."""
+        cursor = self.conn.execute(
+            "SELECT 1 FROM auth_sessions WHERE ip = ? AND username = ? "
+            "AND timestamp BETWEEN ? AND ? LIMIT 1",
+            (ip, username, int(timestamp) - tolerance, int(timestamp) + tolerance)
+        )
+        return cursor.fetchone() is not None
 
     def is_ip_authenticated(self, ip, trust_duration_seconds):
         """Check if IP has a recent successful WordPress login."""
@@ -587,6 +719,302 @@ class GuardianDB:
         ).fetchone()[0]
 
         return stats
+
+    # ------------------------------------------------------------------
+    # v1.4 — Compromise detection queries (auth-map, distributed-auth)
+    # ------------------------------------------------------------------
+    def distinct_auth_counts(self, username, window_seconds):
+        """Count distinct dimensions across successful auths for a user
+        over the sliding window. Used by DistributedAuthDetector on every
+        successful auth.
+
+        Returns: {'countries': int, 'asns': int, 'ips': int}
+        """
+        cutoff = int(time.time()) - int(window_seconds)
+        row = self.conn.execute(
+            "SELECT COUNT(DISTINCT CASE WHEN geoip_country != '' THEN geoip_country END) AS countries, "
+            "       COUNT(DISTINCT CASE WHEN geoip_asn > 0 THEN geoip_asn END) AS asns, "
+            "       COUNT(DISTINCT ip) AS ips "
+            "FROM auth_sessions WHERE username = ? AND timestamp >= ?",
+            (username, cutoff)
+        ).fetchone()
+        if not row:
+            return {'countries': 0, 'asns': 0, 'ips': 0}
+        return {
+            'countries': row['countries'] or 0,
+            'asns': row['asns'] or 0,
+            'ips': row['ips'] or 0,
+        }
+
+    def recent_auth_ips(self, username, window_seconds, limit=1000):
+        """Return distinct IPs that authenticated as this user in the window."""
+        cutoff = int(time.time()) - int(window_seconds)
+        cursor = self.conn.execute(
+            "SELECT DISTINCT ip FROM auth_sessions "
+            "WHERE username = ? AND timestamp >= ? LIMIT ?",
+            (username, cutoff, limit)
+        )
+        return [row['ip'] for row in cursor.fetchall()]
+
+    def recent_auth_countries(self, username, window_seconds):
+        """Return distinct countries for this user in the window."""
+        cutoff = int(time.time()) - int(window_seconds)
+        cursor = self.conn.execute(
+            "SELECT DISTINCT geoip_country FROM auth_sessions "
+            "WHERE username = ? AND timestamp >= ? AND geoip_country != ''",
+            (username, cutoff)
+        )
+        return [row['geoip_country'] for row in cursor.fetchall()]
+
+    def auth_map_for_user(self, username, days=30):
+        """Per-IP auth summary for a user over the last `days`.
+
+        Returns a list of dicts ordered by last_seen DESC.
+        """
+        cutoff = int(time.time()) - int(days) * 86400
+        cursor = self.conn.execute(
+            "SELECT ip, "
+            "       MAX(geoip_country) AS country, "
+            "       MAX(geoip_city) AS city, "
+            "       MAX(geoip_asn) AS asn, "
+            "       MAX(geoip_asn_org) AS asn_org, "
+            "       MIN(timestamp) AS first_seen, "
+            "       MAX(timestamp) AS last_seen, "
+            "       COUNT(*) AS hit_count, "
+            "       GROUP_CONCAT(DISTINCT service) AS services "
+            "FROM auth_sessions "
+            "WHERE username = ? AND timestamp >= ? "
+            "GROUP BY ip "
+            "ORDER BY last_seen DESC",
+            (username, cutoff)
+        )
+        results = []
+        for row in cursor.fetchall():
+            services = (row['services'] or '').split(',') if row['services'] else []
+            results.append({
+                'ip': row['ip'],
+                'country': row['country'] or '',
+                'city': row['city'] or '',
+                'asn': row['asn'] or 0,
+                'asn_org': row['asn_org'] or '',
+                'first_seen': row['first_seen'],
+                'last_seen': row['last_seen'],
+                'count': row['hit_count'],
+                'services': services,
+            })
+        return results
+
+    def auth_map_summary(self, username, days=30):
+        """Aggregate totals for --auth-map footer."""
+        cutoff = int(time.time()) - int(days) * 86400
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS total, "
+            "       COUNT(DISTINCT ip) AS ips, "
+            "       COUNT(DISTINCT CASE WHEN geoip_country != '' THEN geoip_country END) AS countries, "
+            "       COUNT(DISTINCT CASE WHEN geoip_asn > 0 THEN geoip_asn END) AS asns, "
+            "       MIN(timestamp) AS first_seen, "
+            "       MAX(timestamp) AS last_seen "
+            "FROM auth_sessions WHERE username = ? AND timestamp >= ?",
+            (username, cutoff)
+        ).fetchone()
+        return {
+            'total_auths': row['total'] or 0,
+            'distinct_ips': row['ips'] or 0,
+            'distinct_countries': row['countries'] or 0,
+            'distinct_asns': row['asns'] or 0,
+            'first_seen': row['first_seen'],
+            'last_seen': row['last_seen'],
+        }
+
+    def suspect_accounts(self, days=7, min_distinct_ips=10):
+        """Find accounts with distributed-source auth patterns."""
+        cutoff = int(time.time()) - int(days) * 86400
+        cursor = self.conn.execute(
+            "SELECT username, "
+            "       COUNT(DISTINCT ip) AS ips, "
+            "       COUNT(DISTINCT CASE WHEN geoip_country != '' THEN geoip_country END) AS countries, "
+            "       COUNT(DISTINCT CASE WHEN geoip_asn > 0 THEN geoip_asn END) AS asns, "
+            "       COUNT(*) AS total, "
+            "       MIN(timestamp) AS first_seen, "
+            "       MAX(timestamp) AS last_seen "
+            "FROM auth_sessions "
+            "WHERE timestamp >= ? AND username != '' "
+            "GROUP BY username "
+            "HAVING ips >= ? "
+            "ORDER BY ips DESC",
+            (cutoff, int(min_distinct_ips))
+        )
+        results = []
+        for row in cursor.fetchall():
+            sample_cursor = self.conn.execute(
+                "SELECT DISTINCT ip FROM auth_sessions "
+                "WHERE username = ? AND timestamp >= ? LIMIT 10",
+                (row['username'], cutoff)
+            )
+            sample = [r['ip'] for r in sample_cursor.fetchall()]
+            results.append({
+                'username': row['username'],
+                'distinct_ips': row['ips'],
+                'distinct_countries': row['countries'],
+                'distinct_asns': row['asns'],
+                'total_auths': row['total'],
+                'first_seen': row['first_seen'],
+                'last_seen': row['last_seen'],
+                'sample_ips': sample,
+            })
+        return results
+
+    # ------------------------------------------------------------------
+    # v1.4 — compromise_events
+    # ------------------------------------------------------------------
+    def insert_compromise_event(self, username, service, trigger_rule, counts,
+                                window_seconds, sample_ips=None, sample_countries=None,
+                                action_taken='pending', notes=''):
+        """Insert a compromise_events row; returns new id."""
+        now = int(time.time())
+        trigger_count = counts.get(trigger_rule, 0)
+        cursor = self.conn.execute(
+            "INSERT INTO compromise_events "
+            "(detected_at, username, service, trigger_rule, trigger_count, window_seconds, "
+            " distinct_ips, distinct_countries, distinct_asns, "
+            " sample_ips, sample_countries, action_taken, notes) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (now, username, service, trigger_rule, trigger_count, int(window_seconds),
+             counts.get('ips', 0), counts.get('countries', 0), counts.get('asns', 0),
+             json.dumps(list(sample_ips or [])[:20]),
+             json.dumps(list(sample_countries or [])[:20]),
+             action_taken, notes)
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def update_compromise_event(self, event_id, updates):
+        """Update arbitrary columns on a compromise_events row."""
+        if not updates:
+            return
+        cols = ', '.join("{k} = ?".format(k=k) for k in updates.keys())
+        values = list(updates.values()) + [event_id]
+        self.conn.execute(
+            "UPDATE compromise_events SET {cols} WHERE id = ?".format(cols=cols),
+            values
+        )
+        self.conn.commit()
+
+    def list_compromise_events(self, open_only=False, limit=50):
+        """List recent compromise_events rows."""
+        if open_only:
+            cursor = self.conn.execute(
+                "SELECT * FROM compromise_events WHERE resolved_at = 0 "
+                "ORDER BY detected_at DESC LIMIT ?", (limit,)
+            )
+        else:
+            cursor = self.conn.execute(
+                "SELECT * FROM compromise_events ORDER BY detected_at DESC LIMIT ?",
+                (limit,)
+            )
+        return cursor.fetchall()
+
+    def get_compromise_event(self, event_id):
+        cursor = self.conn.execute(
+            "SELECT * FROM compromise_events WHERE id = ?", (event_id,)
+        )
+        return cursor.fetchone()
+
+    def has_open_compromise(self, username):
+        """True if the user currently has an unresolved compromise_event."""
+        cursor = self.conn.execute(
+            "SELECT 1 FROM compromise_events WHERE username = ? AND resolved_at = 0 LIMIT 1",
+            (username,)
+        )
+        return cursor.fetchone() is not None
+
+    def resolve_compromise_event(self, event_id, resolved_by='cli', note=''):
+        """Mark a compromise event as resolved."""
+        now = int(time.time())
+        if note:
+            self.conn.execute(
+                "UPDATE compromise_events SET resolved_at = ?, resolved_by = ?, "
+                "notes = CASE WHEN notes = '' THEN ? ELSE notes || char(10) || ? END "
+                "WHERE id = ?",
+                (now, resolved_by, note, note, event_id)
+            )
+        else:
+            self.conn.execute(
+                "UPDATE compromise_events SET resolved_at = ?, resolved_by = ? WHERE id = ?",
+                (now, resolved_by, event_id)
+            )
+        self.conn.commit()
+
+    # ------------------------------------------------------------------
+    # v1.4 — mailbox_actions
+    # ------------------------------------------------------------------
+    def insert_mailbox_action(self, username, action, actor, reason='',
+                              related_compromise_id=0, success=True,
+                              error_message=''):
+        """Record a mailbox enable/disable action."""
+        now = int(time.time())
+        self.conn.execute(
+            "INSERT INTO mailbox_actions "
+            "(performed_at, username, action, actor, reason, "
+            " related_compromise_id, success, error_message) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (now, username, action, actor, reason,
+             int(related_compromise_id), 1 if success else 0, error_message)
+        )
+        self.conn.commit()
+
+    def recent_mailbox_actions(self, username=None, limit=20):
+        if username:
+            cursor = self.conn.execute(
+                "SELECT * FROM mailbox_actions WHERE username = ? "
+                "ORDER BY performed_at DESC LIMIT ?", (username, limit)
+            )
+        else:
+            cursor = self.conn.execute(
+                "SELECT * FROM mailbox_actions ORDER BY performed_at DESC LIMIT ?",
+                (limit,)
+            )
+        return cursor.fetchall()
+
+    # ------------------------------------------------------------------
+    # v1.4 — alert digest buffer
+    # ------------------------------------------------------------------
+    def digest_queue(self, event_type, severity, summary, payload=None):
+        """Buffer a low-priority alert for later digest flush."""
+        now = int(time.time())
+        payload_json = json.dumps(payload) if payload else ''
+        self.conn.execute(
+            "INSERT INTO alert_digest_buffer "
+            "(queued_at, event_type, severity, summary, payload_json, flushed) "
+            "VALUES (?, ?, ?, ?, ?, 0)",
+            (now, event_type, severity, summary, payload_json)
+        )
+        self.conn.commit()
+
+    def digest_pending(self, max_events=100):
+        """Return unflushed digest events, oldest first."""
+        cursor = self.conn.execute(
+            "SELECT * FROM alert_digest_buffer WHERE flushed = 0 "
+            "ORDER BY queued_at ASC LIMIT ?", (max_events,)
+        )
+        return cursor.fetchall()
+
+    def digest_mark_flushed(self, ids):
+        """Mark a batch of digest ids as flushed."""
+        if not ids:
+            return
+        placeholders = ','.join('?' * len(ids))
+        self.conn.execute(
+            "UPDATE alert_digest_buffer SET flushed = 1 WHERE id IN ({ph})".format(ph=placeholders),
+            list(ids)
+        )
+        self.conn.commit()
+
+    def digest_count_pending(self):
+        cursor = self.conn.execute(
+            "SELECT COUNT(*) FROM alert_digest_buffer WHERE flushed = 0"
+        )
+        return cursor.fetchone()[0]
 
     def close(self):
         """Close the database connection."""

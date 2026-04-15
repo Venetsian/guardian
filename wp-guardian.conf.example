@@ -49,6 +49,9 @@ imap_nonexistent_user_threshold = 3
 ssh_fail_threshold = 3
 ssh_invalid_user_instant_block = true
 
+# Roundcube webmail failed-login threshold (v1.4+)
+roundcube_fail_threshold = 5
+
 [escalation]
 # Tier 1: first offense
 tier1_duration = 24h
@@ -132,14 +135,25 @@ alias_cidr = wp_guardian_cidr
 file = /opt/wp-guardian/whitelist.conf
 
 [geoip]
-# MaxMind GeoLite2 database (future feature)
+# MaxMind GeoLite2 databases (v1.4+)
+# Enable to geo-enrich auth events and feed DistributedAuthDetector.
+# You must download GeoLite2-City.mmdb and GeoLite2-ASN.mmdb from MaxMind
+# (free registration required). See INSTALL.md for setup instructions.
 enabled = false
-database_path = /opt/wp-guardian/state/geoip/GeoLite2-City.mmdb
 
-# Learning mode duration (days) — alerts only, no geo-based blocking
-learning_days = 7
+# Paths to the .mmdb files
+city_database_path = /opt/wp-guardian/state/geoip/GeoLite2-City.mmdb
+asn_database_path = /opt/wp-guardian/state/geoip/GeoLite2-ASN.mmdb
 
-# Baseline retention (days)
+# LRU cache size (IPs kept in memory). 0 = no cache.
+cache_size = 10000
+
+# What to do if a database file is missing at startup.
+#   fail = refuse to start
+#   warn = log warning, continue with geoip disabled at runtime
+on_missing_db = warn
+
+# Baseline retention (days) — reserved for future geo baseline work
 baseline_retention = 90
 
 [telegram]
@@ -158,6 +172,19 @@ commands_enabled = false
 # Long-poll timeout in seconds (how long to wait for new messages)
 commands_poll_timeout = 30
 
+# Alert mode (v1.4+):
+#   verbose = every block alerts immediately (v1.3 behavior; default for first week of tuning)
+#   digest  = tier-1/tier-2 routine blocks are buffered into an hourly digest message;
+#             compromise, tier-3, CIDR /24 and BLOCK FAILED stay immediate
+#   quiet   = only compromise and BLOCK FAILED alert immediately; everything else digested
+alert_mode = verbose
+
+# Digest flush interval (seconds)
+digest_interval = 3600
+
+# Maximum events per digest message
+digest_max_events = 50
+
 # Quiet hours (don't send low-priority alerts)
 # Format: HH:MM-HH:MM in server local time
 # quiet_hours = 23:00-07:00
@@ -170,6 +197,7 @@ wp_trust_duration = 24
 # Override auto-detected log paths if needed
 # mail_log = /var/log/maillog
 # secure_log = /var/log/secure
+# roundcube_log = /var/www/roundcube/logs/errors.log
 
 [database]
 path = /opt/wp-guardian/state/guardian.db
@@ -188,3 +216,68 @@ discover_interval = 24h
 
 # Auto-analysis removed — use --analyze-tripwires for manual review
 # See: python3 wp-guardian.py --analyze-tripwires
+
+# ---------------------------------------------------------------------------
+# v1.4 — Compromise detection, mail backend, profile
+# ---------------------------------------------------------------------------
+
+[profile]
+# Threshold profile mode.
+#   steady    = tight thresholds for normal operations
+#   migration = loose thresholds for post-cutover periods when legitimate
+#               users are fat-fingering credentials during a migration
+mode = steady
+
+[compromise_detection]
+# DistributedAuthDetector — fires when a single account authenticates from
+# N+ distinct countries / ASNs / IPs in a short window. This catches
+# credential compromise used by distributed credential-abuse botnets.
+#
+# Requires [geoip] enabled = true for the country and ASN rules to work.
+enabled = false
+
+# Sliding window in seconds (default 3600 = 1 hour)
+window_seconds = 3600
+
+# Fire when ANY of these thresholds are hit
+threshold_distinct_countries = 3
+threshold_distinct_asns = 5
+threshold_distinct_ips = 20
+
+# What to do on detection:
+#   alert_only       — record event + Telegram alert, nothing else
+#   block_ips        — alert + block all attacker IPs seen in the window
+#   disable_mailbox  — alert + disable mailbox in the mail backend
+#   full             — alert + block IPs + disable mailbox (default)
+action = full
+
+# Anti-spam: don't re-fire for the same username within this many seconds
+suppression_seconds = 1800
+
+# Exclude usernames matching any of these regex patterns (one per line).
+# Useful for known-mobile users or shared service accounts.
+exclude_usernames =
+
+[mail_backend]
+# Integration with the mail server's MariaDB, so CompromiseAction
+# can disable compromised mailboxes automatically.
+#
+# Currently supported types:
+#   none                  — disabled (default)
+#   mariadb_virtual_users — Postfixadmin/Mailcow-style virtual_users table
+#
+# Operator must create a least-privilege MariaDB user ahead of time:
+#
+#   CREATE USER 'wp_guardian'@'localhost' IDENTIFIED BY '...';
+#   GRANT SELECT (email, enabled), UPDATE (enabled)
+#     ON mailserver.virtual_users TO 'wp_guardian'@'localhost';
+#   FLUSH PRIVILEGES;
+type = none
+host = 127.0.0.1
+port = 3306
+database = mailserver
+user = wp_guardian
+password =
+table = virtual_users
+email_column = email
+enabled_column = enabled

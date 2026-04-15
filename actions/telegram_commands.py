@@ -28,7 +28,8 @@ class TelegramCommander:
     All other messages are silently ignored.
     """
 
-    def __init__(self, config, db, blocker, whitelist, tripwires=None, base_dir=None):
+    def __init__(self, config, db, blocker, whitelist, tripwires=None, base_dir=None,
+                 mail_backend=None, compromise_action=None):
         self.enabled = config.getboolean('telegram', 'commands_enabled', fallback=False)
         self.bot_token = config.get('telegram', 'bot_token', fallback='')
         self.chat_id = config.get('telegram', 'chat_id', fallback='')
@@ -39,6 +40,8 @@ class TelegramCommander:
         self.whitelist = whitelist
         self.tripwires = tripwires  # Shared set reference from Guardian
         self.base_dir = base_dir or '/opt/wp-guardian'
+        self.mail_backend = mail_backend  # may be None/disabled
+        self.compromise_action = compromise_action  # may be None
 
         self.running = False
         self._thread = None
@@ -199,6 +202,13 @@ class TelegramCommander:
             '/tripwires': self._cmd_tripwires,
             '/remove': self._cmd_remove,
             '/help': self._cmd_help,
+            # v1.4
+            '/authmap': self._cmd_authmap,
+            '/suspects': self._cmd_suspects,
+            '/disable': self._cmd_disable,
+            '/enable': self._cmd_enable,
+            '/compromises': self._cmd_compromises,
+            '/resolve': self._cmd_resolve,
         }
 
         handler = handlers.get(command)
@@ -557,6 +567,212 @@ class TelegramCommander:
                 "Use /tripwires &lt;search&gt; to find tripwires.".format(path=path)
             )
 
+    # ------------------------------------------------------------------
+    # v1.4 — compromise detection commands
+    # ------------------------------------------------------------------
+    def _cmd_authmap(self, args):
+        """/authmap <user> [days]"""
+        if not args:
+            self._reply("Usage: /authmap &lt;user&gt; [days]")
+            return
+        username = args[0]
+        days = 7
+        if len(args) >= 2:
+            try:
+                days = int(args[1])
+            except ValueError:
+                pass
+
+        rows = self.db.auth_map_for_user(username, days=days)
+        summary = self.db.auth_map_summary(username, days=days)
+        if not rows:
+            self._reply(
+                "No successful auths for <code>{u}</code> in the last {d} days.".format(
+                    u=username, d=days
+                )
+            )
+            return
+
+        lines = [
+            "<b>Auth map: {u}</b> (last {d}d)".format(u=username, d=days),
+            "━━━━━━━━━━━━━━━━━━━━━",
+            "Total auths: {t}".format(t=summary['total_auths']),
+            "Distinct IPs: {n}".format(n=summary['distinct_ips']),
+            "Distinct countries: {n}".format(n=summary['distinct_countries']),
+            "Distinct ASNs: {n}".format(n=summary['distinct_asns']),
+            "",
+            "<b>Top sources:</b>",
+        ]
+        for row in rows[:10]:
+            last_ts = time.strftime('%m-%d %H:%M', time.localtime(row['last_seen']))
+            loc = row['country'] or '?'
+            if row['city']:
+                loc = "{ct}/{cy}".format(ct=row['country'], cy=row['city'])
+            lines.append("<code>{ip}</code> {loc} ASN{asn} ({c}x, {t})".format(
+                ip=row['ip'], loc=loc, asn=row['asn'] or '-', c=row['count'], t=last_ts
+            ))
+        if len(rows) > 10:
+            lines.append("...({n} more, use --auth-map for full list)".format(n=len(rows) - 10))
+
+        if self.db.has_open_compromise(username):
+            lines.append("")
+            lines.append("⚠ OPEN compromise event for this user")
+
+        self._reply('\n'.join(lines))
+
+    def _cmd_suspects(self, args):
+        """/suspects [days] [minips]"""
+        days = 7
+        min_ips = 10
+        if len(args) >= 1:
+            try:
+                days = int(args[0])
+            except ValueError:
+                pass
+        if len(args) >= 2:
+            try:
+                min_ips = int(args[1])
+            except ValueError:
+                pass
+
+        rows = self.db.suspect_accounts(days=days, min_distinct_ips=min_ips)
+        if not rows:
+            self._reply(
+                "No accounts with {m}+ distinct source IPs in the last {d} days.".format(
+                    m=min_ips, d=days
+                )
+            )
+            return
+
+        lines = [
+            "<b>Suspect accounts</b> (last {d}d, {m}+ IPs)".format(d=days, m=min_ips),
+            "━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        for row in rows[:10]:
+            status = 'COMPROMISED' if self.db.has_open_compromise(row['username']) else ''
+            lines.append(
+                "<code>{u}</code> — {ips} IPs, {c}c, {a}a {st}".format(
+                    u=row['username'], ips=row['distinct_ips'],
+                    c=row['distinct_countries'], a=row['distinct_asns'],
+                    st=('⚠ ' + status) if status else ''
+                )
+            )
+        if len(rows) > 10:
+            lines.append("...({n} more, use --auth-suspects for full list)".format(n=len(rows) - 10))
+
+        self._reply('\n'.join(lines))
+
+    def _cmd_disable(self, args):
+        """/disable <user> [reason]"""
+        if not args:
+            self._reply("Usage: /disable &lt;user&gt; [reason]")
+            return
+        if not self.mail_backend or not getattr(self.mail_backend, 'enabled', False):
+            self._reply("Mail backend not configured. Cannot disable mailboxes.")
+            return
+
+        username = args[0]
+        reason = ' '.join(args[1:]).strip() or 'manual Telegram disable'
+        try:
+            changed = self.mail_backend.disable_mailbox(username)
+            self.db.insert_mailbox_action(
+                username=username, action='disable',
+                actor='telegram:{cid}'.format(cid=self.chat_id),
+                reason=reason, success=True,
+            )
+            if changed:
+                self._reply("Disabled mailbox: <code>{u}</code>".format(u=username))
+            else:
+                self._reply(
+                    "Mailbox already disabled or not found: <code>{u}</code>".format(u=username)
+                )
+        except Exception as e:
+            self.db.insert_mailbox_action(
+                username=username, action='disable',
+                actor='telegram:{cid}'.format(cid=self.chat_id),
+                reason=reason, success=False, error_message=str(e),
+            )
+            self._reply("Failed to disable {u}: {e}".format(u=username, e=str(e)[:200]))
+
+    def _cmd_enable(self, args):
+        """/enable <user>"""
+        if not args:
+            self._reply("Usage: /enable &lt;user&gt;")
+            return
+        if not self.mail_backend or not getattr(self.mail_backend, 'enabled', False):
+            self._reply("Mail backend not configured. Cannot enable mailboxes.")
+            return
+
+        username = args[0]
+        try:
+            changed = self.mail_backend.enable_mailbox(username)
+            self.db.insert_mailbox_action(
+                username=username, action='enable',
+                actor='telegram:{cid}'.format(cid=self.chat_id),
+                reason='manual Telegram enable', success=True,
+            )
+            if changed:
+                self._reply("Enabled mailbox: <code>{u}</code>".format(u=username))
+            else:
+                self._reply(
+                    "Mailbox already enabled or not found: <code>{u}</code>".format(u=username)
+                )
+        except Exception as e:
+            self.db.insert_mailbox_action(
+                username=username, action='enable',
+                actor='telegram:{cid}'.format(cid=self.chat_id),
+                reason='manual Telegram enable', success=False, error_message=str(e),
+            )
+            self._reply("Failed to enable {u}: {e}".format(u=username, e=str(e)[:200]))
+
+    def _cmd_compromises(self, args):
+        """/compromises [open]"""
+        open_only = bool(args) and args[0].lower() == 'open'
+        rows = self.db.list_compromise_events(open_only=open_only, limit=20)
+        if not rows:
+            self._reply("No compromise events." if not open_only else "No open compromise events.")
+            return
+
+        header = "<b>Open compromise events</b>" if open_only else "<b>Compromise events</b>"
+        lines = [header, "━━━━━━━━━━━━━━━━━━━━━"]
+        for r in rows:
+            when = time.strftime('%m-%d %H:%M', time.localtime(r['detected_at']))
+            status = 'OPEN' if not r['resolved_at'] else 'resolved'
+            lines.append(
+                "[{i}] {w} <code>{u}</code> trig={r} act={a} ({s})".format(
+                    i=r['id'], w=when, u=r['username'],
+                    r=r['trigger_rule'], a=r['action_taken'], s=status
+                )
+            )
+        self._reply('\n'.join(lines))
+
+    def _cmd_resolve(self, args):
+        """/resolve <event_id> [note]"""
+        if not args:
+            self._reply("Usage: /resolve &lt;event_id&gt;")
+            return
+        try:
+            event_id = int(args[0])
+        except ValueError:
+            self._reply("Invalid event id: {x}".format(x=args[0]))
+            return
+        event = self.db.get_compromise_event(event_id)
+        if not event:
+            self._reply("No compromise event with id {i}".format(i=event_id))
+            return
+        if event['resolved_at']:
+            self._reply("Event {i} is already resolved.".format(i=event_id))
+            return
+        note = ' '.join(args[1:]).strip()
+        self.db.resolve_compromise_event(
+            event_id,
+            resolved_by='telegram:{cid}'.format(cid=self.chat_id),
+            note=note,
+        )
+        self._reply("Resolved compromise event {i} (<code>{u}</code>)".format(
+            i=event_id, u=event['username']
+        ))
+
     def _cmd_help(self, args):
         """Handle /help command."""
         msg = (
@@ -570,6 +786,15 @@ class TelegramCommander:
             "/history &lt;ip&gt; — full IP history\n"
             "/tripwires [search] — list/search tripwires\n"
             "/remove &lt;path&gt; — remove a tripwire\n"
+            "\n"
+            "<b>Compromise detection (v1.4+)</b>\n"
+            "/authmap &lt;user&gt; [days] — per-IP auth map\n"
+            "/suspects [days] [minips] — suspect accounts\n"
+            "/disable &lt;user&gt; [reason] — disable mailbox\n"
+            "/enable &lt;user&gt; — re-enable mailbox\n"
+            "/compromises [open] — list compromise events\n"
+            "/resolve &lt;event_id&gt; [note] — mark event resolved\n"
+            "\n"
             "/help — this message"
         )
         self._reply(msg)

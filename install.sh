@@ -369,7 +369,108 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
         if ask_yn "  Enable Telegram commands?" "y"; then
             TELEGRAM_COMMANDS="true"
         fi
+
+        # --- Alert mode (v1.4+) ---
+        echo ""
+        echo -e "${BOLD}  Telegram Alert Mode (v1.4+)${NC}"
+        echo "    1) verbose — every block alerts immediately (recommended for first week)"
+        echo "    2) digest  — tier-1/tier-2 blocks are buffered into an hourly summary"
+        echo "    3) quiet   — only compromise + BLOCK FAILED alert immediately"
+        ALERT_MODE_CHOICE=$(ask "  Choice" "1")
+        case "$ALERT_MODE_CHOICE" in
+            2) TELEGRAM_ALERT_MODE="digest" ;;
+            3) TELEGRAM_ALERT_MODE="quiet" ;;
+            *) TELEGRAM_ALERT_MODE="verbose" ;;
+        esac
     fi
+
+    # --- GeoIP (v1.4+) ---
+    echo ""
+    echo -e "${BOLD}  GeoIP Enrichment (v1.4+)${NC}"
+    echo "  Tags every auth event with country, city, and ASN."
+    echo "  Required for the compromise-detection feature."
+    echo "  You'll need MaxMind GeoLite2 database files (free registration)."
+    echo "  See INSTALL.md for setup steps."
+    echo ""
+    GEOIP_ENABLED="false"
+    if ask_yn "  Enable GeoIP enrichment?" "n"; then
+        GEOIP_ENABLED="true"
+        echo ""
+        echo "  Place the following files under /opt/wp-guardian/state/geoip/:"
+        echo "    - GeoLite2-City.mmdb"
+        echo "    - GeoLite2-ASN.mmdb"
+        echo ""
+        echo "  Get them from https://www.maxmind.com/en/geolite2/signup"
+        echo "  (Dashboard → Manage License Keys → Download Databases)"
+        echo ""
+        if [[ ! -f "${INSTALL_DIR}/state/geoip/GeoLite2-City.mmdb" ]]; then
+            print_warn "GeoLite2-City.mmdb not yet present — place it before starting the daemon."
+        else
+            print_ok "GeoLite2-City.mmdb found"
+        fi
+        if [[ ! -f "${INSTALL_DIR}/state/geoip/GeoLite2-ASN.mmdb" ]]; then
+            print_warn "GeoLite2-ASN.mmdb not yet present — place it before starting the daemon."
+        else
+            print_ok "GeoLite2-ASN.mmdb found"
+        fi
+    fi
+
+    # --- Compromise detection (v1.4+) ---
+    echo ""
+    echo -e "${BOLD}  Compromise Detection (v1.4+)${NC}"
+    echo "  Flags accounts authenticating from many distinct countries/ASNs/IPs"
+    echo "  in a short window — the classic credential-abuse botnet signature."
+    COMPROMISE_ENABLED="false"
+    if ask_yn "  Enable compromise detection?" "n"; then
+        COMPROMISE_ENABLED="true"
+        if [[ "$GEOIP_ENABLED" != "true" ]]; then
+            print_warn "GeoIP is NOT enabled — country/ASN rules will never trigger."
+            print_warn "Only the distinct-IPs rule will work without GeoIP."
+        fi
+    fi
+
+    # --- Mail backend (v1.4+) ---
+    echo ""
+    echo -e "${BOLD}  Mail Backend Integration (v1.4+)${NC}"
+    echo "  Lets Guardian auto-disable a compromised mailbox by updating the"
+    echo "  mail server's MariaDB virtual_users table."
+    MAIL_BACKEND_TYPE="none"
+    MAIL_BACKEND_HOST="127.0.0.1"
+    MAIL_BACKEND_PORT="3306"
+    MAIL_BACKEND_DB="mailserver"
+    MAIL_BACKEND_USER="wp_guardian"
+    MAIL_BACKEND_PASSWORD=""
+    MAIL_BACKEND_TABLE="virtual_users"
+    if ask_yn "  Configure mail backend integration?" "n"; then
+        MAIL_BACKEND_TYPE="mariadb_virtual_users"
+        MAIL_BACKEND_HOST=$(ask "    MariaDB host" "127.0.0.1")
+        MAIL_BACKEND_PORT=$(ask "    MariaDB port" "3306")
+        MAIL_BACKEND_DB=$(ask "    Database name" "mailserver")
+        MAIL_BACKEND_USER=$(ask "    MariaDB user" "wp_guardian")
+        read -r -s -p "    MariaDB password: " MAIL_BACKEND_PASSWORD
+        echo ""
+        MAIL_BACKEND_TABLE=$(ask "    Mailbox table" "virtual_users")
+        echo ""
+        print_step "Before Guardian can disable mailboxes, run this on your mail server:"
+        echo ""
+        echo "    CREATE USER '${MAIL_BACKEND_USER}'@'localhost' IDENTIFIED BY '<your password>';"
+        echo "    GRANT SELECT (email, enabled), UPDATE (enabled)"
+        echo "      ON ${MAIL_BACKEND_DB}.${MAIL_BACKEND_TABLE} TO '${MAIL_BACKEND_USER}'@'localhost';"
+        echo "    FLUSH PRIVILEGES;"
+        echo ""
+        read -r -p "  Press Enter when done..."
+    fi
+
+    # --- Profile (v1.4+) ---
+    echo ""
+    echo -e "${BOLD}  Threshold Profile (v1.4+)${NC}"
+    echo "    1) steady    — tight thresholds for normal operations (default)"
+    echo "    2) migration — loose thresholds for post-cutover migration periods"
+    PROFILE_CHOICE=$(ask "  Choice" "1")
+    case "$PROFILE_CHOICE" in
+        2) PROFILE_MODE="migration" ;;
+        *) PROFILE_MODE="steady" ;;
+    esac
 
     # --- Generate config ---
     print_step "Generating wp-guardian.conf..."
@@ -417,6 +518,37 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
     fi
     if [[ "${TELEGRAM_COMMANDS:-false}" == "true" ]]; then
         sed -i "/^\[telegram\]/,/^\[/ s|^commands_enabled = .*|commands_enabled = true|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+    fi
+    if [[ -n "${TELEGRAM_ALERT_MODE:-}" ]]; then
+        sed -i "/^\[telegram\]/,/^\[/ s|^alert_mode = .*|alert_mode = ${TELEGRAM_ALERT_MODE}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+    fi
+
+    # v1.4 — GeoIP
+    if [[ "${GEOIP_ENABLED:-false}" == "true" ]]; then
+        sed -i "/^\[geoip\]/,/^\[/ s|^enabled = .*|enabled = true|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+    fi
+
+    # v1.4 — Compromise detection
+    if [[ "${COMPROMISE_ENABLED:-false}" == "true" ]]; then
+        sed -i "/^\[compromise_detection\]/,/^\[/ s|^enabled = .*|enabled = true|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+    fi
+
+    # v1.4 — Mail backend
+    if [[ "${MAIL_BACKEND_TYPE:-none}" != "none" ]]; then
+        # Escape characters that are meaningful in sed replacement strings
+        esc_password=$(printf '%s\n' "${MAIL_BACKEND_PASSWORD}" | sed -e 's/[\/&|]/\\&/g')
+        sed -i "/^\[mail_backend\]/,/^\[/ s|^type = .*|type = ${MAIL_BACKEND_TYPE}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[mail_backend\]/,/^\[/ s|^host = .*|host = ${MAIL_BACKEND_HOST}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[mail_backend\]/,/^\[/ s|^port = .*|port = ${MAIL_BACKEND_PORT}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[mail_backend\]/,/^\[/ s|^database = .*|database = ${MAIL_BACKEND_DB}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[mail_backend\]/,/^\[/ s|^user = .*|user = ${MAIL_BACKEND_USER}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[mail_backend\]/,/^\[/ s|^password = .*|password = ${esc_password}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[mail_backend\]/,/^\[/ s|^table = .*|table = ${MAIL_BACKEND_TABLE}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+    fi
+
+    # v1.4 — Profile
+    if [[ -n "${PROFILE_MODE:-}" ]]; then
+        sed -i "/^\[profile\]/,/^\[/ s|^mode = .*|mode = ${PROFILE_MODE}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
     fi
 
     print_ok "Config generated"

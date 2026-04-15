@@ -7,5 +7,18 @@
 # HTTP client — used by Telegram alerts and pfSense/OPNsense backend
 requests>=2.18.0
 
+# --- v1.4 additions (optional, only needed if the feature is enabled) ---
+
+# GeoIP enrichment — used by compromise detection.
+# Enable via [geoip] enabled = true in wp-guardian.conf.
+# Requires MaxMind GeoLite2-City.mmdb and GeoLite2-ASN.mmdb files
+# (free MaxMind registration; see INSTALL.md).
+geoip2>=4.7.0
+
+# Mail backend integration — used by the mailbox disable action.
+# Enable via [mail_backend] type = mariadb_virtual_users.
+# Pure-Python MariaDB/MySQL driver, no libmysqlclient required.
+PyMySQL>=1.0.0
+
 # Install:
 #   pip3 install -r requirements.txt --break-system-packages

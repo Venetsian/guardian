@@ -23,6 +23,10 @@ from modules.config import load_config, load_whitelist_file, load_tripwire_file,
 from modules.database import GuardianDB
 from modules.whitelist import WhitelistManager
 from modules.blocker import Blocker
+from modules.geoip import GeoIPResolver
+from modules.mail_backend import MailBackend
+from modules.compromise import CompromiseAction
+from modules.digest import DigestBuffer
 from backends.factory import create_backend
 from actions.telegram import TelegramAlerter
 from actions.telegram_commands import TelegramCommander
@@ -342,10 +346,13 @@ class WebDetector:
 class MailDetector:
     """Parses /var/log/maillog for SMTP and IMAP/POP3 attacks."""
 
-    def __init__(self, config, blocker, db, whitelist=None):
+    def __init__(self, config, blocker, db, whitelist=None,
+                 geoip=None, distributed_auth_detector=None):
         self.blocker = blocker
         self.db = db
         self.whitelist = whitelist
+        self.geoip = geoip
+        self.distributed_auth_detector = distributed_auth_detector
         self.time_window = config.getint('thresholds', 'time_window', fallback=300)
 
         self.smtp_threshold = config.getint('thresholds', 'smtp_auth_fail_threshold', fallback=5)
@@ -353,6 +360,30 @@ class MailDetector:
 
         self.hits_smtp = HitTracker(self.time_window)
         self.hits_imap = HitTracker(self.time_window)
+
+    def _geo(self, ip):
+        if self.geoip and getattr(self.geoip, 'enabled', False):
+            try:
+                return self.geoip.lookup(ip)
+            except Exception as e:
+                logging.getLogger('wp-guardian.mail').debug(
+                    "GeoIP lookup error for {ip}: {e}".format(ip=ip, e=e)
+                )
+        return None
+
+    def _on_auth(self, ip, service, username):
+        """Common post-auth hook: geo-enrich, record, notify compromise detector."""
+        geo = self._geo(ip)
+        self.db.record_auth(ip, service, username, geo=geo)
+        if self.distributed_auth_detector:
+            try:
+                self.distributed_auth_detector.on_successful_auth(
+                    username, ip, service, geo or {}
+                )
+            except Exception as e:
+                logging.getLogger('wp-guardian.mail').error(
+                    "DistributedAuthDetector error: {e}".format(e=e)
+                )
 
     def process_line(self, line):
         """Process a single maillog line."""
@@ -378,7 +409,7 @@ class MailDetector:
             if ip_match and user_match:
                 ip = ip_match.group(1)
                 username = user_match.group(1)
-                self.db.record_auth(ip, 'smtp', username)
+                self._on_auth(ip, 'smtp', username)
             return
 
         # Dovecot failed auth (IMAP/POP3)
@@ -403,7 +434,7 @@ class MailDetector:
                 ip = ip_match.group(1)
                 username = user_match.group(1)
                 service = 'imap' if 'imap-login' in line else 'pop3'
-                self.db.record_auth(ip, service, username)
+                self._on_auth(ip, service, username)
             return
 
 
@@ -413,10 +444,13 @@ class MailDetector:
 class SSHDetector:
     """Parses /var/log/secure for SSH attacks."""
 
-    def __init__(self, config, blocker, db, whitelist=None):
+    def __init__(self, config, blocker, db, whitelist=None,
+                 geoip=None, distributed_auth_detector=None):
         self.blocker = blocker
         self.db = db
         self.whitelist = whitelist
+        self.geoip = geoip
+        self.distributed_auth_detector = distributed_auth_detector
         self.time_window = config.getint('thresholds', 'time_window', fallback=300)
 
         self.ssh_threshold = config.getint('thresholds', 'ssh_fail_threshold', fallback=3)
@@ -425,6 +459,14 @@ class SSHDetector:
         )
 
         self.hits_ssh = HitTracker(self.time_window)
+
+    def _geo(self, ip):
+        if self.geoip and getattr(self.geoip, 'enabled', False):
+            try:
+                return self.geoip.lookup(ip)
+            except Exception:
+                return None
+        return None
 
     def process_line(self, line):
         """Process a single secure log line."""
@@ -460,8 +502,177 @@ class SSHDetector:
             if ip_match and user_match:
                 ip = ip_match.group(1)
                 username = user_match.group(1)
-                self.db.record_auth(ip, 'ssh', username)
+                geo = self._geo(ip)
+                self.db.record_auth(ip, 'ssh', username, geo=geo)
+                if self.distributed_auth_detector:
+                    try:
+                        self.distributed_auth_detector.on_successful_auth(
+                            username, ip, 'ssh', geo or {}
+                        )
+                    except Exception as e:
+                        logging.getLogger('wp-guardian.ssh').error(
+                            "DistributedAuthDetector error: {e}".format(e=e)
+                        )
             return
+
+
+# ---------------------------------------------------------------------------
+# Roundcube Error Log Parser (v1.4+)
+# ---------------------------------------------------------------------------
+class RoundcubeDetector:
+    """Parses Roundcube errors.log for failed webmail logins.
+
+    Log line example:
+        [14-Apr-2026 15:11:15 +0000]: <abc> IMAP Error: Login failed for
+        user@example.com against localhost from 198.51.100.21. ...
+    """
+
+    _FAIL_RE = re.compile(
+        r'IMAP Error:\s*Login failed for (?P<user>\S+) against \S+ from (?P<ip>\d+\.\d+\.\d+\.\d+)'
+    )
+
+    def __init__(self, config, blocker, db, whitelist=None):
+        self.blocker = blocker
+        self.db = db
+        self.whitelist = whitelist
+        self.time_window = config.getint('thresholds', 'time_window', fallback=300)
+        self.threshold = config.getint('thresholds', 'roundcube_fail_threshold', fallback=5)
+        self.hits = HitTracker(self.time_window)
+
+    def process_line(self, line):
+        m = self._FAIL_RE.search(line)
+        if not m:
+            return
+        ip = m.group('ip')
+        username = m.group('user')
+
+        if self.whitelist and self.whitelist.is_whitelisted(ip):
+            return
+
+        count = self.hits.add(ip)
+        if count >= self.threshold:
+            self.blocker.block(
+                ip,
+                "Roundcube auth brute force ({c} fails in {w}s, last user={u})".format(
+                    c=count, w=self.time_window, u=username
+                ),
+                service='roundcube'
+            )
+
+
+# ---------------------------------------------------------------------------
+# DistributedAuthDetector (v1.4+ — the headline detector)
+# ---------------------------------------------------------------------------
+class DistributedAuthDetector:
+    """Watches successful authentications across services and flags accounts
+    showing distributed-source patterns indicative of credential compromise.
+
+    Not a process_line detector — it's fed by a callback from MailDetector,
+    SSHDetector, and the backfill tool after every successful auth.
+    """
+
+    def __init__(self, config, db, compromise_action):
+        self.enabled = config.getboolean(
+            'compromise_detection', 'enabled', fallback=False
+        )
+        self.db = db
+        self.compromise_action = compromise_action
+        self.window_seconds = config.getint(
+            'compromise_detection', 'window_seconds', fallback=3600
+        )
+        self.threshold_countries = config.getint(
+            'compromise_detection', 'threshold_distinct_countries', fallback=3
+        )
+        self.threshold_asns = config.getint(
+            'compromise_detection', 'threshold_distinct_asns', fallback=5
+        )
+        self.threshold_ips = config.getint(
+            'compromise_detection', 'threshold_distinct_ips', fallback=20
+        )
+        self.suppression_seconds = config.getint(
+            'compromise_detection', 'suppression_seconds', fallback=1800
+        )
+
+        # Exclude regex list (one pattern per line in config)
+        excl_raw = config.get('compromise_detection', 'exclude_usernames', fallback='')
+        self._exclude_regexes = []
+        for line in excl_raw.splitlines():
+            pattern = line.strip()
+            if pattern and not pattern.startswith('#'):
+                try:
+                    self._exclude_regexes.append(re.compile(pattern, re.IGNORECASE))
+                except re.error as e:
+                    logging.getLogger('wp-guardian.compromise-detector').warning(
+                        "Invalid exclude_usernames regex '{p}': {e}".format(p=pattern, e=e)
+                    )
+
+        self._suppressed = {}  # username -> epoch expiry
+        self._logger = logging.getLogger('wp-guardian.compromise-detector')
+
+    def on_successful_auth(self, username, ip, service, geo):
+        """Called after every successful auth. Must be fast."""
+        if not self.enabled:
+            return
+        if not username:
+            return
+        if self._is_excluded(username):
+            return
+        if self._is_suppressed(username):
+            return
+
+        # Need at least some geo data for the country/asn rules to be meaningful;
+        # the IP rule still works without.
+        try:
+            counts = self.db.distinct_auth_counts(username, self.window_seconds)
+        except Exception as e:
+            self._logger.error("distinct_auth_counts failed: {e}".format(e=e))
+            return
+
+        triggered = None
+        if counts['countries'] >= self.threshold_countries:
+            triggered = 'countries'
+        elif counts['asns'] >= self.threshold_asns:
+            triggered = 'asns'
+        elif counts['ips'] >= self.threshold_ips:
+            triggered = 'ips'
+
+        if not triggered:
+            return
+
+        self._mark_suppressed(username)
+        self._logger.warning(
+            "Compromise trigger: user={u} rule={r} counts={c}".format(
+                u=username, r=triggered, c=counts
+            )
+        )
+        try:
+            self.compromise_action.handle(
+                username=username,
+                service=service or 'unknown',
+                trigger_rule=triggered,
+                counts=counts,
+                window_seconds=self.window_seconds,
+            )
+        except Exception as e:
+            self._logger.error("CompromiseAction.handle failed: {e}".format(e=e))
+
+    def _is_excluded(self, username):
+        for rx in self._exclude_regexes:
+            if rx.search(username):
+                return True
+        return False
+
+    def _is_suppressed(self, username):
+        expires = self._suppressed.get(username)
+        if not expires:
+            return False
+        if time.time() > expires:
+            del self._suppressed[username]
+            return False
+        return True
+
+    def _mark_suppressed(self, username):
+        self._suppressed[username] = time.time() + self.suppression_seconds
 
 
 # ---------------------------------------------------------------------------
@@ -586,6 +797,9 @@ class Guardian:
         self.logger.info(f"WP-Guardian v{self.version} starting up")
         self.logger.info("=" * 60)
 
+        # Apply profile overrides BEFORE any detector reads thresholds
+        self._apply_profile()
+
         # Initialize database
         db_path = self.config.get('database', 'path',
                                   fallback=os.path.join(self.base_dir, 'state', 'guardian.db'))
@@ -618,6 +832,51 @@ class Guardian:
         # Initialize blocker
         self.blocker = Blocker(self.config, self.db, self.whitelist, self.firewall, self.telegram)
 
+        # ---- v1.4 additions ----
+        # GeoIP resolver (optional, fails safe)
+        try:
+            self.geoip = GeoIPResolver(self.config)
+            if not self.geoip.enabled:
+                self.geoip = None
+        except Exception as e:
+            self.logger.error(f"GeoIP init failed: {e}")
+            self.geoip = None
+
+        # Mail backend (optional, MariaDB virtual_users)
+        try:
+            self.mail_backend = MailBackend(self.config)
+        except Exception as e:
+            self.logger.error(f"MailBackend init failed: {e}")
+            self.mail_backend = None
+
+        # Compromise action orchestrator
+        self.compromise_action = CompromiseAction(
+            self.config, self.db, self.blocker, self.mail_backend, self.telegram
+        )
+
+        # Distributed-auth detector — only useful with geoip enabled
+        if self.config.getboolean('compromise_detection', 'enabled', fallback=False):
+            if not self.geoip:
+                self.logger.warning(
+                    "compromise_detection.enabled=true but GeoIP is unavailable; "
+                    "country/ASN rules will never trigger. Only the IP-count rule will work."
+                )
+            self.distributed_auth_detector = DistributedAuthDetector(
+                self.config, self.db, self.compromise_action
+            )
+        else:
+            self.distributed_auth_detector = None
+
+        # Digest buffer + blocker wiring
+        hostname = ''
+        try:
+            import socket
+            hostname = socket.gethostname()
+        except Exception:
+            pass
+        self.digest_buffer = DigestBuffer(self.config, self.db, self.telegram, hostname=hostname)
+        self.blocker.set_digest_buffer(self.digest_buffer)
+
         # Load tripwires
         tripwire_file = os.path.join(self.base_dir, 'tripwires.txt')
         self.tripwires = load_tripwire_file(tripwire_file)
@@ -629,7 +888,9 @@ class Guardian:
         # Initialize Telegram command handler (after tripwires so we can pass the set)
         self.telegram_cmd = TelegramCommander(
             self.config, self.db, self.blocker, self.whitelist,
-            self.tripwires, self.base_dir
+            self.tripwires, self.base_dir,
+            mail_backend=self.mail_backend,
+            compromise_action=self.compromise_action,
         )
 
         # Ensure firewall rules exist (backend-specific setup)
@@ -644,6 +905,44 @@ class Guardian:
         self.logger.info(f"Telegram commands: {'enabled' if self.telegram_cmd.enabled else 'disabled'}")
         self.logger.info(f"Whitelist entries: {len(file_ips)}")
         self.logger.info(f"Tripwires: {len(self.tripwires)}")
+
+    def _apply_profile(self):
+        """Apply [profile] mode=migration threshold overrides (v1.4+).
+
+        Migration mode loosens brute-force thresholds for the post-cutover
+        period when legitimate users are fat-fingering creds. Compromise
+        detection country/ASN rules are NOT loosened — those signals indicate
+        compromise regardless of mode.
+        """
+        profile = 'steady'
+        try:
+            profile = self.config.get('profile', 'mode', fallback='steady').strip().lower()
+        except Exception:
+            pass
+
+        if profile not in ('steady', 'migration'):
+            self.logger.warning("Unknown profile mode '{p}', defaulting to steady".format(p=profile))
+            profile = 'steady'
+
+        self.logger.info("Profile: {p}".format(p=profile))
+
+        if profile != 'migration':
+            return
+
+        overrides = [
+            ('thresholds', 'smtp_auth_fail_threshold', '15'),
+            ('thresholds', 'imap_auth_fail_threshold', '15'),
+            ('thresholds', 'roundcube_fail_threshold', '15'),
+            ('thresholds', 'ssh_fail_threshold', '8'),
+            ('thresholds', 'time_window', '600'),
+            ('thresholds', 'wp_login_threshold', '25'),
+            ('compromise_detection', 'threshold_distinct_ips', '30'),
+        ]
+        for section, key, value in overrides:
+            if not self.config.has_section(section):
+                self.config.add_section(section)
+            self.config.set(section, key, value)
+        self.logger.info("Migration profile overrides applied")
 
     def _load_web_logs(self):
         """Load web access log paths from logfiles.txt."""
@@ -683,7 +982,11 @@ class Guardian:
         # Start mail log tailing
         mail_log = self.config.get('log_paths', 'mail_log', fallback='/var/log/maillog')
         if os.path.exists(mail_log):
-            mail_detector = MailDetector(self.config, self.blocker, self.db, self.whitelist)
+            mail_detector = MailDetector(
+                self.config, self.blocker, self.db, self.whitelist,
+                geoip=self.geoip,
+                distributed_auth_detector=self.distributed_auth_detector,
+            )
             mail_tailer = LogTailer([mail_log], mail_detector, name='mail')
             mail_tailer.start()
             self.tailers.append(mail_tailer)
@@ -693,12 +996,30 @@ class Guardian:
         # Start SSH log tailing
         secure_log = self.config.get('log_paths', 'secure_log', fallback='/var/log/secure')
         if os.path.exists(secure_log):
-            ssh_detector = SSHDetector(self.config, self.blocker, self.db, self.whitelist)
+            ssh_detector = SSHDetector(
+                self.config, self.blocker, self.db, self.whitelist,
+                geoip=self.geoip,
+                distributed_auth_detector=self.distributed_auth_detector,
+            )
             ssh_tailer = LogTailer([secure_log], ssh_detector, name='ssh')
             ssh_tailer.start()
             self.tailers.append(ssh_tailer)
         else:
             self.logger.warning(f"Secure log not found: {secure_log}")
+
+        # Start Roundcube error log tailing (v1.4+)
+        roundcube_log = self.config.get(
+            'log_paths', 'roundcube_log',
+            fallback='/var/www/roundcube/logs/errors.log'
+        )
+        if os.path.exists(roundcube_log):
+            rc_detector = RoundcubeDetector(self.config, self.blocker, self.db, self.whitelist)
+            rc_tailer = LogTailer([roundcube_log], rc_detector, name='roundcube')
+            rc_tailer.start()
+            self.tailers.append(rc_tailer)
+            self.logger.info("Roundcube detector active")
+        else:
+            self.logger.info(f"Roundcube log not found: {roundcube_log} (skipping)")
 
         self.logger.info(f"Guardian running with {len(self.tailers)} log tailer(s)")
 
@@ -777,6 +1098,12 @@ class Guardian:
                 if auto_discover_enabled and now - last_log_discovery > discover_interval:
                     self._auto_discover_logs()
                     last_log_discovery = now
+
+                # Alert digest flush (v1.4+)
+                try:
+                    self.digest_buffer.flush_if_due()
+                except Exception as e:
+                    self.logger.error(f"Digest flush error: {e}")
 
                 time.sleep(1)
 
@@ -899,8 +1226,225 @@ class Guardian:
         for tailer in self.tailers:
             tailer.stop()
 
+        if self.geoip:
+            try:
+                self.geoip.close()
+            except Exception:
+                pass
+
+        # Final digest flush before we exit
+        try:
+            if self.digest_buffer:
+                self.digest_buffer.flush_if_due(force=True)
+        except Exception:
+            pass
+
         self.db.close()
         self.logger.info("Shutdown complete")
+
+    # ------------------------------------------------------------------
+    # v1.4 — CLI helpers (auth-map, auth-suspects, hunt-compromises)
+    # ------------------------------------------------------------------
+    def print_auth_map(self, username, days=30):
+        """--auth-map <username> output."""
+        rows = self.db.auth_map_for_user(username, days=days)
+        summary = self.db.auth_map_summary(username, days=days)
+
+        print("")
+        print(f"Auth map for {username} (last {days} days)")
+        print("")
+        if not rows:
+            print("  No successful authentications recorded.")
+            return
+
+        print("{ip:<18s} {country:<8s} {city:<15s} {asn:<7s} {org:<20s} {first:<20s} {last:<20s} {count:>6s}  Services".format(
+            ip='IP', country='Country', city='City', asn='ASN',
+            org='ASN Org', first='First Seen', last='Last Seen', count='Count'
+        ))
+        print("-" * 130)
+        for row in rows[:200]:
+            first_ts = time.strftime('%Y-%m-%d %H:%M', time.localtime(row['first_seen']))
+            last_ts = time.strftime('%Y-%m-%d %H:%M', time.localtime(row['last_seen']))
+            asn_str = str(row['asn']) if row['asn'] else '-'
+            print("{ip:<18s} {country:<8s} {city:<15.15s} {asn:<7s} {org:<20.20s} {first:<20s} {last:<20s} {count:>6d}  {svc}".format(
+                ip=row['ip'],
+                country=row['country'] or '-',
+                city=row['city'] or '-',
+                asn=asn_str,
+                org=row['asn_org'] or '-',
+                first=first_ts,
+                last=last_ts,
+                count=row['count'],
+                svc=','.join(row['services']),
+            ))
+
+        print("")
+        print("Summary:")
+        print(f"  Total auths:        {summary['total_auths']}")
+        print(f"  Distinct IPs:       {summary['distinct_ips']}")
+        print(f"  Distinct countries: {summary['distinct_countries']}")
+        print(f"  Distinct ASNs:      {summary['distinct_asns']}")
+
+        if self.db.has_open_compromise(username):
+            print("")
+            print(f"⚠  This account has an OPEN compromise event.")
+            print(f"   Use --list-compromise-events to view details.")
+
+    def print_auth_suspects(self, days=7, min_ips=10):
+        """--auth-suspects output."""
+        rows = self.db.suspect_accounts(days=days, min_distinct_ips=min_ips)
+        print("")
+        print(f"Accounts with distributed-source authentication (last {days} days, min {min_ips} IPs)")
+        print("")
+        if not rows:
+            print("  No accounts matched.")
+            return
+
+        print("{user:<40s} {ips:>5s}  {countries:>9s}  {asns:>5s}  {total:>6s}  {first:<20s}  {last:<20s}  Status".format(
+            user='Username', ips='IPs', countries='Countries', asns='ASNs',
+            total='Auths', first='First', last='Last'
+        ))
+        print("-" * 130)
+        for row in rows:
+            first_ts = time.strftime('%Y-%m-%d %H:%M', time.localtime(row['first_seen']))
+            last_ts = time.strftime('%Y-%m-%d %H:%M', time.localtime(row['last_seen']))
+
+            if self.db.has_open_compromise(row['username']):
+                status = 'COMPROMISED'
+            elif (row['distinct_countries'] >= 3
+                  or row['distinct_asns'] >= 5
+                  or row['distinct_ips'] >= 20):
+                status = 'SUSPICIOUS'
+            else:
+                status = 'review'
+
+            print("{user:<40.40s} {ips:>5d}  {c:>9d}  {a:>5d}  {t:>6d}  {first:<20s}  {last:<20s}  {status}".format(
+                user=row['username'],
+                ips=row['distinct_ips'],
+                c=row['distinct_countries'],
+                a=row['distinct_asns'],
+                t=row['total_auths'],
+                first=first_ts, last=last_ts,
+                status=status,
+            ))
+
+    def hunt_compromises(self, days=7, auto_act=False):
+        """--hunt-compromises — replay detector logic against historical data."""
+        if not self.config.getboolean('compromise_detection', 'enabled', fallback=False):
+            print("")
+            print("Note: [compromise_detection] enabled=false. Using default thresholds for hunt.")
+
+        threshold_c = self.config.getint('compromise_detection', 'threshold_distinct_countries', fallback=3)
+        threshold_a = self.config.getint('compromise_detection', 'threshold_distinct_asns', fallback=5)
+        threshold_i = self.config.getint('compromise_detection', 'threshold_distinct_ips', fallback=20)
+        window = self.config.getint('compromise_detection', 'window_seconds', fallback=3600)
+
+        cutoff = int(time.time()) - days * 86400
+        cur = self.db.conn.execute(
+            "SELECT COUNT(*) AS n, COUNT(DISTINCT username) AS u "
+            "FROM auth_sessions WHERE timestamp >= ?", (cutoff,)
+        ).fetchone()
+        total_auths = cur['n']
+        total_users = cur['u']
+
+        print("")
+        print(f"Scanning {total_auths} successful auths across {total_users} distinct usernames (last {days} days)...")
+        print("")
+
+        # Pull accounts where *any* rule might trip using a cheap aggregate
+        candidate_cursor = self.db.conn.execute(
+            "SELECT username, "
+            "       COUNT(DISTINCT ip) AS ips, "
+            "       COUNT(DISTINCT CASE WHEN geoip_country != '' THEN geoip_country END) AS countries, "
+            "       COUNT(DISTINCT CASE WHEN geoip_asn > 0 THEN geoip_asn END) AS asns "
+            "FROM auth_sessions WHERE timestamp >= ? AND username != '' "
+            "GROUP BY username "
+            "HAVING ips >= ? OR countries >= ? OR asns >= ? "
+            "ORDER BY ips DESC",
+            (cutoff, threshold_i, threshold_c, threshold_a)
+        )
+        candidates = candidate_cursor.fetchall()
+
+        if not candidates:
+            print("No accounts triggered compromise rules over the last {d} days.".format(d=days))
+            return
+
+        print(f"Found {len(candidates)} account(s) that triggered compromise rules:")
+        print("")
+
+        findings = []
+        idx = 0
+        for row in candidates:
+            user = row['username']
+            if row['countries'] >= threshold_c:
+                rule = 'countries'
+                metric = row['countries']
+            elif row['asns'] >= threshold_a:
+                rule = 'asns'
+                metric = row['asns']
+            else:
+                rule = 'ips'
+                metric = row['ips']
+
+            idx += 1
+            print(f"[{idx}] {user}")
+            print(f"    Trigger: {rule}={metric} (threshold {threshold_c}c/{threshold_a}a/{threshold_i}i), window={window}s")
+            print(f"    Distinct IPs:       {row['ips']}")
+            print(f"    Distinct countries: {row['countries']}")
+            print(f"    Distinct ASNs:      {row['asns']}")
+            if self.db.has_open_compromise(user):
+                print(f"    Status: already has OPEN compromise event")
+            print("")
+            findings.append({
+                'username': user,
+                'rule': rule,
+                'counts': {
+                    'countries': row['countries'],
+                    'asns': row['asns'],
+                    'ips': row['ips'],
+                },
+            })
+
+        if auto_act:
+            print("--auto-act flag set: applying configured compromise_action...")
+            print("")
+            for finding in findings:
+                if self.db.has_open_compromise(finding['username']):
+                    print(f"  skipping {finding['username']} (already has open event)")
+                    continue
+                self.compromise_action.handle(
+                    username=finding['username'],
+                    service='smtp',
+                    trigger_rule=finding['rule'],
+                    counts=finding['counts'],
+                    window_seconds=window,
+                    actor='cli:--hunt-compromises --auto-act',
+                )
+        else:
+            print("Run with --auto-act to apply the configured compromise_action.")
+            print("Run with --auth-map <user> to see the full per-IP breakdown.")
+
+    def list_compromise_events_cli(self, open_only=False, limit=50):
+        rows = self.db.list_compromise_events(open_only=open_only, limit=limit)
+        if not rows:
+            print("No compromise events recorded.")
+            return
+        header = "Open compromise events:" if open_only else "Compromise events:"
+        print("")
+        print(header)
+        print("")
+        print("{id:<5s}  {when:<20s}  {user:<40s}  {rule:<10s}  {action:<18s}  {status}".format(
+            id='ID', when='Detected', user='Username', rule='Trigger',
+            action='Action', status='Status'
+        ))
+        print("-" * 120)
+        for r in rows:
+            when = time.strftime('%Y-%m-%d %H:%M', time.localtime(r['detected_at']))
+            status = 'resolved' if r['resolved_at'] else 'OPEN'
+            print("{id:<5d}  {when:<20s}  {user:<40.40s}  {rule:<10s}  {action:<18s}  {status}".format(
+                id=r['id'], when=when, user=r['username'],
+                rule=r['trigger_rule'], action=r['action_taken'], status=status
+            ))
 
     def status(self):
         """Print current status."""
@@ -972,6 +1516,34 @@ def main():
                         help='Show database schema version and exit')
     parser.add_argument('--migrate', action='store_true',
                         help='Run pending database migrations and exit')
+
+    # v1.4 — Per-account auth / compromise detection
+    parser.add_argument('--auth-map', metavar='USERNAME',
+                        help='Show per-IP auth map for a username')
+    parser.add_argument('--auth-suspects', action='store_true',
+                        help='List accounts with distributed-source auth patterns')
+    parser.add_argument('--hunt-compromises', action='store_true',
+                        help='Scan historical auth data for compromised accounts')
+    parser.add_argument('--auto-act', action='store_true',
+                        help='With --hunt-compromises: apply configured compromise action')
+    parser.add_argument('--days', type=int, default=None,
+                        help='Look-back window in days (auth-map/suspects/hunt)')
+    parser.add_argument('--min-ips', type=int, default=10,
+                        help='Minimum distinct IPs threshold for --auth-suspects (default 10)')
+    parser.add_argument('--disable-mailbox', metavar='USERNAME',
+                        help='Disable a mailbox via mail_backend')
+    parser.add_argument('--enable-mailbox', metavar='USERNAME',
+                        help='Re-enable a mailbox via mail_backend')
+    parser.add_argument('--reason', metavar='TEXT', default='',
+                        help='Reason string for mailbox enable/disable')
+    parser.add_argument('--list-compromise-events', action='store_true',
+                        help='List compromise_events rows')
+    parser.add_argument('--open-only', action='store_true',
+                        help='With --list-compromise-events: only show unresolved')
+    parser.add_argument('--resolve-compromise', type=int, metavar='ID',
+                        help='Mark a compromise event as resolved')
+    parser.add_argument('--note', metavar='TEXT', default='',
+                        help='Note to attach to --resolve-compromise')
 
     args = parser.parse_args()
 
@@ -1281,6 +1853,89 @@ def main():
             print("Test message sent!" if result else "Failed to send test message.")
         else:
             print("Telegram is not enabled. Run --telegram-setup first.")
+        return
+
+    # v1.4 — Auth map / suspects / hunt
+    if args.auth_map:
+        days = args.days if args.days is not None else 30
+        guardian.print_auth_map(args.auth_map, days=days)
+        return
+
+    if args.auth_suspects:
+        days = args.days if args.days is not None else 7
+        guardian.print_auth_suspects(days=days, min_ips=args.min_ips)
+        return
+
+    if args.hunt_compromises:
+        days = args.days if args.days is not None else 7
+        guardian.hunt_compromises(days=days, auto_act=args.auto_act)
+        return
+
+    if args.disable_mailbox:
+        username = args.disable_mailbox
+        if not guardian.mail_backend or not guardian.mail_backend.enabled:
+            print("Mail backend not configured. Set [mail_backend] type in wp-guardian.conf.")
+            return
+        try:
+            changed = guardian.mail_backend.disable_mailbox(username)
+            guardian.db.insert_mailbox_action(
+                username=username, action='disable', actor='cli',
+                reason=args.reason or 'manual CLI disable',
+                success=True,
+            )
+            if changed:
+                print(f"Disabled mailbox: {username}")
+            else:
+                print(f"Mailbox already disabled or not found: {username}")
+        except Exception as e:
+            guardian.db.insert_mailbox_action(
+                username=username, action='disable', actor='cli',
+                reason=args.reason or 'manual CLI disable',
+                success=False, error_message=str(e),
+            )
+            print(f"Failed to disable {username}: {e}")
+        return
+
+    if args.enable_mailbox:
+        username = args.enable_mailbox
+        if not guardian.mail_backend or not guardian.mail_backend.enabled:
+            print("Mail backend not configured. Set [mail_backend] type in wp-guardian.conf.")
+            return
+        try:
+            changed = guardian.mail_backend.enable_mailbox(username)
+            guardian.db.insert_mailbox_action(
+                username=username, action='enable', actor='cli',
+                reason=args.reason or 'manual CLI enable',
+                success=True,
+            )
+            if changed:
+                print(f"Enabled mailbox: {username}")
+            else:
+                print(f"Mailbox already enabled or not found: {username}")
+        except Exception as e:
+            guardian.db.insert_mailbox_action(
+                username=username, action='enable', actor='cli',
+                reason=args.reason or 'manual CLI enable',
+                success=False, error_message=str(e),
+            )
+            print(f"Failed to enable {username}: {e}")
+        return
+
+    if args.list_compromise_events:
+        guardian.list_compromise_events_cli(open_only=args.open_only)
+        return
+
+    if args.resolve_compromise:
+        event_id = args.resolve_compromise
+        event = guardian.db.get_compromise_event(event_id)
+        if not event:
+            print(f"No compromise event with id {event_id}")
+            return
+        if event['resolved_at']:
+            print(f"Event {event_id} is already resolved.")
+            return
+        guardian.db.resolve_compromise_event(event_id, resolved_by='cli', note=args.note)
+        print(f"Resolved compromise event {event_id} ({event['username']})")
         return
 
     # Default: run the daemon

@@ -3,7 +3,8 @@
     "allow": [
       "Bash(python:*)",
       "Bash(git check-ignore:*)",
-      "Bash(py:*)"
+      "Bash(py:*)",
+      "Bash(git update-index:*)"
     ]
   }
 }
