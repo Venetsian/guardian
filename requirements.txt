@@ -16,7 +16,7 @@ requests>=2.18.0
 geoip2>=4.7.0
 
 # Mail backend integration — used by the mailbox disable action.
-# Enable via [mail_backend] type = mariadb_virtual_users.
+# Enable via [mail_backend] type = cyberpanel|postfixadmin|mailcow|iredmail|custom.
 # Pure-Python MariaDB/MySQL driver, no libmysqlclient required.
 PyMySQL>=1.0.0
 

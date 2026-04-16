@@ -128,6 +128,7 @@ class MailBackend:
         """
         self.type = config.get('mail_backend', 'type', fallback='none').strip().lower()
         self.enabled = False
+        self.init_error = None  # stores the reason if init fails
         self._pymysql = None
         self._guardian_db = guardian_db
 
@@ -148,10 +149,10 @@ class MailBackend:
         if self.type in RECIPES:
             recipe = RECIPES[self.type]
         else:
-            logger.error("Unsupported mail_backend type: {t}. "
-                         "Available: {r}".format(
-                             t=self.type,
-                             r=', '.join(sorted(RECIPES.keys()))))
+            msg = "Unsupported mail_backend type: {t}. Available: {r}".format(
+                t=self.type, r=', '.join(sorted(RECIPES.keys())))
+            logger.error(msg)
+            self.init_error = msg
             return
 
         # Resolve config: recipe defaults, then explicit config overrides
@@ -161,10 +162,10 @@ class MailBackend:
             import pymysql  # lazy import — only needed when enabled
             self._pymysql = pymysql
         except ImportError:
-            logger.error(
-                "mail_backend enabled but 'PyMySQL' not installed. "
-                "Run: pip install PyMySQL"
-            )
+            msg = ("mail_backend type={t} requires PyMySQL. "
+                   "Install: pip3 install PyMySQL").format(t=self.type)
+            logger.error(msg)
+            self.init_error = msg
             return
 
         self.host = self._config_or_recipe(config, 'host', recipe, '127.0.0.1')
@@ -191,10 +192,10 @@ class MailBackend:
                 self._config_or_recipe(config, 'password_column', recipe, 'password')
             )
             if not self._guardian_db:
-                logger.error(
-                    "password_reset strategy requires guardian_db for storing "
-                    "original password hashes. Pass guardian_db to MailBackend()."
-                )
+                msg = ("password_reset strategy requires guardian_db for storing "
+                       "original password hashes. This is a bug — report it.")
+                logger.error(msg)
+                self.init_error = msg
                 return
         else:
             logger.error("Unknown disable_strategy: {s}".format(s=self.disable_strategy))
@@ -203,11 +204,13 @@ class MailBackend:
         try:
             self._test_connection()
         except Exception as e:
-            logger.error("MailBackend startup test failed: {e}".format(e=e))
+            msg = "MailBackend connection failed: {e}".format(e=e)
+            logger.error(msg)
             logger.error(
                 "Compromise mailbox-disable action will be unavailable. "
                 "Guardian will still block source IPs and send alerts."
             )
+            self.init_error = msg
             return
 
         self.enabled = True

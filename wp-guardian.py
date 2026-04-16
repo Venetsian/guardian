@@ -2049,7 +2049,11 @@ def main():
     if args.disable_mailbox:
         username = args.disable_mailbox
         if not guardian.mail_backend or not guardian.mail_backend.enabled:
-            print("Mail backend not configured. Set [mail_backend] type in wp-guardian.conf.")
+            err = getattr(guardian.mail_backend, 'init_error', None) if guardian.mail_backend else None
+            if err:
+                print(f"Mail backend failed to initialize: {err}")
+            else:
+                print("Mail backend not configured. Set [mail_backend] type in wp-guardian.conf.")
             return
         try:
             changed = guardian.mail_backend.disable_mailbox(username)
@@ -2077,7 +2081,11 @@ def main():
     if args.enable_mailbox:
         username = args.enable_mailbox
         if not guardian.mail_backend or not guardian.mail_backend.enabled:
-            print("Mail backend not configured. Set [mail_backend] type in wp-guardian.conf.")
+            err = getattr(guardian.mail_backend, 'init_error', None) if guardian.mail_backend else None
+            if err:
+                print(f"Mail backend failed to initialize: {err}")
+            else:
+                print("Mail backend not configured. Set [mail_backend] type in wp-guardian.conf.")
             return
         try:
             changed = guardian.mail_backend.enable_mailbox(username)

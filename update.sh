@@ -412,6 +412,50 @@ print('All imports OK')
     VERIFY_OK=false
 }
 
+# Check optional dependencies based on config
+if [[ -f "${INSTALL_DIR}/wp-guardian.conf" ]]; then
+    python3 -c "
+import sys, os
+sys.path.insert(0, '${INSTALL_DIR}')
+from modules.config import load_config
+config = load_config('${INSTALL_DIR}/wp-guardian.conf')
+warnings = []
+
+# Check PyMySQL for mail_backend
+mb_type = config.get('mail_backend', 'type', fallback='none').strip().lower()
+if mb_type != 'none' and mb_type != '':
+    try:
+        import pymysql
+    except ImportError:
+        warnings.append('PyMySQL (required for [mail_backend] type={t})'.format(t=mb_type))
+
+# Check geoip2 for geoip
+geoip = config.get('geoip', 'enabled', fallback='false').strip().lower()
+if geoip == 'true':
+    try:
+        import geoip2
+    except ImportError:
+        warnings.append('geoip2 (required for [geoip] enabled=true)')
+
+if warnings:
+    print('MISSING:' + '|'.join(warnings))
+else:
+    print('OK')
+" 2>/dev/null | while IFS= read -r line; do
+        if [[ "$line" == MISSING:* ]]; then
+            DEPS="${line#MISSING:}"
+            IFS='|' read -ra DEP_LIST <<< "$DEPS"
+            print_warn "Missing Python dependencies for enabled features:"
+            for dep in "${DEP_LIST[@]}"; do
+                echo "    - $dep"
+            done
+            echo ""
+            echo "    Install with: pip3 install -r ${INSTALL_DIR}/requirements.txt --break-system-packages"
+            echo ""
+        fi
+    done
+fi
+
 # Quick version check
 INSTALLED_VERSION=$(python3 -c "
 import sys, os
