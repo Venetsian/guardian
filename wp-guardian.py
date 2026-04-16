@@ -226,7 +226,8 @@ class WebDetector:
         # Skip all detection for whitelisted IPs, but still record successful WP logins
         if self.whitelist and self.whitelist.is_whitelisted(ip):
             if method == 'POST' and 'wp-login.php' in clean_path and status == '302':
-                self.db.record_auth(ip, 'wordpress', 'unknown', site='', country='', city='')
+                wp_user = 'wp@{s}'.format(s=site) if site else 'wp@unknown'
+                self.db.record_auth(ip, 'wordpress', wp_user, site=site, country='', city='')
             return
 
         # ----- LOGIN ISOLATION: track CSS loads (real browser signal) -----
@@ -235,7 +236,8 @@ class WebDetector:
 
         # ----- AUTHENTICATION TRACKING -----
         if method == 'POST' and 'wp-login.php' in clean_path and status == '302':
-            self.db.record_auth(ip, 'wordpress', 'unknown', site='', country='', city='')
+            wp_user = 'wp@{s}'.format(s=site) if site else 'wp@unknown'
+            self.db.record_auth(ip, 'wordpress', wp_user, site=site, country='', city='')
             return
 
         # ----- TRIPWIRE RULES (instant block for non-authenticated) -----
