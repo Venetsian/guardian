@@ -432,29 +432,77 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
     # --- Mail backend (v1.4+) ---
     echo ""
     echo -e "${BOLD}  Mail Backend Integration (v1.4+)${NC}"
-    echo "  Lets Guardian auto-disable a compromised mailbox by updating the"
-    echo "  mail server's MariaDB virtual_users table."
+    echo "  Lets Guardian auto-disable a compromised mailbox."
+    echo ""
+    echo "  Choose your mail server type:"
+    echo "    1) CyberPanel       — locks account by resetting password"
+    echo "    2) Postfixadmin     — toggles 'active' column"
+    echo "    3) Mailcow          — toggles 'active' column"
+    echo "    4) iRedMail         — toggles 'active' column"
+    echo "    5) Custom           — specify table/columns manually"
+    echo "    6) None             — skip mail backend"
+    echo ""
     MAIL_BACKEND_TYPE="none"
     MAIL_BACKEND_HOST="127.0.0.1"
     MAIL_BACKEND_PORT="3306"
-    MAIL_BACKEND_DB="mailserver"
+    MAIL_BACKEND_DB=""
     MAIL_BACKEND_USER="wp_guardian"
     MAIL_BACKEND_PASSWORD=""
-    MAIL_BACKEND_TABLE="virtual_users"
-    if ask_yn "  Configure mail backend integration?" "n"; then
-        MAIL_BACKEND_TYPE="mariadb_virtual_users"
-        MAIL_BACKEND_HOST=$(ask "    MariaDB host" "127.0.0.1")
-        MAIL_BACKEND_PORT=$(ask "    MariaDB port" "3306")
-        MAIL_BACKEND_DB=$(ask "    Database name" "mailserver")
-        MAIL_BACKEND_USER=$(ask "    MariaDB user" "wp_guardian")
+    MAIL_BACKEND_TABLE=""
+    MAIL_RECIPE_CHOICE=$(ask "  Choice" "6")
+    case "$MAIL_RECIPE_CHOICE" in
+        1)
+            MAIL_BACKEND_TYPE="cyberpanel"
+            MAIL_BACKEND_DB="cyberpanel"
+            MAIL_BACKEND_TABLE="e_users"
+            echo ""
+            echo "  CyberPanel mode: Guardian will reset the mailbox password to lock it."
+            echo "  The original password hash is saved so it can be restored with --enable-mailbox."
+            echo "  No schema changes needed."
+            ;;
+        2)
+            MAIL_BACKEND_TYPE="postfixadmin"
+            MAIL_BACKEND_DB="postfixadmin"
+            MAIL_BACKEND_TABLE="mailbox"
+            ;;
+        3)
+            MAIL_BACKEND_TYPE="mailcow"
+            MAIL_BACKEND_DB="mailcow"
+            MAIL_BACKEND_TABLE="mailbox"
+            ;;
+        4)
+            MAIL_BACKEND_TYPE="iredmail"
+            MAIL_BACKEND_DB="vmail"
+            MAIL_BACKEND_TABLE="mailbox"
+            ;;
+        5)
+            MAIL_BACKEND_TYPE="custom"
+            MAIL_BACKEND_DB=$(ask "    Database name" "mailserver")
+            MAIL_BACKEND_TABLE=$(ask "    Table name" "virtual_users")
+            ;;
+        *)
+            MAIL_BACKEND_TYPE="none"
+            ;;
+    esac
+
+    if [[ "$MAIL_BACKEND_TYPE" != "none" ]]; then
+        echo ""
+        MAIL_BACKEND_HOST=$(ask "    MariaDB host" "$MAIL_BACKEND_HOST")
+        MAIL_BACKEND_PORT=$(ask "    MariaDB port" "$MAIL_BACKEND_PORT")
+        MAIL_BACKEND_DB=$(ask "    Database name" "$MAIL_BACKEND_DB")
+        MAIL_BACKEND_USER=$(ask "    MariaDB user" "$MAIL_BACKEND_USER")
         read -r -s -p "    MariaDB password: " MAIL_BACKEND_PASSWORD
         echo ""
-        MAIL_BACKEND_TABLE=$(ask "    Mailbox table" "virtual_users")
+
         echo ""
-        print_step "Before Guardian can disable mailboxes, run this on your mail server:"
+        print_step "Before Guardian can manage mailboxes, run this on your mail server:"
         echo ""
         echo "    CREATE USER '${MAIL_BACKEND_USER}'@'localhost' IDENTIFIED BY '<your password>';"
-        echo "    GRANT SELECT (email, enabled), UPDATE (enabled)"
+        if [[ "$MAIL_BACKEND_TYPE" == "cyberpanel" ]]; then
+            echo "    GRANT SELECT (email, password), UPDATE (password)"
+        else
+            echo "    GRANT SELECT (email, enabled), UPDATE (enabled)"
+        fi
         echo "      ON ${MAIL_BACKEND_DB}.${MAIL_BACKEND_TABLE} TO '${MAIL_BACKEND_USER}'@'localhost';"
         echo "    FLUSH PRIVILEGES;"
         echo ""

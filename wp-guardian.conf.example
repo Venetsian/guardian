@@ -262,22 +262,38 @@ exclude_usernames =
 # Integration with the mail server's MariaDB, so CompromiseAction
 # can disable compromised mailboxes automatically.
 #
-# Currently supported types:
-#   none                  — disabled (default)
-#   mariadb_virtual_users — Postfixadmin/Mailcow-style virtual_users table
+# Supported types (recipes):
+#   none         — disabled (default)
+#   cyberpanel   — CyberPanel (locks account by resetting password)
+#   postfixadmin — Postfixadmin (toggles active column)
+#   mailcow      — Mailcow (toggles active column)
+#   iredmail     — iRedMail (toggles active column)
+#   custom       — manual config (you specify table/column names)
 #
-# Operator must create a least-privilege MariaDB user ahead of time:
+# Each recipe auto-fills database, table, and column names.
+# You can override any recipe default by setting it explicitly below.
 #
-#   CREATE USER 'wp_guardian'@'localhost' IDENTIFIED BY '...';
+# Disable strategy:
+#   toggle_enabled  — SET enabled=0/1 (postfixadmin, mailcow, iredmail, custom)
+#   password_reset  — scramble password to lock, restore to unlock (cyberpanel)
+#
+# Operator must create a least-privilege MariaDB user ahead of time.
+#
+# For toggle_enabled recipes:
 #   GRANT SELECT (email, enabled), UPDATE (enabled)
-#     ON mailserver.virtual_users TO 'wp_guardian'@'localhost';
-#   FLUSH PRIVILEGES;
+#     ON <database>.<table> TO 'wp_guardian'@'localhost';
+#
+# For password_reset recipes (cyberpanel):
+#   GRANT SELECT (email, password), UPDATE (password)
+#     ON cyberpanel.e_users TO 'wp_guardian'@'localhost';
 type = none
 host = 127.0.0.1
 port = 3306
-database = mailserver
 user = wp_guardian
 password =
-table = virtual_users
-email_column = email
-enabled_column = enabled
+# Override recipe defaults if your setup differs:
+# database = mailserver
+# table = virtual_users
+# email_column = email
+# enabled_column = enabled
+# password_column = password

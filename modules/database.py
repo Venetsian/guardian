@@ -124,7 +124,8 @@ class GuardianDB:
                 reason                  TEXT DEFAULT '',
                 related_compromise_id   INTEGER DEFAULT 0,
                 success                 INTEGER NOT NULL,
-                error_message           TEXT DEFAULT ''
+                error_message           TEXT DEFAULT '',
+                original_password_hash  TEXT DEFAULT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_mailbox_actions_username ON mailbox_actions(username);
@@ -950,18 +951,39 @@ class GuardianDB:
     # ------------------------------------------------------------------
     def insert_mailbox_action(self, username, action, actor, reason='',
                               related_compromise_id=0, success=True,
-                              error_message=''):
+                              error_message='', original_password_hash=None):
         """Record a mailbox enable/disable action."""
         now = int(time.time())
         self.conn.execute(
             "INSERT INTO mailbox_actions "
             "(performed_at, username, action, actor, reason, "
-            " related_compromise_id, success, error_message) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " related_compromise_id, success, error_message, original_password_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (now, username, action, actor, reason,
-             int(related_compromise_id), 1 if success else 0, error_message)
+             int(related_compromise_id), 1 if success else 0, error_message,
+             original_password_hash)
         )
         self.conn.commit()
+
+    def get_original_password_hash(self, email):
+        """Get the stored original password hash from the most recent
+        password_reset_disable action that hasn't been restored yet.
+        Returns the hash string or None."""
+        cursor = self.conn.execute(
+            "SELECT original_password_hash FROM mailbox_actions "
+            "WHERE username = ? AND action = 'password_reset_disable' "
+            "AND original_password_hash IS NOT NULL "
+            "AND id > COALESCE("
+            "  (SELECT MAX(id) FROM mailbox_actions "
+            "   WHERE username = ? AND action = 'password_restore_enable'), 0"
+            ") "
+            "ORDER BY performed_at DESC LIMIT 1",
+            (email, email)
+        )
+        row = cursor.fetchone()
+        if row:
+            return row[0]
+        return None
 
     def recent_mailbox_actions(self, username=None, limit=20):
         if username:

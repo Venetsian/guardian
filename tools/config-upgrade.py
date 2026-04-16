@@ -473,33 +473,77 @@ def wizard_compromise(example_conf, live_conf, base_dir):
 
 @wizard_handler('mail_backend')
 def wizard_mail_backend(example_conf, live_conf, base_dir):
-    """Mail backend wizard (with password handling via configparser)."""
+    """Mail backend wizard with recipe selection."""
     print('')
     print('{b}  Mail Backend Integration (v1.4+){n}'.format(b=BOLD, n=NC))
-    print('  Lets Guardian auto-disable a compromised mailbox by updating the')
-    print('  mail server\'s MariaDB virtual_users table.')
+    print('  Lets Guardian auto-disable a compromised mailbox.')
+    print('')
+    print('  Choose your mail server type:')
+    print('    1) CyberPanel       — locks account by resetting password')
+    print('    2) Postfixadmin     — toggles active column')
+    print('    3) Mailcow          — toggles active column')
+    print('    4) iRedMail         — toggles active column')
+    print('    5) Custom           — specify table/columns manually')
+    print('    6) None             — skip mail backend')
     print('')
 
+    recipes = {
+        '1': ('cyberpanel',   'cyberpanel',   'e_users'),
+        '2': ('postfixadmin', 'postfixadmin', 'mailbox'),
+        '3': ('mailcow',      'mailcow',      'mailbox'),
+        '4': ('iredmail',     'vmail',         'mailbox'),
+    }
+
+    choice = ask('  Choice', '6')
     values = {}
-    if ask_yn('  Configure mail backend integration?', 'n'):
-        values['type'] = 'mariadb_virtual_users'
+
+    if choice in recipes:
+        rtype, rdb, rtable = recipes[choice]
+        values['type'] = rtype
+        values['host'] = ask('    MariaDB host', '127.0.0.1')
+        values['port'] = ask('    MariaDB port', '3306')
+        values['database'] = ask('    Database name', rdb)
+        values['user'] = ask('    MariaDB user', 'wp_guardian')
+        values['password'] = ask_password('    MariaDB password')
+
+        if rtype == 'cyberpanel':
+            print('')
+            print('  CyberPanel mode: Guardian will reset the mailbox password to lock it.')
+            print('  The original hash is saved so it can be restored with --enable-mailbox.')
+
+        print('')
+        print_step('Before Guardian can manage mailboxes, run this on your mail server:')
+        print('')
+        print("    CREATE USER '{u}'@'localhost' IDENTIFIED BY '<your password>';".format(
+            u=values['user']))
+        if rtype == 'cyberpanel':
+            print("    GRANT SELECT (email, password), UPDATE (password)")
+        else:
+            print("    GRANT SELECT (email, active), UPDATE (active)")
+        print("      ON {db}.{tbl} TO '{u}'@'localhost';".format(
+            db=values.get('database', rdb), tbl=rtable, u=values['user']))
+        print("    FLUSH PRIVILEGES;")
+        print('')
+
+    elif choice == '5':
+        values['type'] = 'custom'
         values['host'] = ask('    MariaDB host', '127.0.0.1')
         values['port'] = ask('    MariaDB port', '3306')
         values['database'] = ask('    Database name', 'mailserver')
         values['user'] = ask('    MariaDB user', 'wp_guardian')
         values['password'] = ask_password('    MariaDB password')
-        values['table'] = ask('    Mailbox table', 'virtual_users')
 
         print('')
-        print_step('Before Guardian can disable mailboxes, run this on your mail server:')
+        print_step('Before Guardian can manage mailboxes, run this on your mail server:')
         print('')
         print("    CREATE USER '{u}'@'localhost' IDENTIFIED BY '<your password>';".format(
             u=values['user']))
         print("    GRANT SELECT (email, enabled), UPDATE (enabled)")
-        print("      ON {db}.{tbl} TO '{u}'@'localhost';".format(
-            db=values['database'], tbl=values['table'], u=values['user']))
+        print("      ON {db}.virtual_users TO '{u}'@'localhost';".format(
+            db=values['database'], u=values['user']))
         print("    FLUSH PRIVILEGES;")
         print('')
+
     else:
         values['type'] = 'none'
 
@@ -668,9 +712,15 @@ def write_merged_config(example_conf, live_conf, live_path,
         if section_block:
             # Replace values with wizard values
             for key, value in section_values.items():
+                # Skip password — handled safely in Step 3 via direct line edit
+                if section == 'mail_backend' and key == 'password':
+                    continue
+                # re.escape the replacement to prevent $ & \ from being
+                # interpreted as backreferences
+                safe_value = value.replace('\\', '\\\\').replace('&', '\\&')
                 section_block = re.sub(
                     r'^({k}\s*=\s*).*$'.format(k=re.escape(key)),
-                    r'\g<1>{v}'.format(v=value),
+                    r'\g<1>{v}'.format(v=safe_value),
                     section_block,
                     count=1,
                     flags=re.MULTILINE
@@ -689,25 +739,33 @@ def write_merged_config(example_conf, live_conf, live_path,
                 value = section_values.get(key, example_conf.get(section, key) or '')
                 lines.append('{k} = {v}'.format(k=key, v=value))
 
-    # Step 3: Handle mail_backend password safely via configparser
+    # Step 3: Handle mail_backend password safely
+    # The password was already inserted by Step 2's regex substitution,
+    # but passwords with special chars ($ & / | etc.) can break regex.
+    # Do a targeted line replacement instead — find the password line in
+    # the [mail_backend] section and set it precisely.
     if 'mail_backend' in wizard_values and wizard_values['mail_backend'].get('password'):
-        # Write the file first without the password
-        output = '\n'.join(lines)
-        if not output.endswith('\n'):
-            output += '\n'
-        with open(live_path, 'w') as f:
-            f.write(output)
-
-        # Now use configparser to set the password safely
-        parser = configparser.ConfigParser(allow_no_value=True)
-        parser.optionxform = str
-        parser.read(live_path)
-        if parser.has_section('mail_backend'):
-            parser.set('mail_backend', 'password',
-                        wizard_values['mail_backend']['password'])
-            with open(live_path, 'w') as f:
-                parser.write(f)
-        return
+        password = wizard_values['mail_backend']['password']
+        in_mail_section = False
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith('[') and ']' in stripped:
+                header = stripped.split(']')[0].lstrip('[').strip()
+                if header == 'mail_backend':
+                    in_mail_section = True
+                    continue
+                elif in_mail_section:
+                    break
+            if in_mail_section and stripped.startswith('password'):
+                eq_pos = stripped.find('=')
+                if eq_pos > 0:
+                    # Preserve the original spacing style
+                    prefix = line[:line.find('=') + 1]
+                    # Add space after = if original had one
+                    if len(line) > line.find('=') + 1 and line[line.find('=') + 1] == ' ':
+                        prefix += ' '
+                    lines[i] = prefix + password
+                    break
 
     # Write final output
     output = '\n'.join(lines)

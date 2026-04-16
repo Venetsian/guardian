@@ -845,9 +845,9 @@ class Guardian:
             self.logger.error(f"GeoIP init failed: {e}")
             self.geoip = None
 
-        # Mail backend (optional, MariaDB virtual_users)
+        # Mail backend (optional, recipe-based)
         try:
-            self.mail_backend = MailBackend(self.config)
+            self.mail_backend = MailBackend(self.config, guardian_db=self.db)
         except Exception as e:
             self.logger.error(f"MailBackend init failed: {e}")
             self.mail_backend = None
@@ -2053,11 +2053,14 @@ def main():
             return
         try:
             changed = guardian.mail_backend.disable_mailbox(username)
-            guardian.db.insert_mailbox_action(
-                username=username, action='disable', actor='cli',
-                reason=args.reason or 'manual CLI disable',
-                success=True,
-            )
+            # password_reset strategy records its own action (with hash);
+            # toggle_enabled needs a separate record
+            if guardian.mail_backend.disable_strategy == 'toggle_enabled':
+                guardian.db.insert_mailbox_action(
+                    username=username, action='disable', actor='cli',
+                    reason=args.reason or 'manual CLI disable',
+                    success=True,
+                )
             if changed:
                 print(f"Disabled mailbox: {username}")
             else:
@@ -2078,11 +2081,12 @@ def main():
             return
         try:
             changed = guardian.mail_backend.enable_mailbox(username)
-            guardian.db.insert_mailbox_action(
-                username=username, action='enable', actor='cli',
-                reason=args.reason or 'manual CLI enable',
-                success=True,
-            )
+            if guardian.mail_backend.disable_strategy == 'toggle_enabled':
+                guardian.db.insert_mailbox_action(
+                    username=username, action='enable', actor='cli',
+                    reason=args.reason or 'manual CLI enable',
+                    success=True,
+                )
             if changed:
                 print(f"Enabled mailbox: {username}")
             else:
