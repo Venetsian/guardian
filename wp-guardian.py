@@ -1703,6 +1703,8 @@ def main():
                         help='Mark a compromise event as resolved')
     parser.add_argument('--note', metavar='TEXT', default='',
                         help='Note to attach to --resolve-compromise')
+    parser.add_argument('--upgrade-config', action='store_true',
+                        help='Check for new config options and run upgrade wizard')
 
     args = parser.parse_args()
 
@@ -1715,6 +1717,20 @@ def main():
         version = get_version(base_dir)
         print(f"WP-Guardian v{version}")
         return
+
+    # Config upgrade wizard
+    if args.upgrade_config:
+        tool_path = os.path.join(base_dir, 'tools', 'config-upgrade.py')
+        if not os.path.exists(tool_path):
+            print("Error: tools/config-upgrade.py not found")
+            sys.exit(1)
+        cmd_args = [sys.executable, tool_path]
+        if args.config:
+            cmd_args.extend(['--config', args.config])
+        # Pass --auto if running non-interactively (piped stdin)
+        if hasattr(args, 'auto_act') and args.auto_act:
+            cmd_args.append('--auto')
+        sys.exit(subprocess.call(cmd_args))
 
     # Database schema version
     if args.db_version:

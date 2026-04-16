@@ -350,7 +350,48 @@ else
 fi
 
 # ===========================================================================
-# Step 5: Verify
+# Step 5: Config upgrade check
+# ===========================================================================
+if [[ -f "${INSTALL_DIR}/wp-guardian.conf" ]] && [[ -f "${INSTALL_DIR}/tools/config-upgrade.py" ]]; then
+    print_step "Checking config for new options..."
+
+    # Show what's new and detect missing config
+    DIFF_OUTPUT=$(python3 "${INSTALL_DIR}/tools/config-upgrade.py" --diff-only --quiet \
+        --config "${INSTALL_DIR}/wp-guardian.conf" \
+        --example "${INSTALL_DIR}/wp-guardian.conf.example" 2>&1) || true
+    DIFF_EXIT=$?
+
+    if echo "$DIFF_OUTPUT" | grep -q "Missing config"; then
+        # Show what's new from changelog
+        python3 "${INSTALL_DIR}/tools/config-upgrade.py" --diff-only \
+            --config "${INSTALL_DIR}/wp-guardian.conf" \
+            --example "${INSTALL_DIR}/wp-guardian.conf.example" 2>/dev/null || true
+
+        echo ""
+        if ask_yn "  Run config upgrade wizard to set up new options?" "y"; then
+            python3 "${INSTALL_DIR}/tools/config-upgrade.py" \
+                --config "${INSTALL_DIR}/wp-guardian.conf" \
+                --example "${INSTALL_DIR}/wp-guardian.conf.example"
+        else
+            echo ""
+            if ask_yn "  Add new options with default values?" "y"; then
+                python3 "${INSTALL_DIR}/tools/config-upgrade.py" --auto \
+                    --config "${INSTALL_DIR}/wp-guardian.conf" \
+                    --example "${INSTALL_DIR}/wp-guardian.conf.example"
+            else
+                print_warn "Skipped config upgrade. Run later with:"
+                echo "    python3 ${INSTALL_DIR}/tools/config-upgrade.py"
+            fi
+        fi
+    else
+        print_ok "Config is up to date"
+    fi
+else
+    print_warn "Config or upgrade tool not found — skipping config check"
+fi
+
+# ===========================================================================
+# Step 6: Verify
 # ===========================================================================
 print_step "Verifying installation..."
 
@@ -394,7 +435,7 @@ if [[ "$VERIFY_OK" == "false" ]]; then
 fi
 
 # ===========================================================================
-# Step 6: Restart service
+# Step 7: Restart service
 # ===========================================================================
 if [[ "$WAS_RUNNING" == "true" ]]; then
     print_step "Starting WP-Guardian service..."
@@ -412,7 +453,7 @@ if [[ "$WAS_RUNNING" == "true" ]]; then
 fi
 
 # ===========================================================================
-# Step 7: Cleanup old backups (keep last 5)
+# Step 8: Cleanup old backups (keep last 5)
 # ===========================================================================
 if [[ -d "${BACKUP_BASE}" ]]; then
     BACKUP_COUNT=$(ls -1d "${BACKUP_BASE}"/backup-* 2>/dev/null | wc -l)
