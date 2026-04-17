@@ -301,6 +301,166 @@ if [[ "$CURRENT_VERSION" == "$NEW_VERSION" ]]; then
 fi
 
 # ===========================================================================
+# Preflight: Check optional Python dependencies for enabled features
+# ===========================================================================
+# Runs BEFORE any backup/file copy/migration, so if deps are missing and the
+# operator aborts, the install is untouched. If the operator accepts and
+# install succeeds, we continue. If they decline, we exit 1 — no silent
+# half-working updates where a feature is enabled in config but its
+# Python dep is missing (e.g. geoip2 → DistributedAuthDetector country rules
+# never fire because GeoIPResolver fails safe to None).
+print_step "Checking optional Python dependencies..."
+
+DEP_CHECK=""
+if [[ -f "${INSTALL_DIR}/wp-guardian.conf" ]]; then
+    DEP_CHECK=$(python3 -c "
+import sys, os
+sys.path.insert(0, '${INSTALL_DIR}')
+try:
+    from modules.config import load_config
+    config = load_config('${INSTALL_DIR}/wp-guardian.conf')
+except Exception as e:
+    print('ERROR:config load failed: {e}'.format(e=e))
+    sys.exit(0)
+
+warnings = []
+
+# PyMySQL — required for [mail_backend] type != none
+mb_type = config.get('mail_backend', 'type', fallback='none').strip().lower()
+if mb_type and mb_type != 'none':
+    try:
+        import pymysql  # noqa: F401
+    except ImportError:
+        warnings.append('PyMySQL|[mail_backend] type={t} — mailbox disable/enable will fail'.format(t=mb_type))
+
+# geoip2 — required for [geoip] enabled=true
+if config.get('geoip', 'enabled', fallback='false').strip().lower() == 'true':
+    try:
+        import geoip2  # noqa: F401
+    except ImportError:
+        warnings.append('geoip2|[geoip] enabled=true — country/ASN detection silently disabled; DistributedAuthDetector rules will never fire')
+
+# requests — required for [telegram] enabled=true
+if config.get('telegram', 'enabled', fallback='false').strip().lower() == 'true':
+    try:
+        import requests  # noqa: F401
+    except ImportError:
+        warnings.append('requests|[telegram] enabled=true — no alerts, no /verbosity commands')
+
+if warnings:
+    print('MISSING:' + '\n'.join(warnings))
+else:
+    print('OK')
+" 2>/dev/null || echo "ERROR:python check crashed")
+fi
+
+# Treat anything unrecognized as a soft warning — don't block the update on
+# a diagnostic glitch, but DO block on a confirmed MISSING.
+if [[ "$DEP_CHECK" == ERROR:* ]]; then
+    print_warn "Could not verify dependencies: ${DEP_CHECK#ERROR:}"
+    echo "    Proceeding — import verification at step 6 will catch hard failures."
+    echo ""
+elif [[ -z "$DEP_CHECK" || ( "$DEP_CHECK" != "OK" && "$DEP_CHECK" != MISSING:* ) ]]; then
+    print_warn "Dep check returned unexpected output — skipping gate."
+    echo ""
+elif [[ "$DEP_CHECK" == MISSING:* ]]; then
+    echo ""
+    echo -e "${RED}${BOLD}============================================${NC}"
+    echo -e "${RED}${BOLD}  MISSING REQUIRED DEPENDENCIES${NC}"
+    echo -e "${RED}${BOLD}============================================${NC}"
+    echo ""
+    echo "  The live config has features enabled that need Python modules"
+    echo "  which are not installed. Continuing as-is would leave those"
+    echo "  features silently broken:"
+    echo ""
+    DEPS_LIST="${DEP_CHECK#MISSING:}"
+    while IFS='|' read -r pkg reason; do
+        [[ -z "$pkg" ]] && continue
+        echo -e "    ${RED}•${NC} ${BOLD}${pkg}${NC}"
+        echo "      ${reason}"
+    done <<< "$DEPS_LIST"
+    echo ""
+
+    # Non-interactive run (no TTY on stdin) — refuse by default. Safer to
+    # fail visibly than to let an automated caller skip silently.
+    if [[ ! -t 0 ]]; then
+        print_err "Non-interactive run with missing dependencies — aborting."
+        echo "    Install with: pip3 install -r ${SOURCE_DIR}/requirements.txt --break-system-packages"
+        echo "    Or set features to disabled in ${INSTALL_DIR}/wp-guardian.conf."
+        exit 1
+    fi
+
+    REQ_FILE="${SOURCE_DIR}/requirements.txt"
+    if [[ ! -f "$REQ_FILE" ]]; then
+        REQ_FILE="${INSTALL_DIR}/requirements.txt"
+    fi
+
+    if [[ -f "$REQ_FILE" ]] && ask_yn "  Install missing dependencies now (pip3 install -r requirements.txt)?" "y"; then
+        echo ""
+        print_step "Running: pip3 install -r ${REQ_FILE} --break-system-packages"
+        if pip3 install -r "${REQ_FILE}" --break-system-packages; then
+            echo ""
+            print_ok "Dependencies installed — re-checking..."
+            RECHECK=$(python3 -c "
+import sys
+sys.path.insert(0, '${INSTALL_DIR}')
+from modules.config import load_config
+config = load_config('${INSTALL_DIR}/wp-guardian.conf')
+still_missing = []
+mb_type = config.get('mail_backend', 'type', fallback='none').strip().lower()
+if mb_type and mb_type != 'none':
+    try: import pymysql
+    except ImportError: still_missing.append('PyMySQL')
+if config.get('geoip', 'enabled', fallback='false').strip().lower() == 'true':
+    try: import geoip2
+    except ImportError: still_missing.append('geoip2')
+if config.get('telegram', 'enabled', fallback='false').strip().lower() == 'true':
+    try: import requests
+    except ImportError: still_missing.append('requests')
+print('|'.join(still_missing) if still_missing else 'OK')
+" 2>/dev/null)
+            if [[ "$RECHECK" == "OK" ]]; then
+                print_ok "All dependencies now satisfied"
+                echo ""
+            else
+                print_err "Still missing after install: ${RECHECK}"
+                if ask_yn "  Continue update with FEATURES DISABLED anyway?" "n"; then
+                    print_warn "Proceeding with known-broken features."
+                    echo ""
+                else
+                    print_err "Update aborted. Nothing has been changed."
+                    exit 1
+                fi
+            fi
+        else
+            print_err "pip install failed — see output above."
+            if ask_yn "  Continue update with FEATURES DISABLED anyway?" "n"; then
+                print_warn "Proceeding with known-broken features."
+                echo ""
+            else
+                print_err "Update aborted. Nothing has been changed."
+                exit 1
+            fi
+        fi
+    else
+        echo ""
+        echo "  Install manually later with:"
+        echo "    pip3 install -r ${REQ_FILE} --break-system-packages"
+        echo ""
+        if ask_yn "  Continue update with FEATURES DISABLED?" "n"; then
+            print_warn "Proceeding with known-broken features."
+            echo ""
+        else
+            print_err "Update aborted. Nothing has been changed."
+            exit 1
+        fi
+    fi
+else
+    print_ok "All enabled features have their dependencies"
+    echo ""
+fi
+
+# ===========================================================================
 # Step 1: Create backup
 # ===========================================================================
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -475,49 +635,7 @@ print('All imports OK')
     VERIFY_OK=false
 }
 
-# Check optional dependencies based on config
-if [[ -f "${INSTALL_DIR}/wp-guardian.conf" ]]; then
-    python3 -c "
-import sys, os
-sys.path.insert(0, '${INSTALL_DIR}')
-from modules.config import load_config
-config = load_config('${INSTALL_DIR}/wp-guardian.conf')
-warnings = []
-
-# Check PyMySQL for mail_backend
-mb_type = config.get('mail_backend', 'type', fallback='none').strip().lower()
-if mb_type != 'none' and mb_type != '':
-    try:
-        import pymysql
-    except ImportError:
-        warnings.append('PyMySQL (required for [mail_backend] type={t})'.format(t=mb_type))
-
-# Check geoip2 for geoip
-geoip = config.get('geoip', 'enabled', fallback='false').strip().lower()
-if geoip == 'true':
-    try:
-        import geoip2
-    except ImportError:
-        warnings.append('geoip2 (required for [geoip] enabled=true)')
-
-if warnings:
-    print('MISSING:' + '|'.join(warnings))
-else:
-    print('OK')
-" 2>/dev/null | while IFS= read -r line; do
-        if [[ "$line" == MISSING:* ]]; then
-            DEPS="${line#MISSING:}"
-            IFS='|' read -ra DEP_LIST <<< "$DEPS"
-            print_warn "Missing Python dependencies for enabled features:"
-            for dep in "${DEP_LIST[@]}"; do
-                echo "    - $dep"
-            done
-            echo ""
-            echo "    Install with: pip3 install -r ${INSTALL_DIR}/requirements.txt --break-system-packages"
-            echo ""
-        fi
-    done
-fi
+# Optional-dep check ran at preflight — no need to repeat here.
 
 # Quick version check
 INSTALLED_VERSION=$(python3 -c "

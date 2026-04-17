@@ -87,6 +87,27 @@ no regression.
 - **Deduped**: one trusted-skip alert per (IP, service) per 24h, so a client
   stuck in a retry loop doesn't spam the operator.
 
+### Dependency preflight in update.sh
+
+- The old "Missing Python dependencies for enabled features" was a soft
+  warning at Step 6 (after backup, file copy, migrations), easy to miss in
+  the output. A missing `geoip2` module doesn't crash the daemon — it fails
+  safe to `None`, leaving `DistributedAuthDetector`'s country/ASN rules
+  silently inert. Same for missing PyMySQL with mail_backend enabled.
+- **Now a hard preflight** before any backup or file copy:
+  - Red banner listing each missing package, the config flag that requires
+    it, and what silently breaks (e.g. *"geoip2 → country/ASN detection
+    silently disabled; DistributedAuthDetector rules will never fire"*).
+  - Offers to run `pip3 install -r requirements.txt --break-system-packages`
+    interactively (default yes). Re-verifies after install.
+  - If the operator declines install, asks one more time: *"Continue update
+    with FEATURES DISABLED?"* — defaults to no.
+  - Non-interactive runs (no TTY on stdin) abort automatically so an
+    automated caller can't skip past the check.
+  - No state has been modified at the point of abort.
+- Checks: `pymysql` (for `[mail_backend] type != none`), `geoip2` (for
+  `[geoip] enabled = true`), `requests` (for `[telegram] enabled = true`).
+
 ### Update script version tracking
 
 - **Fixed**: `git pull && sudo bash update.sh` used to report
