@@ -132,7 +132,8 @@ class CompromiseAction:
         reason = "Compromise of {u} (event {i})".format(u=username, i=event_id)
         for ip in ips:
             try:
-                if self.blocker.block(ip, reason, service=service or 'smtp'):
+                if self.blocker.block(ip, reason, service=service or 'smtp',
+                                      username=username, rule='compromise'):
                     blocked += 1
             except Exception as e:
                 logger.error("Failed to block {ip}: {e}".format(ip=ip, e=e))

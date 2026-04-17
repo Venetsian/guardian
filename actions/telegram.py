@@ -86,7 +86,7 @@ class TelegramAlerter:
     # ------------------------------------------------------------------
     # Pre-formatted alert methods
     # ------------------------------------------------------------------
-    def alert_block(self, ip, tier, reason, service, country='', city='', site=''):
+    def alert_block(self, ip, tier, reason, service, country='', city='', site='', username=''):
         """Alert about a new block."""
         tier_emoji = {1: '🟡', 2: '🟠', 3: '🔴'}
         tier_label = {1: '24h block', 2: '30-day block', 3: 'PERMANENT block'}
@@ -96,11 +96,12 @@ class TelegramAlerter:
             location = f"\n📍 Location: {city}, {country}" if city else f"\n📍 Location: {country}"
 
         site_line = f"\nSite: {site}" if site else ""
+        account_line = f"\nAccount: <code>{username}</code>" if username else ""
 
         msg = (
             f"{tier_emoji.get(tier, '⚪')} <b>WP-Guardian — Tier {tier} ({tier_label.get(tier, 'block')})</b>\n"
             f"IP: <code>{ip}</code>{location}\n"
-            f"Service: {service}{site_line}\n"
+            f"Service: {service}{site_line}{account_line}\n"
             f"Reason: {reason}"
         )
         self.send(msg, priority='HIGH' if tier >= 2 else 'MEDIUM')

@@ -1,5 +1,109 @@
 # WP-Guardian Changelog
 
+## v1.4.1 — Mail false-positive fix + fine-grained Telegram routing (2026-04-17)
+
+Fixes legitimate mail users getting blocked when their mail client has the
+wrong SMTP password saved. Symptoms: IMAP works fine, but the client retries
+SMTP auth 5+ times in seconds, hits the brute-force threshold, and firewalld
+blocks the whole IP — killing the working IMAP connection too.
+
+### Changes
+
+- **`is_ip_authenticated()` is now service-agnostic.** A successful login on
+  ANY protocol (WordPress, IMAP, POP3, SMTP, SSH) marks the IP as a known
+  user. Takeover of those credentials is still caught by
+  `DistributedAuthDetector` (same username from multiple countries/ASNs).
+- **`MailDetector` and `RoundcubeDetector` now honor the trust grace period.**
+  If an IP has authenticated successfully within `mail_trust_duration`, it is
+  exempt from SMTP / IMAP / POP3 / Roundcube auth-failure thresholds — the
+  detector logs a warning instead of blocking. Mirrors the WordPress pattern
+  that's been live since v1.0.
+- **Raised default mail thresholds** (5 → 10) to better match real mail-client
+  retry behavior.
+
+### Config
+
+- New `[auth_tracking] mail_trust_duration = 24` (hours). Picked up
+  automatically by `tools/config-upgrade.py` on upgrade.
+- `smtp_auth_fail_threshold`, `imap_auth_fail_threshold`,
+  `roundcube_fail_threshold` defaults raised to 10.
+
+### Username-aware alerts
+
+- `Blocker.block()` now accepts `username=''`. When present, it's rendered as
+  an `Account:` line in the Telegram block alert (`alert_block`), and logged
+  to `blocked.log` as `user=<name>`. `MailDetector` / `RoundcubeDetector` /
+  `CompromiseAction` all pass it through.
+- **New `Blocker.alert_trusted_skip()`** — heads-up Telegram alert (MEDIUM)
+  when a trusted IP hits a mail / roundcube threshold and the block is
+  skipped. Message: "IP had a successful login recently, so it's NOT being
+  blocked despite failing IMAP auth 10 times in 300s. Account: kathy@… —
+  likely a misconfigured mail client. Consider calling the user."
+- **Deduped**: one trusted-skip alert per (IP, service) per 24h, so a client
+  stuck in a retry loop doesn't spam the operator.
+
+### Per-rule Telegram routing (`[telegram.rules]` + `/verbosity`)
+
+Replaces the coarse-grained `alert_mode = verbose | digest | quiet` with
+per-rule routing. Every block call now carries a short `rule` id
+(`wp_login`, `php_scan`, `general_404`, `smtp_fail`, `imap_fail`,
+`ssh_fail`, `ssh_invalid`, `roundcube`, `tripwire`, `instant`, `structural`,
+`suspicious`, `login_isolation`, `xmlrpc`, `author_enum`, `trusted_skip`,
+`compromise`, `cidr`, `block_failed`). A new `VerbosityRouter` resolves each
+rule to **immediate**, **digest**, or **silent**.
+
+- **New hardcoded defaults** — `php_scan`, `general_404`, `author_enum` =
+  `silent` out of the box (the noisy web traffic that was spamming
+  Telegram). Everything else defaults to `immediate`. The block still
+  executes in all cases — `silent` only suppresses the Telegram message.
+- **Always-immediate rules** (cannot be muted): `compromise`, `cidr`,
+  `block_failed`, and any tier-3 block (regardless of its rule).
+- **`[telegram.rules]` config section** — per-rule overrides in the config
+  file, picked up on startup.
+- **`/verbosity` Telegram command** — live tuning without a restart:
+  - `/verbosity` — show full rule → level table with source annotations
+  - `/verbosity <rule> <level>` — set an override (immediate / digest / silent)
+  - `/verbosity clear <rule>` — remove one override
+  - `/verbosity reset` — wipe all runtime overrides
+- **Runtime overrides persist** to `state/telegram_verbosity.json`
+  (atomic write via `.tmp` + rename) and survive restarts without
+  touching `wp-guardian.conf` (no configparser rewrite = no lost comments).
+
+Legacy `alert_mode` is still honored as a fallback for rules that aren't
+covered by defaults or `[telegram.rules]` — existing v1.4 operators see
+no regression.
+
+### Username-aware alerts
+
+- `Blocker.block()` now accepts `username=''`. When present, it's rendered as
+  an `Account:` line in the Telegram block alert (`alert_block`), and logged
+  to `blocked.log` as `user=<name>`. `MailDetector` / `RoundcubeDetector` /
+  `CompromiseAction` all pass it through.
+- **New `Blocker.alert_trusted_skip()`** — heads-up Telegram alert (MEDIUM)
+  when a trusted IP hits a mail / roundcube threshold and the block is
+  skipped. Message: "IP had a successful login recently, so it's NOT being
+  blocked despite failing IMAP auth 10 times in 300s. Account: kathy@… —
+  likely a misconfigured mail client. Consider calling the user."
+- **Deduped**: one trusted-skip alert per (IP, service) per 24h, so a client
+  stuck in a retry loop doesn't spam the operator.
+
+### Files changed
+
+- `modules/database.py` — `is_ip_authenticated()` drops the `service = 'wordpress'` filter
+- `modules/blocker.py` — `username` + `rule` kwargs, `alert_trusted_skip()`,
+  dedup state, router integration
+- `modules/verbosity.py` — NEW. `VerbosityRouter`, `[telegram.rules]` parsing,
+  JSON-backed runtime overrides, always-immediate rule set
+- `modules/digest.py` — `queue()` trusts the router (no longer re-checks `is_immediate`)
+- `modules/compromise.py` — passes `username` + `rule='compromise'` through to `blocker.block()`
+- `actions/telegram.py` — `alert_block()` renders `Account:` line
+- `actions/telegram_commands.py` — `/verbosity` command + help update
+- `wp-guardian.py` — `MailDetector` / `RoundcubeDetector` extract username
+  and consult the trust check; all detector `blocker.block()` calls carry a `rule`
+- `wp-guardian.conf.example`, `wp-guardian.conf` — new `[telegram.rules]` section +
+  `mail_trust_duration` + raised mail defaults
+- `VERSION` — bumped to 1.4.1
+
 ## v1.4.0 — Mail Hardening Release (2026-04-15)
 
 Headline feature: **DistributedAuthDetector** catches the classic distributed

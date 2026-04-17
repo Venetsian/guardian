@@ -13,8 +13,8 @@ WP-Guardian monitors web, SMTP, IMAP/POP3, and SSH logs, automatically blocks at
 - **GeoIP enrichment (v1.4+)** — every auth event and block is tagged with country, city, ASN, and ASN organization via MaxMind GeoLite2
 - **Three-tier escalation** — 24h block, 30d block, permanent ban with automatic tier advancement
 - **CIDR /24 aggregation** — auto-blocks entire subnets when coordinated scanning is detected
-- **Authenticated user protection** — WordPress-logged-in users are never auto-blocked
-- **Telegram alerts** — real-time notifications for every block, plus three alert modes (verbose/digest/quiet) as of v1.4
+- **Authenticated user protection** — any successful login (WordPress, IMAP, POP3, SMTP, SSH) grants the IP a 24h grace period across all detectors, so a mail client with a wrong outgoing password can't get its working IMAP connection cut off
+- **Telegram alerts** — real-time notifications for every block, with per-rule routing (v1.4.1+): mute noisy rules like `php_scan` / `general_404` / `author_enum`, digest others hourly, keep auth and compromise rules loud. Tune live via `/verbosity <rule> <level>` from chat — `compromise`, `cidr`, and `block_failed` are always-immediate and cannot be muted by accident
 - **Telegram commands** — manage blocks, whitelists, and compromise events remotely via Telegram chat (`/status`, `/unblock`, `/whitelist`, `/history`, `/authmap`, `/suspects`, `/disable`, `/enable`, `/compromises`, `/resolve`)
 - **Per-account auth map (v1.4+)** — `--auth-map`, `--auth-suspects`, `--hunt-compromises` for investigating account activity and surfacing pre-existing compromises
 - **Automated tripwire discovery** — learns attack patterns from your access logs
@@ -118,6 +118,10 @@ When `commands_enabled = true` in your `[telegram]` config, WP-Guardian polls fo
 /history <ip>                — full IP history with recent blocks
 /tripwires [search]          — list/search active tripwires
 /remove <path>               — remove a tripwire path
+/verbosity                   — show rule → level routing table
+/verbosity <rule> <level>    — set immediate/digest/silent for a rule
+/verbosity clear <rule>      — remove one override
+/verbosity reset             — wipe all overrides
 /help                        — list commands
 ```
 

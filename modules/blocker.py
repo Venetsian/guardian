@@ -5,6 +5,7 @@ Determines tier, checks whitelist, executes block via the configured firewall ba
 """
 
 import logging
+import time
 from modules.config import parse_duration
 
 logger = logging.getLogger('wp-guardian.blocker')
@@ -38,12 +39,31 @@ class Blocker:
         # Digest buffer (set later by Guardian.__init__). When present,
         # routine blocks (tier 1/2) may be buffered instead of sent immediately.
         self.digest_buffer = None
+        # Verbosity router (set later by Guardian.__init__). Decides
+        # immediate/digest/silent per rule.
+        self.router = None
+
+        # Dedup for trusted-skip alerts: (ip, service) -> last_alert_timestamp.
+        # Prevents re-alerting every 5 minutes while a misconfigured client
+        # keeps retrying — one heads-up per IP+service per day is enough.
+        self._trusted_skip_alerts = {}
+        self._trusted_skip_cooldown = 86400  # 24h
 
     def set_digest_buffer(self, digest_buffer):
         """Wire in the digest buffer for alert routing."""
         self.digest_buffer = digest_buffer
 
-    def block(self, ip, reason, service='web', country='', city='', site=''):
+    def set_router(self, router):
+        """Wire in the verbosity router."""
+        self.router = router
+
+    def _route(self, rule, tier, severity):
+        """Ask the router, or fall back to always-immediate if none wired."""
+        if self.router:
+            return self.router.route(rule, tier=tier, severity=severity)
+        return 'immediate'
+
+    def block(self, ip, reason, service='web', country='', city='', site='', username='', rule='block'):
         """
         Main blocking entry point.
         Checks whitelist, determines tier, executes block, records in DB, sends alerts.
@@ -93,31 +113,33 @@ class Blocker:
 
             # Write to blocked.log
             site_tag = f" site={site}" if site else ""
+            user_tag = f" user={username}" if username else ""
             block_logger.info(f"BLOCKED ip={ip} tier={tier} duration={duration} "
-                            f"via={self._backend_name} service={service}{site_tag} reason={reason}")
+                            f"via={self._backend_name} service={service}{site_tag}{user_tag} reason={reason}")
 
             # Log to main log
             logger.info(f"BLOCKED {ip} tier={tier} duration={duration} via={self._backend_name} "
-                       f"service={service}{site_tag} reason={reason}")
+                       f"service={service}{site_tag}{user_tag} reason={reason}")
 
-            # Telegram alert routing:
-            # - tier 3 blocks are always immediate
-            # - in verbose mode or when no digest buffer, send immediately
-            # - in digest/quiet modes, tier 1/2 routine blocks go to the buffer
-            event_type = 'tier3_block' if tier >= 3 else 'block'
+            # Telegram alert routing — delegated to the verbosity router.
+            # Tier-3 blocks, compromise, cidr, and block_failed are locked
+            # to 'immediate' inside the router (cannot be muted).
             severity = 'high' if tier >= 2 else 'medium'
-            if self.digest_buffer and not self.digest_buffer.is_immediate(event_type, severity):
+            event_type = 'tier3_block' if tier >= 3 else 'block'
+            level = self._route(rule, tier=tier, severity=severity)
+            if level == 'immediate':
+                self.telegram.alert_block(ip, tier, reason, service, country, city, site, username)
+            elif level == 'digest' and self.digest_buffer:
                 summary = "T{t} {svc} {ip}: {r}".format(
                     t=tier, svc=service, ip=ip, r=reason[:100]
                 )
                 payload = {
                     'ip': ip, 'tier': tier, 'service': service,
                     'country': country, 'city': city, 'site': site,
-                    'reason': reason,
+                    'reason': reason, 'username': username, 'rule': rule,
                 }
                 self.digest_buffer.queue(event_type, severity, summary, payload=payload)
-            else:
-                self.telegram.alert_block(ip, tier, reason, service, country, city, site)
+            # else: silent — block still executes, just no Telegram notification
 
             # Check if this block pushes a /24 subnet over the CIDR threshold
             if self.cidr_enabled and self.firewall.supports_cidr:
@@ -210,6 +232,51 @@ class Blocker:
             )
         else:
             logger.warning(f"CIDR block failed or skipped for {subnet_cidr}")
+
+    def alert_trusted_skip(self, ip, service, count, window, username=''):
+        """Heads-up Telegram alert when a trusted IP hits a block threshold.
+
+        Fires when an IP with a recent successful auth (within mail_trust_duration)
+        crosses a mail/roundcube failure threshold. Instead of blocking, we tell
+        the operator so they can call the user about the misconfigured client.
+
+        Deduped: one alert per (ip, service) per 24h — otherwise a client
+        retrying in a loop would spam the operator every 5 minutes.
+        """
+        # Respect verbosity routing — operator can mute or digest these.
+        level = self._route('trusted_skip', tier=0, severity='medium')
+        if level == 'silent':
+            return
+
+        key = (ip, service)
+        now = time.time()
+        last = self._trusted_skip_alerts.get(key, 0)
+        if now - last < self._trusted_skip_cooldown:
+            return
+        self._trusted_skip_alerts[key] = now
+
+        user_line = f"\nAccount: <code>{username}</code>" if username else ""
+        msg = (
+            f"ℹ️ <b>WP-Guardian — trusted-IP skip</b>\n"
+            f"IP: <code>{ip}</code> had a successful login recently,"
+            f" so it's NOT being blocked despite failing {service.upper()} auth"
+            f" {count} times in {window}s.{user_line}\n"
+            f"Likely a misconfigured mail client. Consider calling the user."
+        )
+        try:
+            if level == 'digest' and self.digest_buffer:
+                summary = "trusted-skip {svc} {ip} ({c}/{w}s)".format(
+                    svc=service, ip=ip, c=count, w=window
+                )
+                payload = {
+                    'ip': ip, 'service': service, 'username': username,
+                    'rule': 'trusted_skip', 'count': count, 'window': window,
+                }
+                self.digest_buffer.queue('trusted_skip', 'medium', summary, payload=payload)
+            else:
+                self.telegram.send(msg, priority='MEDIUM')
+        except Exception as e:
+            logger.debug(f"alert_trusted_skip send failed: {e}")
 
     def unblock(self, ip):
         """Manually unblock an IP from the firewall."""

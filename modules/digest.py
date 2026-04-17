@@ -40,38 +40,12 @@ class DigestBuffer:
 
         logger.info("Alert mode: {m} (digest_interval={i}s)".format(m=self.mode, i=self.interval))
 
-    def is_immediate(self, event_type, severity):
-        """Decide whether an event should be sent immediately or buffered.
-
-        High-priority events always go immediately regardless of mode.
-        """
-        severity = (severity or 'medium').lower()
-        event_type = (event_type or '').lower()
-
-        # Always-immediate events (any mode)
-        always_immediate = {
-            'compromise', 'block_failed', 'mailbox_disable_failed',
-            'cidr_block', 'tier3_block',
-        }
-        if event_type in always_immediate:
-            return True
-        if severity == 'critical':
-            return True
-
-        if self.mode == 'verbose':
-            return True
-        if self.mode == 'digest':
-            # tier-1/tier-2 blocks go to digest
-            return False
-        if self.mode == 'quiet':
-            return False
-
-        return True
-
     def queue(self, event_type, severity, summary, payload=None):
-        """Buffer an event. No-op for events that should be immediate."""
-        if self.is_immediate(event_type, severity):
-            return False
+        """Buffer an event for the next digest flush.
+
+        Callers (v1.4.1+) decide whether to queue or send immediately using
+        the VerbosityRouter; this method trusts that decision and just stores.
+        """
         try:
             self.db.digest_queue(event_type, severity, summary, payload=payload)
             return True

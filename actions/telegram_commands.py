@@ -29,7 +29,7 @@ class TelegramCommander:
     """
 
     def __init__(self, config, db, blocker, whitelist, tripwires=None, base_dir=None,
-                 mail_backend=None, compromise_action=None):
+                 mail_backend=None, compromise_action=None, verbosity_router=None):
         self.enabled = config.getboolean('telegram', 'commands_enabled', fallback=False)
         self.bot_token = config.get('telegram', 'bot_token', fallback='')
         self.chat_id = config.get('telegram', 'chat_id', fallback='')
@@ -42,6 +42,7 @@ class TelegramCommander:
         self.base_dir = base_dir or '/opt/wp-guardian'
         self.mail_backend = mail_backend  # may be None/disabled
         self.compromise_action = compromise_action  # may be None
+        self.verbosity_router = verbosity_router  # may be None
 
         self.running = False
         self._thread = None
@@ -209,6 +210,8 @@ class TelegramCommander:
             '/enable': self._cmd_enable,
             '/compromises': self._cmd_compromises,
             '/resolve': self._cmd_resolve,
+            # v1.4.1
+            '/verbosity': self._cmd_verbosity,
         }
 
         handler = handlers.get(command)
@@ -773,6 +776,76 @@ class TelegramCommander:
             i=event_id, u=event['username']
         ))
 
+    # ------------------------------------------------------------------
+    # v1.4.1 — Telegram verbosity routing
+    # ------------------------------------------------------------------
+    def _cmd_verbosity(self, args):
+        """/verbosity                   — show current rule → level table
+        /verbosity <rule> <level>     — set runtime override (immediate|digest|silent)
+        /verbosity clear <rule>       — remove one override, fall back to config
+        /verbosity reset              — wipe all runtime overrides
+        """
+        if not self.verbosity_router:
+            self._reply("Verbosity router not available.")
+            return
+
+        if not args:
+            rows = self.verbosity_router.current_map()
+            if not rows:
+                self._reply("No rules configured.")
+                return
+            icons = {'immediate': '🔔', 'digest': '📦', 'silent': '🔕'}
+            lines = [
+                "<b>Telegram verbosity</b>",
+                "━━━━━━━━━━━━━━━━━━━━━",
+                "<i>🔔 immediate   📦 digest   🔕 silent   🔒 locked</i>",
+                "",
+            ]
+            for rule, level, source in rows:
+                lock = ' 🔒' if source == 'locked' else ''
+                tag = '' if source == 'default' else f" <i>({source})</i>"
+                lines.append(
+                    "{ic} <code>{r}</code> → {l}{tag}{lock}".format(
+                        ic=icons.get(level, '?'), r=rule, l=level, tag=tag, lock=lock
+                    )
+                )
+            lines.append("")
+            lines.append("<i>Change: /verbosity &lt;rule&gt; &lt;level&gt;</i>")
+            lines.append("<i>Reset: /verbosity reset</i>")
+            self._reply('\n'.join(lines))
+            return
+
+        sub = args[0].lower()
+
+        if sub == 'reset':
+            ok, msg = self.verbosity_router.reset_all()
+            self._reply(msg)
+            return
+
+        if sub == 'clear':
+            if len(args) < 2:
+                self._reply("Usage: /verbosity clear &lt;rule&gt;")
+                return
+            ok, msg = self.verbosity_router.clear_override(args[1])
+            self._reply(msg)
+            return
+
+        # /verbosity <rule> <level>
+        if len(args) < 2:
+            self._reply(
+                "Usage:\n"
+                "/verbosity — show current settings\n"
+                "/verbosity &lt;rule&gt; &lt;level&gt; — set (immediate|digest|silent)\n"
+                "/verbosity clear &lt;rule&gt; — remove one override\n"
+                "/verbosity reset — wipe all overrides"
+            )
+            return
+
+        rule = args[0]
+        level = args[1]
+        ok, msg = self.verbosity_router.set_override(rule, level)
+        self._reply(msg)
+
     def _cmd_help(self, args):
         """Handle /help command."""
         msg = (
@@ -794,6 +867,12 @@ class TelegramCommander:
             "/enable &lt;user&gt; — re-enable mailbox\n"
             "/compromises [open] — list compromise events\n"
             "/resolve &lt;event_id&gt; [note] — mark event resolved\n"
+            "\n"
+            "<b>Alert routing (v1.4.1+)</b>\n"
+            "/verbosity — show rule → level\n"
+            "/verbosity &lt;rule&gt; &lt;level&gt; — set (immediate/digest/silent)\n"
+            "/verbosity clear &lt;rule&gt; — remove one override\n"
+            "/verbosity reset — wipe all overrides\n"
             "\n"
             "/help — this message"
         )

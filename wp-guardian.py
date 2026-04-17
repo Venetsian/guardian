@@ -27,6 +27,7 @@ from modules.geoip import GeoIPResolver
 from modules.mail_backend import MailBackend
 from modules.compromise import CompromiseAction
 from modules.digest import DigestBuffer
+from modules.verbosity import VerbosityRouter
 from backends.factory import create_backend
 from actions.telegram import TelegramAlerter
 from actions.telegram_commands import TelegramCommander
@@ -255,7 +256,7 @@ class WebDetector:
                         f"Authenticated IP {ip} hit structural tripwire: {clean_path}"
                     )
                     return
-                self.blocker.block(ip, f"PHP in uploads: {clean_path}", service='web', site=site)
+                self.blocker.block(ip, f"PHP in uploads: {clean_path}", service='web', site=site, rule='structural')
                 return
 
         # Check instant-block patterns (known webshells)
@@ -267,7 +268,7 @@ class WebDetector:
                             f"Authenticated IP {ip} hit instant pattern: {description} ({clean_path})"
                         )
                         return
-                    self.blocker.block(ip, f"{description}: {clean_path}", service='web', site=site)
+                    self.blocker.block(ip, f"{description}: {clean_path}", service='web', site=site, rule='instant')
                     return
 
         # Check suspicious patterns (threshold-based)
@@ -277,7 +278,7 @@ class WebDetector:
                     if pattern.search(clean_path):
                         count = self.hits_suspicious.add(ip)
                         if count >= self.suspicious_threshold:
-                            self.blocker.block(ip, f"Suspicious PHP scanning ({count} pattern hits in {self.time_window}s)", service='web', site=site)
+                            self.blocker.block(ip, f"Suspicious PHP scanning ({count} pattern hits in {self.time_window}s)", service='web', site=site, rule='suspicious')
                         return
 
         # Check file-based tripwires (PHP only)
@@ -288,7 +289,7 @@ class WebDetector:
                 )
                 return
             self.db.record_tripwire_hit(clean_path)
-            self.blocker.block(ip, f"Tripwire: {clean_path}", service='web', site=site)
+            self.blocker.block(ip, f"Tripwire: {clean_path}", service='web', site=site, rule='tripwire')
             return
 
         # ----- LOGIN ISOLATION DETECTION -----
@@ -300,7 +301,8 @@ class WebDetector:
                         ip,
                         f"Login isolation: {login_hits} wp-login.php hits, zero CSS loads",
                         service='web',
-                        site=site
+                        site=site,
+                        rule='login_isolation'
                     )
                     return
 
@@ -310,35 +312,35 @@ class WebDetector:
         if 'wp-login.php' in clean_path and method == 'POST' and status != '302':
             count = self.hits_login.add(ip)
             if count >= self.wp_login_threshold:
-                self.blocker.block(ip, f"wp-login brute force ({count} in {self.time_window}s)", service='web', site=site)
+                self.blocker.block(ip, f"wp-login brute force ({count} in {self.time_window}s)", service='web', site=site, rule='wp_login')
             return
 
         # xmlrpc.php
         if 'xmlrpc.php' in clean_path:
             count = self.hits_xmlrpc.add(ip)
             if count >= self.xmlrpc_threshold:
-                self.blocker.block(ip, f"xmlrpc abuse ({count} in {self.time_window}s)", service='web', site=site)
+                self.blocker.block(ip, f"xmlrpc abuse ({count} in {self.time_window}s)", service='web', site=site, rule='xmlrpc')
             return
 
         # Author enumeration
         if re.search(r'\?author=\d', path):
             count = self.hits_author.add(ip)
             if count >= self.author_enum_threshold:
-                self.blocker.block(ip, f"Author enumeration ({count} in {self.time_window}s)", service='web', site=site)
+                self.blocker.block(ip, f"Author enumeration ({count} in {self.time_window}s)", service='web', site=site, rule='author_enum')
             return
 
         # PHP file 404s
         if status in ('404', '401') and clean_path.endswith('.php'):
             count = self.hits_php404.add(ip)
             if count >= self.php_404_threshold:
-                self.blocker.block(ip, f"PHP scanning ({count} 404s in {self.time_window}s)", service='web', site=site)
+                self.blocker.block(ip, f"PHP scanning ({count} 404s in {self.time_window}s)", service='web', site=site, rule='php_scan')
             return
 
         # General 404 storm
         if status in ('404', '403'):
             count = self.hits_404.add(ip)
             if count >= self.general_404_threshold:
-                self.blocker.block(ip, f"404 storm ({count} in {self.time_window}s)", service='web', site=site)
+                self.blocker.block(ip, f"404 storm ({count} in {self.time_window}s)", service='web', site=site, rule='general_404')
             return
 
 
@@ -357,8 +359,9 @@ class MailDetector:
         self.distributed_auth_detector = distributed_auth_detector
         self.time_window = config.getint('thresholds', 'time_window', fallback=300)
 
-        self.smtp_threshold = config.getint('thresholds', 'smtp_auth_fail_threshold', fallback=5)
-        self.imap_threshold = config.getint('thresholds', 'imap_auth_fail_threshold', fallback=5)
+        self.smtp_threshold = config.getint('thresholds', 'smtp_auth_fail_threshold', fallback=10)
+        self.imap_threshold = config.getint('thresholds', 'imap_auth_fail_threshold', fallback=10)
+        self.trust_duration = config.getint('auth_tracking', 'mail_trust_duration', fallback=24) * 3600
 
         self.hits_smtp = HitTracker(self.time_window)
         self.hits_imap = HitTracker(self.time_window)
@@ -399,9 +402,20 @@ class MailDetector:
                 ip = ip_match.group(1)
                 if self.whitelist and self.whitelist.is_whitelisted(ip):
                     return
+                # Username is best-effort on Postfix fail lines; most configs
+                # don't log it on failure. Left blank when unavailable.
+                user_match = re.search(r'sasl_username=(\S+)', line)
+                username = user_match.group(1) if user_match else ''
                 count = self.hits_smtp.add(ip)
                 if count >= self.smtp_threshold:
-                    self.blocker.block(ip, f"SMTP auth brute force ({count} in {self.time_window}s)", service='smtp')
+                    if self.db.is_ip_authenticated(ip, self.trust_duration):
+                        logging.getLogger('wp-guardian.mail').warning(
+                            f"Authenticated IP {ip} hit SMTP fail threshold ({count} in {self.time_window}s) — not blocking (likely misconfigured mail client)"
+                        )
+                        self.blocker.alert_trusted_skip(ip, 'smtp', count, self.time_window, username)
+                        return
+                    self.blocker.block(ip, f"SMTP auth brute force ({count} in {self.time_window}s)",
+                                      service='smtp', username=username, rule='smtp_fail')
             return
 
         # SMTP successful auth — record for geo tracking.
@@ -424,11 +438,21 @@ class MailDetector:
                 ip = ip_match.group(1)
                 if self.whitelist and self.whitelist.is_whitelisted(ip):
                     return
+                # Dovecot reliably logs user=<...> on failed auth lines.
+                user_match = re.search(r'user=<([^>]+)>', line)
+                username = user_match.group(1) if user_match else ''
                 count = self.hits_imap.add(ip)
                 if count >= self.imap_threshold:
                     service = 'imap' if 'imap-login' in line else 'pop3'
+                    if self.db.is_ip_authenticated(ip, self.trust_duration):
+                        logging.getLogger('wp-guardian.mail').warning(
+                            f"Authenticated IP {ip} hit {service.upper()} fail threshold ({count} in {self.time_window}s) — not blocking (likely misconfigured mail client)"
+                        )
+                        self.blocker.alert_trusted_skip(ip, service, count, self.time_window, username)
+                        return
+                    rule = 'imap_fail' if service == 'imap' else 'pop3_fail'
                     self.blocker.block(ip, f"{service.upper()} auth brute force ({count} in {self.time_window}s)",
-                                      service=service)
+                                      service=service, username=username, rule=rule)
             return
 
         # Dovecot successful auth — record for geo tracking
@@ -485,7 +509,8 @@ class SSHDetector:
                     return
                 user_match = re.search(r'[Ii]nvalid user (\S+)', line)
                 username = user_match.group(1) if user_match else 'unknown'
-                self.blocker.block(ip, f"SSH invalid user: {username}", service='ssh')
+                self.blocker.block(ip, f"SSH invalid user: {username}", service='ssh',
+                                   username=username, rule='ssh_invalid')
             return
 
         # Failed password
@@ -497,7 +522,8 @@ class SSHDetector:
                     return
                 count = self.hits_ssh.add(ip)
                 if count >= self.ssh_threshold:
-                    self.blocker.block(ip, f"SSH brute force ({count} in {self.time_window}s)", service='ssh')
+                    self.blocker.block(ip, f"SSH brute force ({count} in {self.time_window}s)",
+                                       service='ssh', rule='ssh_fail')
             return
 
         # Successful login — record for geo tracking
@@ -541,7 +567,8 @@ class RoundcubeDetector:
         self.db = db
         self.whitelist = whitelist
         self.time_window = config.getint('thresholds', 'time_window', fallback=300)
-        self.threshold = config.getint('thresholds', 'roundcube_fail_threshold', fallback=5)
+        self.threshold = config.getint('thresholds', 'roundcube_fail_threshold', fallback=10)
+        self.trust_duration = config.getint('auth_tracking', 'mail_trust_duration', fallback=24) * 3600
         self.hits = HitTracker(self.time_window)
 
     def process_line(self, line):
@@ -556,12 +583,22 @@ class RoundcubeDetector:
 
         count = self.hits.add(ip)
         if count >= self.threshold:
+            if self.db.is_ip_authenticated(ip, self.trust_duration):
+                logging.getLogger('wp-guardian.roundcube').warning(
+                    "Authenticated IP {ip} hit Roundcube fail threshold ({c} in {w}s, last user={u}) — not blocking".format(
+                        ip=ip, c=count, w=self.time_window, u=username
+                    )
+                )
+                self.blocker.alert_trusted_skip(ip, 'roundcube', count, self.time_window, username)
+                return
             self.blocker.block(
                 ip,
                 "Roundcube auth brute force ({c} fails in {w}s, last user={u})".format(
                     c=count, w=self.time_window, u=username
                 ),
-                service='roundcube'
+                service='roundcube',
+                username=username,
+                rule='roundcube',
             )
 
 
@@ -882,6 +919,10 @@ class Guardian:
         self.digest_buffer = DigestBuffer(self.config, self.db, self.telegram, hostname=hostname)
         self.blocker.set_digest_buffer(self.digest_buffer)
 
+        # Verbosity router — per-rule immediate/digest/silent routing
+        self.verbosity_router = VerbosityRouter(self.config, self.base_dir)
+        self.blocker.set_router(self.verbosity_router)
+
         # Load tripwires
         tripwire_file = os.path.join(self.base_dir, 'tripwires.txt')
         self.tripwires = load_tripwire_file(tripwire_file)
@@ -896,6 +937,7 @@ class Guardian:
             self.tripwires, self.base_dir,
             mail_backend=self.mail_backend,
             compromise_action=self.compromise_action,
+            verbosity_router=self.verbosity_router,
         )
 
         # Ensure firewall rules exist (backend-specific setup)

@@ -402,10 +402,17 @@ class GuardianDB:
         return cursor.fetchone() is not None
 
     def is_ip_authenticated(self, ip, trust_duration_seconds):
-        """Check if IP has a recent successful WordPress login."""
+        """Check if IP has ANY recent successful authentication.
+
+        Service-agnostic by design: a successful login on any protocol
+        (WordPress, IMAP, POP3, SMTP, SSH) marks the IP as a known user.
+        Real takeover of those credentials is caught by DistributedAuthDetector,
+        which watches for the same username authenticating from multiple
+        countries/ASNs in a short window — regardless of trust state.
+        """
         cutoff = int(time.time()) - trust_duration_seconds
         cursor = self.conn.execute(
-            "SELECT 1 FROM auth_sessions WHERE ip = ? AND service = 'wordpress' AND timestamp > ? LIMIT 1",
+            "SELECT 1 FROM auth_sessions WHERE ip = ? AND timestamp > ? LIMIT 1",
             (ip, cutoff)
         )
         return cursor.fetchone() is not None

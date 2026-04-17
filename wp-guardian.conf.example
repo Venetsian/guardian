@@ -38,11 +38,15 @@ login_isolation_window = 120
 login_isolation_retention_hours = 48
 
 # SMTP module
-smtp_auth_fail_threshold = 5
+# Mail clients (Outlook, Apple Mail, Thunderbird) retry aggressively after a
+# misconfiguration, so thresholds are looser than SSH. An IP that has
+# successfully logged in on ANY protocol within [auth_tracking] mail_trust_duration
+# is exempt from these thresholds (see [auth_tracking] below).
+smtp_auth_fail_threshold = 10
 smtp_nonexistent_user_threshold = 3
 
 # IMAP/POP3 module
-imap_auth_fail_threshold = 5
+imap_auth_fail_threshold = 10
 imap_nonexistent_user_threshold = 3
 
 # SSH module (most aggressive)
@@ -50,7 +54,7 @@ ssh_fail_threshold = 3
 ssh_invalid_user_instant_block = true
 
 # Roundcube webmail failed-login threshold (v1.4+)
-roundcube_fail_threshold = 5
+roundcube_fail_threshold = 10
 
 [escalation]
 # Tier 1: first offense
@@ -189,9 +193,40 @@ digest_max_events = 50
 # Format: HH:MM-HH:MM in server local time
 # quiet_hours = 23:00-07:00
 
+[telegram.rules]
+# Per-rule routing (v1.4.1+). Values: immediate | digest | silent
+#
+# Overrides [telegram] alert_mode for specific detection rules.
+# Unlisted rules fall back to hardcoded defaults (below), then to alert_mode.
+# You can also tune this live from Telegram: /verbosity <rule> <level>
+#
+# Always-immediate (cannot be muted, regardless of setting):
+#   compromise, cidr, block_failed, and any tier-3 block
+#
+# Hardcoded defaults:
+#   Web      — wp_login, xmlrpc, tripwire, instant, structural, suspicious,
+#              login_isolation       → immediate
+#              php_scan, general_404, author_enum  → silent
+#   Mail     — smtp_fail, imap_fail, pop3_fail, roundcube  → immediate
+#   SSH      — ssh_fail, ssh_invalid                        → immediate
+#   Meta     — trusted_skip (mail-client heads-up)          → immediate
+#
+# Example — digest noisy web detections, mute ssh brute force:
+# php_scan = digest
+# general_404 = digest
+# ssh_fail = silent
+
 [auth_tracking]
-# How long a successful WordPress login grants "trusted" status (hours)
+# How long a successful WordPress login grants "trusted" status (hours).
+# Trusted IPs bypass WordPress tripwires and login isolation.
 wp_trust_duration = 24
+
+# How long a successful mail login (IMAP/POP3/SMTP) grants "trusted" status (hours).
+# Trusted IPs are exempt from SMTP/IMAP/POP3/Roundcube auth-failure thresholds —
+# a legitimate mail client with a wrong outgoing password won't get its
+# working IMAP connection killed. DistributedAuthDetector still catches
+# real credential compromise (same account from many countries/ASNs).
+mail_trust_duration = 24
 
 [log_paths]
 # Override auto-detected log paths if needed
