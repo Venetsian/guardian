@@ -87,6 +87,25 @@ no regression.
 - **Deduped**: one trusted-skip alert per (IP, service) per 24h, so a client
   stuck in a retry loop doesn't spam the operator.
 
+### Update script version tracking
+
+- **Fixed**: `git pull && sudo bash update.sh` used to report
+  `Current version: 1.4.1 → New version: 1.4.1` because both were reading
+  the same `VERSION` file — `git pull` had already overwritten it.
+- New `state/installed_version` stamp file written on successful install /
+  update / rollback. This is the authoritative "what version is actually
+  deployed" for the next update.sh run.
+- Fallback: if the stamp file is missing (fresh install without yet running
+  update, or manual install), the script reads the pre-pull VERSION from
+  `git show ORIG_HEAD:VERSION` — the reference git automatically sets to
+  the prior branch tip on every `git pull` / merge / rebase.
+- Final fallback: plain `VERSION` file. Current behavior; only engaged if
+  neither stamp nor ORIG_HEAD are available (external-source updates).
+- `--status` now shows both resolved `Current version` and the raw
+  `VERSION file` for diagnostics.
+- `install.sh` also writes the stamp so the first update-after-install
+  works correctly.
+
 ### Files changed
 
 - `modules/database.py` — `is_ip_authenticated()` drops the `service = 'wordpress'` filter
@@ -102,6 +121,9 @@ no regression.
   and consult the trust check; all detector `blocker.block()` calls carry a `rule`
 - `wp-guardian.conf.example`, `wp-guardian.conf` — new `[telegram.rules]` section +
   `mail_trust_duration` + raised mail defaults
+- `update.sh` — `get_installed_version()` resolver (stamp / ORIG_HEAD / VERSION
+  fallback), `write_installed_version()`, stamping after update/rollback
+- `install.sh` — stamps `state/installed_version` on fresh install
 - `VERSION` — bumped to 1.4.1
 
 ## v1.4.0 — Mail Hardening Release (2026-04-15)

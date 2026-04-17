@@ -163,6 +163,11 @@ chmod +x "${INSTALL_DIR}/wp-guardian.py"
 WPG_VERSION=$(cat "${INSTALL_DIR}/VERSION" 2>/dev/null || echo "unknown")
 print_ok "Files installed to ${INSTALL_DIR} (v${WPG_VERSION})"
 
+# Stamp the installed version — update.sh reads this on later runs to know
+# what version we're upgrading from (git pull overwrites VERSION in place).
+mkdir -p "${INSTALL_DIR}/state"
+echo "${WPG_VERSION}" > "${INSTALL_DIR}/state/installed_version"
+
 # ===========================================================================
 # Interactive Configuration
 # ===========================================================================

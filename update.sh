@@ -48,6 +48,20 @@ print_ok()   { echo -e "${GREEN}[✓]${NC} $1"; }
 print_warn() { echo -e "${YELLOW}[!]${NC} $1"; }
 print_err()  { echo -e "${RED}[✗]${NC} $1"; }
 
+ask_yn() {
+    # $1 = prompt, $2 = default (y or n). Exit 0 = yes, 1 = no.
+    local prompt="$1"
+    local default="${2:-n}"
+    if [[ "$default" == "y" ]]; then
+        prompt="$prompt [Y/n]"
+    else
+        prompt="$prompt [y/N]"
+    fi
+    read -r -p "$prompt: " answer
+    answer="${answer:-$default}"
+    [[ "$answer" =~ ^[Yy] ]]
+}
+
 get_version() {
     local dir="$1"
     if [[ -f "${dir}/VERSION" ]]; then
@@ -55,6 +69,49 @@ get_version() {
     else
         echo "unknown"
     fi
+}
+
+# Resolve the version that's currently "installed" (i.e. the one the running
+# service is based on). In the `git pull && update.sh` workflow SOURCE_DIR
+# equals INSTALL_DIR, so VERSION has already been overwritten by git pull —
+# reading it would return the NEW version and "current == new" would be wrong.
+#
+# Resolution order:
+#   1. state/installed_version stamp file (written on successful update/install)
+#   2. ORIG_HEAD:VERSION — set by git pull, holds the pre-pull tip
+#   3. Current VERSION file (fallback for fresh installs / external-source updates)
+get_installed_version() {
+    local dir="$1"
+    local source="${2:-$dir}"
+
+    if [[ -f "${dir}/state/installed_version" ]]; then
+        tr -d '[:space:]' < "${dir}/state/installed_version"
+        return
+    fi
+
+    local dir_real source_real
+    dir_real=$(readlink -f "$dir" 2>/dev/null || echo "$dir")
+    source_real=$(readlink -f "$source" 2>/dev/null || echo "$source")
+    if [[ "$dir_real" == "$source_real" ]] && [[ -d "${dir}/.git" ]]; then
+        local prev
+        prev=$(git -C "$dir" show ORIG_HEAD:VERSION 2>/dev/null | tr -d '[:space:]')
+        if [[ -n "$prev" ]]; then
+            echo "$prev"
+            return
+        fi
+    fi
+
+    get_version "$dir"
+}
+
+# Write the version stamp after a successful install/update/rollback.
+# The stamp file is ignored by git (belongs in state/) and is what future
+# update.sh invocations read to know what version is actually running.
+write_installed_version() {
+    local dir="$1"
+    local version="$2"
+    mkdir -p "${dir}/state"
+    echo "$version" > "${dir}/state/installed_version"
 }
 
 get_db_version() {
@@ -86,7 +143,8 @@ latest_backup() {
 # ===========================================================================
 if [[ "${1:-}" == "--status" ]]; then
     print_header
-    echo "  Current version:    $(get_version "${INSTALL_DIR}")"
+    echo "  Current version:    $(get_installed_version "${INSTALL_DIR}" "${INSTALL_DIR}")"
+    echo "  VERSION file:       $(get_version "${INSTALL_DIR}")"
     echo "  Schema version:     $(get_db_version)"
 
     LATEST=$(latest_backup)
@@ -119,7 +177,7 @@ if [[ "${1:-}" == "--rollback" ]]; then
     fi
 
     BACKUP_VERSION=$(get_version "$LATEST")
-    CURRENT_VERSION=$(get_version "${INSTALL_DIR}")
+    CURRENT_VERSION=$(get_installed_version "${INSTALL_DIR}" "${INSTALL_DIR}")
 
     echo "  Current version: ${CURRENT_VERSION}"
     echo "  Rollback to:     ${BACKUP_VERSION} ($(basename "$LATEST"))"
@@ -193,6 +251,9 @@ if [[ "${1:-}" == "--rollback" ]]; then
         fi
     fi
 
+    # Stamp the restored version so future update.sh runs know the truth
+    write_installed_version "${INSTALL_DIR}" "${BACKUP_VERSION}"
+
     echo ""
     print_ok "Rollback complete — now running v$(get_version "${INSTALL_DIR}")"
     echo ""
@@ -225,7 +286,9 @@ if [[ ! -d "${INSTALL_DIR}" ]]; then
 fi
 
 # Show version info
-CURRENT_VERSION=$(get_version "${INSTALL_DIR}")
+# For the in-place git-pull case, VERSION has already been overwritten — use
+# the stamp file or ORIG_HEAD to find the version we're upgrading FROM.
+CURRENT_VERSION=$(get_installed_version "${INSTALL_DIR}" "${SOURCE_DIR}")
 NEW_VERSION=$(get_version "${SOURCE_DIR}")
 
 echo "  Current version: ${CURRENT_VERSION}"
@@ -477,6 +540,11 @@ if [[ "$VERIFY_OK" == "false" ]]; then
     echo ""
     exit 1
 fi
+
+# Stamp the installed version — read by the next update.sh run as the
+# authoritative "current version", so `git pull && update.sh` shows the
+# real old → new transition even though VERSION has already been overwritten.
+write_installed_version "${INSTALL_DIR}" "${NEW_VERSION}"
 
 # ===========================================================================
 # Step 7: Restart service
