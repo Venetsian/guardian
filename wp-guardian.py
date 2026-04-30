@@ -871,11 +871,9 @@ class Guardian:
         except OSError:
             pass
 
-        # Initialize blocker
-        self.blocker = Blocker(self.config, self.db, self.whitelist, self.firewall, self.telegram)
-
-        # ---- v1.4 additions ----
-        # GeoIP resolver (optional, fails safe)
+        # GeoIP resolver (optional, fails safe). Initialized before the
+        # blocker so block() can enrich ip_history and Telegram alerts with
+        # country / city / ASN.
         try:
             self.geoip = GeoIPResolver(self.config)
             if not self.geoip.enabled:
@@ -883,6 +881,10 @@ class Guardian:
         except Exception as e:
             self.logger.error(f"GeoIP init failed: {e}")
             self.geoip = None
+
+        # Initialize blocker
+        self.blocker = Blocker(self.config, self.db, self.whitelist, self.firewall, self.telegram,
+                               geoip=self.geoip)
 
         # Mail backend (optional, recipe-based)
         try:

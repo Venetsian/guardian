@@ -13,12 +13,13 @@ block_logger = logging.getLogger('wp-guardian.blocks')
 
 
 class Blocker:
-    def __init__(self, config, db, whitelist, firewall, telegram):
+    def __init__(self, config, db, whitelist, firewall, telegram, geoip=None):
         self.config = config
         self.db = db
         self.whitelist = whitelist
         self.firewall = firewall
         self.telegram = telegram
+        self.geoip = geoip
         self.dry_run = config.getboolean('general', 'dry_run', fallback=False)
 
         # Parse escalation settings
@@ -75,8 +76,21 @@ class Blocker:
             logger.info(f"WHITELIST SKIP ip={ip} service={service} reason={reason}{site_tag}")
             return False
 
+        # Geo-enrich. Detector callers don't pass country/city, so without
+        # this lookup ip_history rows and Telegram block alerts go out blank.
+        geo = None
+        if self.geoip and getattr(self.geoip, 'enabled', False):
+            try:
+                geo = self.geoip.lookup(ip)
+            except Exception as e:
+                logger.debug(f"GeoIP lookup failed for {ip}: {e}")
+                geo = None
+        if geo:
+            country = country or geo.get('country', '')
+            city = city or geo.get('city', '')
+
         # Make sure IP is tracked in DB
-        self.db.track_ip(ip, service, country, city)
+        self.db.track_ip(ip, service, country=country, city=city, geo=geo)
 
         # Already blocked — don't waste a firewall call
         ip_data = self.db.get_ip(ip)

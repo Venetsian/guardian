@@ -1,5 +1,69 @@
 # WP-Guardian Changelog
 
+## v1.4.2 — Geo enrichment of blocks (2026-04-30)
+
+Bug fix: every row in `ip_history` shipped since v1.4.0 had `geoip_country=''`
+and `geoip_asn=0`, even on hosts with GeoIP fully configured and the auth
+side working. Telegram block alerts also went out without a country / city
+line, and `--history` / daily-summary country breakdowns were empty.
+
+### Root cause
+
+`Guardian.__init__` constructed `Blocker` on line 875 and `GeoIPResolver` on
+line 880 — the resolver didn't exist yet when the blocker was wired up.
+`Blocker.__init__` had no `geoip` parameter either, so even reordering
+wouldn't have helped without a signature change. Net effect: `Blocker.block()`
+called `db.track_ip(ip, service, country, city)` with the kwargs from each
+detector's `block()` call — and no detector passes country/city. They all
+silently became empty strings.
+
+`auth_sessions` was unaffected because the successful-auth path goes through
+`MailDetector._geo(ip)` → `db.record_auth(geo=geo)`, which the v1.4 wiring
+got right.
+
+### Fix
+
+- `modules/blocker.py` — `Blocker.__init__` now accepts `geoip=None` and
+  stores it. At the top of `block()` (after the whitelist check) it calls
+  `self.geoip.lookup(ip)` once and threads the result into
+  `db.track_ip(geo=geo)` and the Telegram alert / digest payload.
+- `wp-guardian.py` — `GeoIPResolver` is now constructed before `Blocker`,
+  and the resolver is passed in via the new kwarg.
+- Backwards-compatible: detector call sites still pass `country=''` /
+  `city=''` (none of them ever set these), the lookup fills them in. No
+  detector signatures change.
+
+### Files changed
+
+- `modules/blocker.py` — `__init__` accepts `geoip=`; `block()` does the
+  lookup and passes geo to `db.track_ip` and through to alert/digest paths.
+- `wp-guardian.py` — GeoIPResolver init moved above Blocker init; Blocker
+  constructed with `geoip=self.geoip`.
+- `VERSION` → `1.4.2`.
+- `CLAUDE.md` — Blocking Architecture section notes the geo-enrichment step.
+
+### Backfill (manual, one-shot)
+
+Existing rows stay blank until they're re-touched. To enrich them in place:
+
+```python
+import sqlite3
+from configparser import ConfigParser
+from modules.geoip import GeoIPResolver
+
+cfg = ConfigParser(); cfg.read('/opt/wp-guardian/wp-guardian.conf')
+geo = GeoIPResolver(cfg)
+conn = sqlite3.connect('/opt/wp-guardian/state/guardian.db')
+conn.row_factory = sqlite3.Row
+for row in conn.execute("SELECT ip FROM ip_history WHERE geoip_country=''").fetchall():
+    g = geo.lookup(row['ip'])
+    conn.execute(
+        "UPDATE ip_history SET geoip_country=?, geoip_city=?, geoip_asn=?, geoip_asn_org=? WHERE ip=?",
+        (g['country'], g['city'], g['asn'], g['asn_org'], row['ip'])
+    )
+conn.commit()
+```
+
 ## v1.4.1 — Mail false-positive fix + fine-grained Telegram routing (2026-04-17)
 
 Fixes legitimate mail users getting blocked when their mail client has the
