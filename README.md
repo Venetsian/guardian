@@ -202,8 +202,10 @@ See [backends/README.md](backends/README.md) for creating custom backends.
 │   ├── telegram.py         # Telegram alerts
 │   └── telegram_commands.py # Telegram command handler
 ├── tools/
-│   ├── telegram_setup.py   # Interactive Telegram setup
-│   └── log-analyzer.sh     # Tripwire discovery
+│   ├── telegram_setup.py        # Interactive Telegram setup
+│   ├── log-analyzer.sh          # Tripwire discovery
+│   ├── backfill_maillog.py      # Seed auth_sessions from maillog history
+│   └── backfill_ip_history.py   # Geo-enrich ip_history rows (v1.4.2+ repair)
 ├── migrations/
 │   └── *.sql               # Database migrations
 ├── state/

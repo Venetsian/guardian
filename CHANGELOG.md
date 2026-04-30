@@ -1,5 +1,62 @@
 # WP-Guardian Changelog
 
+## v1.4.3 — Trusted-ASN exemption for compromise detection (2026-04-30)
+
+Stops `DistributedAuthDetector` from false-firing on legitimate users of
+Microsoft 365 / Google Workspace / iCloud Mail. These services relay one
+user's outbound mail through DCs in many countries within minutes, which
+previously looked identical to a credential-abuse botnet and would (with
+`action = full`) auto-disable the user's mailbox.
+
+### Real-world example that triggered this fix
+
+One user in 1h: Sky GB (AS5607), Sky GB (AS31655), EE GB (AS206067), and
+Microsoft 365 relays from IE / SE / NL (all AS8075). With the default
+`threshold_distinct_countries = 3` that's 4 countries → fires. The user is
+in one country; Microsoft is the source of the geographic spread.
+
+### Changes
+
+- **New `[compromise_detection] trusted_asns`** — comma-separated list of
+  ASNs whose rows are excluded from the country and ASN counts. The IP
+  count is **not** filtered, so volumetric abuse via a trusted ASN still
+  trips `threshold_distinct_ips`.
+- **Default value: `8075, 15169, 714`** — Microsoft, Google, Apple. These
+  are the providers that relay through DCs in many countries by design.
+  Defaults applied automatically on upgrade via
+  `tools/config-upgrade.py` (the option is auto-discovered from
+  `wp-guardian.conf.example`).
+- **`db.distinct_auth_counts()` now accepts `trusted_asns=`** — used by
+  `DistributedAuthDetector.on_successful_auth` on every successful auth.
+  Backwards-compatible: callers that don't pass it get the v1.4.2 behavior.
+
+### Files changed
+
+- `wp-guardian.py` — `DistributedAuthDetector.__init__` parses
+  `trusted_asns` into a set of ints, passes it to `distinct_auth_counts`.
+- `modules/database.py` — `distinct_auth_counts(..., trusted_asns=None)`
+  emits filtered SQL when the set is non-empty (NOT IN clause on
+  `geoip_asn` for the country and ASN expressions).
+- `wp-guardian.conf.example` — adds `[compromise_detection] trusted_asns`
+  with the default list and a comment explaining why.
+- `wp-guardian.conf` — same option mirrored into the live config.
+- `VERSION` → `1.4.3`.
+- `CLAUDE.md` — DistributedAuthDetector section notes the trusted-ASN filter.
+
+### What if I want stricter behavior?
+
+Set `trusted_asns =` (empty) to count every ASN. You'll get false positives
+on Microsoft 365 / Google / iCloud users but no compromise scenario will
+slip past the country/ASN rules.
+
+### What if a compromise IS using Microsoft 365 as the relay?
+
+The IP-count rule still applies — `threshold_distinct_ips = 20` by default.
+A volumetric attack via a trusted ASN trips that rule even though country
+and ASN counts are zero. For low-volume attacks via your own tenant's
+relay, compromise detection by source dispersal is the wrong layer; outbound
+volume / unusual-recipient monitoring (v1.5 work) catches that.
+
 ## v1.4.2 — Geo enrichment of blocks (2026-04-30)
 
 Bug fix: every row in `ip_history` shipped since v1.4.0 had `geoip_country=''`
@@ -42,27 +99,27 @@ got right.
 - `VERSION` → `1.4.2`.
 - `CLAUDE.md` — Blocking Architecture section notes the geo-enrichment step.
 
-### Backfill (manual, one-shot)
+### Backfill (one-shot)
 
-Existing rows stay blank until they're re-touched. To enrich them in place:
+Existing rows stay blank until they're re-touched. New tool to repair them
+in place:
 
-```python
-import sqlite3
-from configparser import ConfigParser
-from modules.geoip import GeoIPResolver
+```bash
+# Dry run first — counts only, no writes
+python3 /opt/wp-guardian/tools/backfill_ip_history.py --dry-run
 
-cfg = ConfigParser(); cfg.read('/opt/wp-guardian/wp-guardian.conf')
-geo = GeoIPResolver(cfg)
-conn = sqlite3.connect('/opt/wp-guardian/state/guardian.db')
-conn.row_factory = sqlite3.Row
-for row in conn.execute("SELECT ip FROM ip_history WHERE geoip_country=''").fetchall():
-    g = geo.lookup(row['ip'])
-    conn.execute(
-        "UPDATE ip_history SET geoip_country=?, geoip_city=?, geoip_asn=?, geoip_asn_org=? WHERE ip=?",
-        (g['country'], g['city'], g['asn'], g['asn_org'], row['ip'])
-    )
-conn.commit()
+# Apply
+python3 /opt/wp-guardian/tools/backfill_ip_history.py
 ```
+
+Defaults to scanning only rows where `geoip_country = ''` AND `geoip_asn = 0`
+(the v1.4.0–v1.4.1 victims). Pass `--all` to re-resolve every row, e.g.
+after a GeoLite2 database refresh. `--limit N` caps the run for testing.
+Idempotent: re-runs pick up only rows still missing data.
+
+**Note:** `auth_sessions` was unaffected by the bug — the auth path looks
+geo up itself — so this tool only touches `ip_history`. Compromise
+detection (which reads `auth_sessions`) is independent of this fix.
 
 ## v1.4.1 — Mail false-positive fix + fine-grained Telegram routing (2026-04-17)
 

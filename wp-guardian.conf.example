@@ -293,6 +293,20 @@ suppression_seconds = 1800
 # Useful for known-mobile users or shared service accounts.
 exclude_usernames =
 
+# Trusted ASNs — comma-separated list of ASNs whose rows are NOT counted
+# toward the country and ASN thresholds. Cloud mail providers (Microsoft 365,
+# Google Workspace, Apple iCloud) relay outbound traffic from many DCs in
+# different countries for the same legitimate user, which would otherwise
+# look exactly like distributed credential abuse. The IP-count threshold
+# is unaffected by this list — a real volumetric attack via a trusted ASN
+# will still trip threshold_distinct_ips.
+#
+# Defaults below cover the common false-positive sources:
+#   8075   = Microsoft (Office 365 / Exchange Online / Outlook.com)
+#   15169  = Google (Gmail / Workspace)
+#   714    = Apple (iCloud Mail)
+trusted_asns = 8075, 15169, 714
+
 [mail_backend]
 # Integration with the mail server's MariaDB, so CompromiseAction
 # can disable compromised mailboxes automatically.

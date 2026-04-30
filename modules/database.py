@@ -731,21 +731,55 @@ class GuardianDB:
     # ------------------------------------------------------------------
     # v1.4 — Compromise detection queries (auth-map, distributed-auth)
     # ------------------------------------------------------------------
-    def distinct_auth_counts(self, username, window_seconds):
+    def distinct_auth_counts(self, username, window_seconds, trusted_asns=None):
         """Count distinct dimensions across successful auths for a user
         over the sliding window. Used by DistributedAuthDetector on every
         successful auth.
 
+        trusted_asns is an optional iterable of integer ASNs. Rows whose
+        geoip_asn is in this set are excluded from the countries and asns
+        counts (cloud mail providers like Microsoft 365 relay through many
+        DCs and would otherwise look like distributed credential abuse).
+        The ips count is unaffected — volumetric abuse via a trusted ASN
+        should still trip threshold_distinct_ips.
+
         Returns: {'countries': int, 'asns': int, 'ips': int}
         """
         cutoff = int(time.time()) - int(window_seconds)
-        row = self.conn.execute(
-            "SELECT COUNT(DISTINCT CASE WHEN geoip_country != '' THEN geoip_country END) AS countries, "
-            "       COUNT(DISTINCT CASE WHEN geoip_asn > 0 THEN geoip_asn END) AS asns, "
+
+        trusted = [int(a) for a in (trusted_asns or []) if int(a) > 0]
+        if trusted:
+            placeholders = ','.join(['?'] * len(trusted))
+            country_expr = (
+                "COUNT(DISTINCT CASE WHEN geoip_country != '' "
+                "AND (geoip_asn IS NULL OR geoip_asn = 0 "
+                "OR geoip_asn NOT IN ({p})) "
+                "THEN geoip_country END)"
+            ).format(p=placeholders)
+            asn_expr = (
+                "COUNT(DISTINCT CASE WHEN geoip_asn > 0 "
+                "AND geoip_asn NOT IN ({p}) "
+                "THEN geoip_asn END)"
+            ).format(p=placeholders)
+            params = tuple(trusted) + tuple(trusted) + (username, cutoff)
+        else:
+            country_expr = (
+                "COUNT(DISTINCT CASE WHEN geoip_country != '' "
+                "THEN geoip_country END)"
+            )
+            asn_expr = (
+                "COUNT(DISTINCT CASE WHEN geoip_asn > 0 THEN geoip_asn END)"
+            )
+            params = (username, cutoff)
+
+        sql = (
+            "SELECT {c} AS countries, "
+            "       {a} AS asns, "
             "       COUNT(DISTINCT ip) AS ips "
-            "FROM auth_sessions WHERE username = ? AND timestamp >= ?",
-            (username, cutoff)
-        ).fetchone()
+            "FROM auth_sessions WHERE username = ? AND timestamp >= ?"
+        ).format(c=country_expr, a=asn_expr)
+
+        row = self.conn.execute(sql, params).fetchone()
         if not row:
             return {'countries': 0, 'asns': 0, 'ips': 0}
         return {

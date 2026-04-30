@@ -635,6 +635,25 @@ class DistributedAuthDetector:
             'compromise_detection', 'suppression_seconds', fallback=1800
         )
 
+        # Trusted ASNs — excluded from country / ASN counts but NOT IP count.
+        # Cloud mail providers (Microsoft 365, Google Workspace, iCloud) relay
+        # the same user through DCs in many countries; without this filter
+        # legitimate users repeatedly trip threshold_distinct_countries.
+        trusted_raw = config.get(
+            'compromise_detection', 'trusted_asns', fallback='8075, 15169, 714'
+        )
+        self.trusted_asns = set()
+        for token in trusted_raw.replace('\n', ',').split(','):
+            token = token.strip()
+            if not token or token.startswith('#'):
+                continue
+            try:
+                self.trusted_asns.add(int(token))
+            except ValueError:
+                logging.getLogger('wp-guardian.compromise-detector').warning(
+                    "Invalid trusted_asns entry '{t}' — must be an integer ASN".format(t=token)
+                )
+
         # Exclude regex list (one pattern per line in config)
         excl_raw = config.get('compromise_detection', 'exclude_usernames', fallback='')
         self._exclude_regexes = []
@@ -665,7 +684,10 @@ class DistributedAuthDetector:
         # Need at least some geo data for the country/asn rules to be meaningful;
         # the IP rule still works without.
         try:
-            counts = self.db.distinct_auth_counts(username, self.window_seconds)
+            counts = self.db.distinct_auth_counts(
+                username, self.window_seconds,
+                trusted_asns=self.trusted_asns,
+            )
         except Exception as e:
             self._logger.error("distinct_auth_counts failed: {e}".format(e=e))
             return
