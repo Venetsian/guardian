@@ -61,6 +61,12 @@ DEFAULTS = {
     # SSH
     'ssh_fail':        'immediate',
     'ssh_invalid':     'immediate',
+    'ssh_root':        'immediate',  # v1.5 — root brute force, always loud
+
+    # Web — POST-flood (v1.5)
+    # Default 'digest' because the FP profile is not yet proven in production.
+    # After 2+ weeks of clean data the operator can promote to 'immediate'.
+    'post_flood':      'digest',
 
     # Meta
     'trusted_skip':    'immediate',

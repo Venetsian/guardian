@@ -196,6 +196,17 @@ class GuardianDB:
             );
 
             CREATE INDEX IF NOT EXISTS idx_login_iso_last ON login_isolation(last_seen);
+
+            CREATE TABLE IF NOT EXISTS cms_sites (
+                site         TEXT PRIMARY KEY,
+                cms          TEXT NOT NULL DEFAULT 'unknown',
+                docroot      TEXT DEFAULT '',
+                admin_paths  TEXT DEFAULT '',
+                detected_at  INTEGER NOT NULL,
+                overridden   INTEGER DEFAULT 0
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_cms_sites_cms ON cms_sites(cms);
         """)
 
         self.conn.commit()
@@ -564,6 +575,70 @@ class GuardianDB:
         """Return total count of active tripwires."""
         cursor = self.conn.execute("SELECT COUNT(*) FROM tripwires WHERE active = 1")
         return cursor.fetchone()[0]
+
+    # ------------------------------------------------------------------
+    # CMS Site Registry (v1.5)
+    # ------------------------------------------------------------------
+    def cms_sites_upsert(self, site, cms, docroot='', admin_paths=None, overridden=False):
+        """Record (or update) a site's CMS classification.
+
+        admin_paths is a list of admin paths (lowercased). Stored as JSON.
+        """
+        import json
+        now = int(time.time())
+        paths_json = json.dumps(admin_paths or [])
+        self.conn.execute("""
+            INSERT OR REPLACE INTO cms_sites (site, cms, docroot, admin_paths, detected_at, overridden)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (site, cms, docroot, paths_json, now, 1 if overridden else 0))
+        self.conn.commit()
+
+    def cms_sites_get(self, site):
+        """Return a dict {site, cms, docroot, admin_paths, detected_at, overridden}
+        or None if the site has not been detected yet."""
+        import json
+        cursor = self.conn.execute(
+            "SELECT site, cms, docroot, admin_paths, detected_at, overridden "
+            "FROM cms_sites WHERE site = ?",
+            (site,)
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        try:
+            paths = json.loads(row['admin_paths'] or '[]')
+        except (ValueError, TypeError):
+            paths = []
+        return {
+            'site': row['site'],
+            'cms': row['cms'],
+            'docroot': row['docroot'] or '',
+            'admin_paths': paths,
+            'detected_at': row['detected_at'],
+            'overridden': bool(row['overridden']),
+        }
+
+    def cms_sites_all(self):
+        """Return all CMS site records as a dict keyed by site."""
+        import json
+        cursor = self.conn.execute(
+            "SELECT site, cms, docroot, admin_paths, detected_at, overridden FROM cms_sites"
+        )
+        out = {}
+        for row in cursor.fetchall():
+            try:
+                paths = json.loads(row['admin_paths'] or '[]')
+            except (ValueError, TypeError):
+                paths = []
+            out[row['site']] = {
+                'site': row['site'],
+                'cms': row['cms'],
+                'docroot': row['docroot'] or '',
+                'admin_paths': paths,
+                'detected_at': row['detected_at'],
+                'overridden': bool(row['overridden']),
+            }
+        return out
 
     # ------------------------------------------------------------------
     # Whitelist

@@ -1,5 +1,153 @@
 # WP-Guardian Changelog
 
+## v1.5.0 — Multi-CMS scaffolding & POST-flood detector (2026-05-03)
+
+This is an **extensibility release**. Every detector class moved out of
+the 2200-line `wp-guardian.py` into a `detectors/` package, the access-log
+parser is now format-aware (OpenLiteSpeed, Apache combined, nginx), and a
+new CMS registry auto-detects what's running on each vhost so future
+CMS-specific detectors can plug in without touching shared code.
+
+The headline new feature is a generic POST-flood detector with a
+two-stage gate (rate + behavioral confirmation) designed to catch
+admin-page brute force on any CMS while staying safe behind office NAT.
+It ships **off by default** — opt in via `[post_flood] enabled = true`.
+
+Joomla and Drupal arrive as scaffolding (path registration; auth-failure
+detection deferred to v1.6+ when the new web servers actually need it).
+
+### Detector refactor — no behavior change for existing rules
+
+- New `detectors/` package with one file per detector:
+  `base.py` (HitTracker), `web.py`, `mail.py`, `ssh.py`, `roundcube.py`,
+  `distributed_auth.py`, `post_flood.py`, `cms_base.py`, `joomla.py`,
+  `drupal.py`, `log_formats.py`.
+- `wp-guardian.py` shrinks from ~2200 to ~1200 lines and just imports
+  from `detectors`. Existing rules behave identically — verified by
+  unit-level smoke tests of each parser path.
+
+### `detectors/log_formats.py` — log-format dispatcher
+
+- `parse_line()` auto-detects OLS (outer quotes) vs Apache combined /
+  nginx default. Returns a normalized dict with `ip`, `method`, `path`,
+  `clean_path`, `status`, `size`, `referer`, `user_agent`, `format`.
+- `WebDetector.process_line` now calls `parse_line()` first; the legacy
+  three-regex parser is retired. Behavior preserved for the fields the
+  WordPress pipeline already used.
+- Fixes a latent bug in the v1.4 parser that stripped the trailing UA
+  quote from Apache combined lines (harmless before because the pipeline
+  never read that field; it would now have broken POST-flood's
+  off-host-Referer check).
+
+### `modules/cms_registry.py` — CMSRegistry
+
+- Auto-detects WordPress / Joomla / Drupal / Magento / PrestaShop /
+  OpenCart / phpMyAdmin per vhost by fingerprinting the docroot.
+- Refreshes every 6h (configurable), persists to the new `cms_sites`
+  table.
+- New `vhosts.conf` (optional) — operator can pin a site's CMS or
+  declare a renamed admin path (e.g. `admin_paths = /sekret-admin/index.php`).
+- WordPress auto-detect on a Joomla site is a non-issue: bots that
+  attack `/wp-login.php` on a Joomla vhost get a 404 from Joomla and
+  fall through to the universal 404-storm rule.
+
+### `detectors/post_flood.py` — POST-flood detector
+
+Watchlist-driven. Only paths registered by the CMS module (or
+`vhosts.conf`) are watched. WordPress's `wp-login.php` is intentionally
+excluded — the dedicated `wp_login` rule already covers it.
+
+Two-stage gate:
+- **Stage 1 (rate):** N POSTs to one watched URL from one IP within the
+  configured window. Default: 30 / 5 min.
+- **Stage 2 (behavioral, default ON):** at least one of —
+  - **A** zero CSS loads from this IP (real browsers fetch CSS for the
+    page hosting the form). Reuses the existing `login_isolation` table.
+  - **C** ≥80% off-host Referer across recent POSTs.
+  - **D** ≥80% identical Content-Length across recent POSTs.
+
+Trusted-IP exemption runs before stage 1: if the IP authenticated on
+any service in the trust window, the detector logs a heads-up via
+`alert_trusted_skip` and never blocks. (This subsumes the originally
+planned signal B — "zero successful auth" — which was redundant with
+the trust check.)
+
+New rule id: `post_flood`. Default verbosity: `digest` (FP profile
+not yet proven; promote to `immediate` after 2+ weeks of clean data).
+
+### SSH tune-up
+
+- New rule id `ssh_root` — fires when `Failed password for root from
+  <IP>` lines exceed `ssh_root_fail_threshold` (default: half of
+  `ssh_fail_threshold`, floor at 1 → instant block on first attempt).
+- Verified port-agnostic. The listening sshd port (22 / 69 / anything)
+  doesn't appear in the auth log message — only the client's source
+  port — so the existing `from (\d+\.\d+\.\d+\.\d+)` regex works on
+  any server config.
+
+### Database
+
+- Migration `007_cms_sites.sql` adds the `cms_sites` table.
+- `CURRENT_SCHEMA_VERSION` → 7.
+- `db.cms_sites_upsert / cms_sites_get / cms_sites_all` helpers.
+
+### Config additions
+
+```ini
+[cms_detection]
+enabled = true
+refresh_interval = 21600          # 6h
+vhosts_overrides = /opt/wp-guardian/vhosts.conf
+
+[post_flood]
+enabled = false                   # opt-in
+threshold = 30
+window = 300
+behavioral_required = true
+behavioral_referer_pct = 80
+behavioral_content_length_pct = 80
+universal_paths =                 # comma-separated, extends defaults
+
+[thresholds]
+ssh_root_fail_threshold = 1       # NEW (default = max(1, ssh_fail_threshold // 2))
+```
+
+All new options default-off or default-safe; existing v1.4 deployments
+upgrade with zero behavior change until they opt in.
+
+### Files changed
+
+- **New** `detectors/__init__.py`, `detectors/base.py`, `detectors/web.py`,
+  `detectors/mail.py`, `detectors/ssh.py`, `detectors/roundcube.py`,
+  `detectors/distributed_auth.py`, `detectors/log_formats.py`,
+  `detectors/post_flood.py`, `detectors/cms_base.py`,
+  `detectors/joomla.py`, `detectors/drupal.py`.
+- **New** `modules/cms_registry.py`, `migrations/007_cms_sites.sql`.
+- `wp-guardian.py` — detector classes removed; imports from
+  `detectors`; `Guardian.__init__` instantiates `CMSRegistry` and
+  `PostFloodDetector` and threads them into `WebDetector`; main loop
+  refreshes the registry on the configured interval.
+- `modules/database.py` — `cms_sites` in `_create_tables`; new helpers
+  `cms_sites_upsert`, `cms_sites_get`, `cms_sites_all`.
+- `modules/migrator.py` — `CURRENT_SCHEMA_VERSION = 7`.
+- `modules/verbosity.py` — registers `ssh_root` (immediate) and
+  `post_flood` (digest) defaults.
+- `wp-guardian.conf.example` & `wp-guardian.conf` — new sections.
+- `install.sh` — interactive prompts for POST-flood opt-in.
+- `README.md` — features list, file tree, detection-pipeline section.
+- `CLAUDE.md` — Detector architecture section, CMS registry, POST-flood
+  rule, `ssh_root` rule, updated detection-logic ordering.
+- `VERSION` → `1.5.0`.
+
+### Upgrade notes
+
+- `git pull && bash update.sh` runs migration 007 idempotently. No
+  behavior change unless you opt into POST-flood.
+- If you rename your Joomla admin path or use a non-standard docroot
+  layout, drop a stub in `vhosts.conf` so the registry knows about it.
+
+---
+
 ## v1.4.3 — Trusted-ASN exemption for compromise detection (2026-04-30)
 
 Stops `DistributedAuthDetector` from false-firing on legitimate users of

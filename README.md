@@ -6,8 +6,11 @@ WP-Guardian monitors web, SMTP, IMAP/POP3, and SSH logs, automatically blocks at
 
 ## Features
 
-- **Multi-service monitoring** — web access logs, mail (Postfix + Dovecot), Roundcube webmail, SSH
+- **Multi-service monitoring** — web access logs (OpenLiteSpeed, Apache combined, nginx; auto-detected per line), mail (Postfix + Dovecot), Roundcube webmail, SSH
 - **Pluggable firewall backends** — CSF, firewalld, nftables, MikroTik, pfSense/OPNsense
+- **CMS auto-detect (v1.5+)** — fingerprints each vhost on startup (WordPress / Joomla / Drupal / Magento / PrestaShop / OpenCart / phpMyAdmin) and uses that to dispatch CMS-specific rules; per-vhost overrides via optional `vhosts.conf`
+- **POST-flood detector (v1.5+)** — generic catch-all for admin/auth POST flooding. Watchlist-only (registered admin paths + universal `/login`, `/signin`, `/phpmyadmin/`, etc.) plus a two-stage gate (rate threshold + behavioral confirmation: zero CSS / off-host Referer / uniform Content-Length) so it doesn't false-positive on offices behind shared NAT. Off by default, opt-in per server.
+- **SSH root brute-force rule (v1.5+)** — `ssh_root` rule fires on the first `Failed password for root` attempt by default. Port-agnostic (works on sshd port 22, 69, or anything else).
 - **Smart detection pipeline** — structural tripwires, known webshells, login isolation (CSS-based bot detection), brute force thresholds, PHP scanning detection, author enumeration, 404 storms
 - **Credential compromise detection (v1.4+)** — `DistributedAuthDetector` catches the classic distributed credential-abuse botnet pattern (same mailbox authenticating from many countries/ASNs/IPs in a short window), automatically blocks source IPs, and disables the mailbox in the mail backend
 - **GeoIP enrichment (v1.4+)** — every auth event and block is tagged with country, city, ASN, and ASN organization via MaxMind GeoLite2
@@ -137,8 +140,8 @@ commands_poll_timeout = 30    # long-poll timeout in seconds
 
 Each web access log line goes through these checks in order (first match wins):
 
-1. Strip OpenLiteSpeed outer quotes
-2. Parse IP, method, path, status
+1. Auto-detect log format (OLS / Apache combined / nginx) and parse IP, method, path, status, referer, user-agent
+2. **POST-flood watchlist** (v1.5+) — two-stage gate on registered admin paths; runs in parallel before WP-specific rules
 3. Track CSS loads (browser fingerprint for login isolation)
 4. Record successful WordPress logins (trusted for 24h)
 5. Skip safe paths (`/wp-admin/`, `/wp-includes/`)
@@ -152,6 +155,11 @@ Each web access log line goes through these checks in order (first match wins):
 13. Author enumeration — block after 8 hits
 14. PHP 404 scanning — block after 20 hits
 15. General 404 storm — block after 50 hits
+
+For SSH (`/var/log/secure`):
+- `Invalid user` → instant block (`ssh_invalid`)
+- `Failed password for root` → block after `ssh_root_fail_threshold` (default 1) (v1.5+, `ssh_root`)
+- `Failed password` for any other user → block after `ssh_fail_threshold` (default 3) (`ssh_fail`)
 
 ## Firewall Backends
 
@@ -176,18 +184,37 @@ See [backends/README.md](backends/README.md) for creating custom backends.
 
 ```
 /opt/wp-guardian/
-├── wp-guardian.py          # Main daemon + CLI
+├── wp-guardian.py          # Main daemon + CLI (~1200 lines after v1.5 refactor)
 ├── wp-guardian.conf        # Configuration (chmod 600!)
+├── vhosts.conf             # Optional per-vhost CMS / admin-path overrides (v1.5+)
 ├── VERSION                 # Application version
 ├── update.sh               # Update with backup/rollback
 ├── whitelist.conf          # Never-block IPs
 ├── tripwires.txt           # Attack paths from log analysis
 ├── logfiles.txt            # Monitored access log paths
+├── detectors/              # v1.5+ — one detector per file
+│   ├── base.py             # HitTracker (shared sliding-window counter)
+│   ├── log_formats.py      # OLS / Apache / nginx access-log parser
+│   ├── web.py              # WordPress-focused web detector
+│   ├── mail.py             # Postfix + Dovecot detector
+│   ├── ssh.py              # sshd detector (incl. v1.5 ssh_root rule)
+│   ├── roundcube.py        # Roundcube errors.log detector
+│   ├── distributed_auth.py # Cross-protocol compromise detector
+│   ├── post_flood.py       # Two-stage POST-flood detector (v1.5+)
+│   ├── cms_base.py         # Per-CMS detector base class (v1.5+)
+│   ├── joomla.py           # Joomla skeleton (v1.5; auth-failure detect lands in v1.6+)
+│   └── drupal.py           # Drupal skeleton  (same status)
 ├── modules/
 │   ├── database.py         # SQLite data layer
 │   ├── config.py           # Config loader
 │   ├── whitelist.py        # Three-source whitelist manager
 │   ├── blocker.py          # Block decision engine
+│   ├── geoip.py            # MaxMind GeoLite2 lookup
+│   ├── compromise.py       # CompromiseAction (block IPs + disable mailbox)
+│   ├── digest.py           # Hourly Telegram digest buffer
+│   ├── verbosity.py        # Per-rule alert routing
+│   ├── cms_registry.py     # Auto-detected vhost → CMS map (v1.5+)
+│   ├── mail_backend.py     # MariaDB mailbox-disable integration
 │   └── migrator.py         # Database migration runner
 ├── backends/
 │   ├── base.py             # Firewall backend interface (ABC)
@@ -205,9 +232,10 @@ See [backends/README.md](backends/README.md) for creating custom backends.
 │   ├── telegram_setup.py        # Interactive Telegram setup
 │   ├── log-analyzer.sh          # Tripwire discovery
 │   ├── backfill_maillog.py      # Seed auth_sessions from maillog history
-│   └── backfill_ip_history.py   # Geo-enrich ip_history rows (v1.4.2+ repair)
+│   ├── backfill_ip_history.py   # Geo-enrich ip_history rows (v1.4.2+ repair)
+│   └── config-upgrade.py        # Detect & merge new config options on upgrade
 ├── migrations/
-│   └── *.sql               # Database migrations
+│   └── *.sql               # Database migrations (v1.5: 007_cms_sites.sql)
 ├── state/
 │   └── guardian.db          # SQLite database
 └── logs/
