@@ -361,6 +361,10 @@ class Guardian:
             mail_backend=self.mail_backend,
             compromise_action=self.compromise_action,
             verbosity_router=self.verbosity_router,
+            cms_registry=self.cms_registry,
+            firewall=self.firewall,
+            post_flood_detector=self.post_flood_detector,
+            version=self.version,
         )
 
         # Ensure firewall rules exist (backend-specific setup)
@@ -496,6 +500,10 @@ class Guardian:
             self.logger.info(f"Roundcube log not found: {roundcube_log} (skipping)")
 
         self.logger.info(f"Guardian running with {len(self.tailers)} log tailer(s)")
+
+        # Hand the live tailer list to the Telegram command handler so /logs
+        # can introspect what's being monitored.
+        self.telegram_cmd.set_tailers(self.tailers)
 
         # Start Telegram command handler (polling thread)
         self.telegram_cmd.start()

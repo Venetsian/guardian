@@ -110,6 +110,167 @@ ask_yn() {
     [[ "$answer" =~ ^[Yy] ]]
 }
 
+# ---------------------------------------------------------------------------
+# Input validators (v1.5+)
+# All validators retry on bad input. They print warnings to STDERR so the
+# captured stdout (echoed by `local v=$(ask_*)`) only contains the value.
+# ---------------------------------------------------------------------------
+
+_warn_retry() { echo -e "  ${YELLOW}[!]${NC} $1" >&2; }
+
+ask_int() {
+    # $1=prompt, $2=default, $3=min (optional), $4=max (optional)
+    local prompt="$1" default="${2:-}" min="${3:-}" max="${4:-}"
+    local answer
+    while true; do
+        answer=$(ask "$prompt" "$default")
+        if [[ -z "$answer" ]]; then
+            echo ""
+            return
+        fi
+        if ! [[ "$answer" =~ ^[0-9]+$ ]]; then
+            _warn_retry "Please enter a positive integer."
+            continue
+        fi
+        if [[ -n "$min" ]] && (( answer < min )); then
+            _warn_retry "Value must be at least $min."
+            continue
+        fi
+        if [[ -n "$max" ]] && (( answer > max )); then
+            _warn_retry "Value must be at most $max."
+            continue
+        fi
+        echo "$answer"
+        return
+    done
+}
+
+ask_port() {
+    # $1=prompt, $2=default — convenience for ask_int 1-65535
+    ask_int "$1" "$2" 1 65535
+}
+
+ask_choice() {
+    # $1=prompt, $2=default, $3+=valid values
+    local prompt="$1" default="$2"
+    shift 2
+    local valid=("$@")
+    local answer v
+    while true; do
+        answer=$(ask "$prompt" "$default")
+        for v in "${valid[@]}"; do
+            if [[ "$answer" == "$v" ]]; then
+                echo "$answer"
+                return
+            fi
+        done
+        _warn_retry "Please choose one of: ${valid[*]}"
+    done
+}
+
+ask_ip() {
+    # $1=prompt, $2=default, $3=allow_empty (true|false), $4=allow_hostname (true|false)
+    local prompt="$1" default="${2:-}"
+    local allow_empty="${3:-false}" allow_host="${4:-true}"
+    local ipv4_re='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+    local hostname_re='^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$'
+    local answer a b c d o ok
+    while true; do
+        answer=$(ask "$prompt" "$default")
+        if [[ -z "$answer" ]]; then
+            if [[ "$allow_empty" == "true" ]]; then
+                echo ""
+                return
+            fi
+            _warn_retry "This field is required."
+            continue
+        fi
+        if [[ "$answer" =~ $ipv4_re ]]; then
+            ok=true
+            IFS='.' read -r a b c d <<< "$answer"
+            for o in "$a" "$b" "$c" "$d"; do
+                if (( o > 255 )); then ok=false; break; fi
+            done
+            if $ok; then echo "$answer"; return; fi
+            _warn_retry "Each octet must be 0-255."
+            continue
+        fi
+        if [[ "$allow_host" == "true" ]] && [[ "$answer" =~ $hostname_re ]]; then
+            echo "$answer"
+            return
+        fi
+        if [[ "$allow_host" == "true" ]]; then
+            _warn_retry "Please enter a valid IPv4 address or hostname."
+        else
+            _warn_retry "Please enter a valid IPv4 address (e.g. 192.168.1.1)."
+        fi
+    done
+}
+
+ask_path() {
+    # $1=prompt, $2=default, $3=must_exist (true|false)
+    local prompt="$1" default="${2:-}" must_exist="${3:-false}"
+    local answer
+    while true; do
+        answer=$(ask "$prompt" "$default")
+        if [[ -z "$answer" ]]; then
+            _warn_retry "Path is required."
+            continue
+        fi
+        if [[ "$must_exist" == "true" ]] && [[ ! -f "$answer" ]]; then
+            _warn_retry "File does not exist: $answer"
+            if ask_yn "  Continue anyway?" "n"; then
+                echo "$answer"
+                return
+            fi
+            continue
+        fi
+        echo "$answer"
+        return
+    done
+}
+
+ask_telegram_token() {
+    # Telegram bot tokens look like: <digits>:<base64-ish chars>
+    # Empty input is allowed (caller can leave blank to use the wizard).
+    local prompt="$1" default="${2:-}"
+    local re='^[0-9]+:[A-Za-z0-9_-]+$'
+    local answer
+    while true; do
+        answer=$(ask "$prompt" "$default")
+        if [[ -z "$answer" ]]; then
+            echo ""
+            return
+        fi
+        if [[ "$answer" =~ $re ]]; then
+            echo "$answer"
+            return
+        fi
+        _warn_retry "Bot token format looks wrong. Expected like '123456789:ABCdef-_xyz'."
+    done
+}
+
+ask_telegram_chat_id() {
+    # Numeric (positive personal, negative group) or @username (5+ chars).
+    # Empty input is allowed.
+    local prompt="$1" default="${2:-}"
+    local num_re='^-?[0-9]+$'
+    local user_re='^@[A-Za-z0-9_]{4,}$'
+    local answer
+    while true; do
+        answer=$(ask "$prompt" "$default")
+        if [[ -z "$answer" ]]; then
+            echo ""
+            return
+        fi
+        if [[ "$answer" =~ $num_re ]] || [[ "$answer" =~ $user_re ]]; then
+            echo "$answer"
+            return
+        fi
+        _warn_retry "Chat ID must be numeric (e.g. 12345 or -100123) or @username."
+    done
+}
+
 # ===========================================================================
 # Pre-checks
 # ===========================================================================
@@ -297,7 +458,7 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
     echo "       Blocks at network edge via REST API."
     echo ""
 
-    BACKEND_CHOICE=$(ask "  Choice" "1")
+    BACKEND_CHOICE=$(ask_choice "  Choice" "1" 1 2 3 4 5 6)
 
     case "$BACKEND_CHOICE" in
         2)
@@ -326,8 +487,8 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
             echo ""
             print_step "MikroTik configuration:"
             echo ""
-            MK_HOST=$(ask "    Router IP" "192.168.2.1")
-            MK_PORT=$(ask "    SSH port" "22")
+            MK_HOST=$(ask_ip "    Router IP" "192.168.2.1" false true)
+            MK_PORT=$(ask_port "    SSH port" "22")
             MK_USER=$(ask "    SSH user" "guardian")
             MK_FRIENDLY=$(ask "    Friendly address list name" "friendly")
 
@@ -341,7 +502,7 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
             DEFAULT_KEY="/root/.ssh/mikrotik_guardian"
             if [[ -f "$DEFAULT_KEY" ]]; then
                 echo "    Found existing key: ${DEFAULT_KEY}"
-                MK_KEY=$(ask "    SSH private key path" "$DEFAULT_KEY")
+                MK_KEY=$(ask_path "    SSH private key path" "$DEFAULT_KEY" true)
             else
                 # Look for any existing SSH keys
                 EXISTING_KEYS=$(ls /root/.ssh/id_* 2>/dev/null | grep -v '\.pub$' || true)
@@ -357,7 +518,7 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
                 echo "      1) Enter path to an existing SSH key"
                 echo "      2) Generate a new key pair for MikroTik"
                 echo ""
-                KEY_CHOICE=$(ask "    Choice" "1")
+                KEY_CHOICE=$(ask_choice "    Choice" "1" 1 2)
 
                 if [[ "$KEY_CHOICE" == "2" ]]; then
                     MK_KEY="$DEFAULT_KEY"
@@ -373,7 +534,7 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
                     echo ""
                     read -r -p "    Press Enter when done (or skip and do it later)..."
                 else
-                    MK_KEY=$(ask "    SSH private key path" "$DEFAULT_KEY")
+                    MK_KEY=$(ask_path "    SSH private key path" "$DEFAULT_KEY" true)
                 fi
             fi
 
@@ -402,7 +563,7 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
             echo ""
             echo "    a) pfSense"
             echo "    b) OPNsense"
-            PF_CHOICE=$(ask "    Platform" "a")
+            PF_CHOICE=$(ask_choice "    Platform" "a" a b)
             if [[ "$PF_CHOICE" == "b" ]]; then
                 FIREWALL_BACKEND="opnsense"
             else
@@ -410,8 +571,8 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
             fi
             echo ""
             print_step "pfSense/OPNsense configuration:"
-            PF_HOST=$(ask "    Firewall IP" "192.168.1.1")
-            PF_PORT=$(ask "    API port" "443")
+            PF_HOST=$(ask_ip "    Firewall IP" "192.168.1.1" false true)
+            PF_PORT=$(ask_port "    API port" "443")
             PF_KEY=$(ask "    API key" "")
             PF_SECRET=$(ask "    API secret" "")
             PF_ALIAS=$(ask "    Block alias name" "wp_guardian_blocked")
@@ -433,19 +594,15 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
     echo -e "${BOLD}  Telegram Alerts${NC}"
     TELEGRAM_TOKEN=""
     TELEGRAM_CHAT_ID=""
+    RUN_TELEGRAM_SETUP=false
     if ask_yn "  Enable Telegram alerts?" "y"; then
         TELEGRAM_ENABLED="true"
         echo ""
-        echo "  Run the setup wizard to configure your bot."
-        echo "  (You can also do this later with: wp-guardian.py --telegram-setup)"
+        echo "  If you already have a bot token and chat ID, paste them now."
+        echo "  Leave both blank to run the interactive setup wizard at the end of this install."
         echo ""
-        if ask_yn "  Run Telegram setup wizard now?" "y"; then
-            RUN_TELEGRAM_SETUP=true
-        else
-            RUN_TELEGRAM_SETUP=false
-            TELEGRAM_TOKEN=$(ask "    Bot token (or press Enter to skip)" "")
-            TELEGRAM_CHAT_ID=$(ask "    Chat ID (or press Enter to skip)" "")
-        fi
+        TELEGRAM_TOKEN=$(ask_telegram_token "    Bot token (Enter to skip)" "")
+        TELEGRAM_CHAT_ID=$(ask_telegram_chat_id "    Chat ID (Enter to skip)" "")
 
         echo ""
         echo "  Telegram commands let you manage WP-Guardian from your chat:"
@@ -463,7 +620,7 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
         echo "    1) verbose — every block alerts immediately (recommended for first week)"
         echo "    2) digest  — tier-1/tier-2 blocks are buffered into an hourly summary"
         echo "    3) quiet   — only compromise + BLOCK FAILED alert immediately"
-        ALERT_MODE_CHOICE=$(ask "  Choice" "1")
+        ALERT_MODE_CHOICE=$(ask_choice "  Choice" "1" 1 2 3)
         case "$ALERT_MODE_CHOICE" in
             2) TELEGRAM_ALERT_MODE="digest" ;;
             3) TELEGRAM_ALERT_MODE="quiet" ;;
@@ -551,7 +708,7 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
     MAIL_BACKEND_USER="wp_guardian"
     MAIL_BACKEND_PASSWORD=""
     MAIL_BACKEND_TABLE=""
-    MAIL_RECIPE_CHOICE=$(ask "  Choice" "6")
+    MAIL_RECIPE_CHOICE=$(ask_choice "  Choice" "6" 1 2 3 4 5 6)
     case "$MAIL_RECIPE_CHOICE" in
         1)
             MAIL_BACKEND_TYPE="cyberpanel"
@@ -589,8 +746,8 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
 
     if [[ "$MAIL_BACKEND_TYPE" != "none" ]]; then
         echo ""
-        MAIL_BACKEND_HOST=$(ask "    MariaDB host" "$MAIL_BACKEND_HOST")
-        MAIL_BACKEND_PORT=$(ask "    MariaDB port" "$MAIL_BACKEND_PORT")
+        MAIL_BACKEND_HOST=$(ask_ip "    MariaDB host" "$MAIL_BACKEND_HOST" false true)
+        MAIL_BACKEND_PORT=$(ask_port "    MariaDB port" "$MAIL_BACKEND_PORT")
         MAIL_BACKEND_DB=$(ask "    Database name" "$MAIL_BACKEND_DB")
         MAIL_BACKEND_USER=$(ask "    MariaDB user" "$MAIL_BACKEND_USER")
         read -r -s -p "    MariaDB password: " MAIL_BACKEND_PASSWORD
@@ -616,7 +773,7 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
     echo -e "${BOLD}  Threshold Profile (v1.4+)${NC}"
     echo "    1) steady    — tight thresholds for normal operations (default)"
     echo "    2) migration — loose thresholds for post-cutover migration periods"
-    PROFILE_CHOICE=$(ask "  Choice" "1")
+    PROFILE_CHOICE=$(ask_choice "  Choice" "1" 1 2)
     case "$PROFILE_CHOICE" in
         2) PROFILE_MODE="migration" ;;
         *) PROFILE_MODE="steady" ;;
@@ -735,10 +892,22 @@ PYEOF
 
     print_ok "Config generated"
 
-    # Run Telegram setup wizard if requested
-    if [[ "${RUN_TELEGRAM_SETUP}" == "true" ]]; then
+    # Run Telegram setup wizard — only if alerts were enabled AND token/chat_id
+    # are still missing. We ask the question HERE (right before the wizard
+    # actually runs) instead of upfront in gather_config, so the user isn't
+    # surprised by other config questions appearing "inside" the Telegram step.
+    if [[ "${TELEGRAM_ENABLED:-false}" == "true" ]] && \
+       [[ -z "${TELEGRAM_TOKEN}" || -z "${TELEGRAM_CHAT_ID}" ]]; then
         echo ""
-        python3 "${INSTALL_DIR}/tools/telegram_setup.py" "${INSTALL_DIR}/wp-guardian.conf" || true
+        echo -e "${BOLD}  Telegram Setup Wizard${NC}"
+        echo "  Bot token and/or chat ID are not set yet."
+        echo "  The wizard will walk you through getting them and write them to wp-guardian.conf."
+        if ask_yn "  Run the Telegram setup wizard now?" "y"; then
+            echo ""
+            python3 "${INSTALL_DIR}/tools/telegram_setup.py" "${INSTALL_DIR}/wp-guardian.conf" || true
+        else
+            echo "  Skipped. Run later with: python3 ${INSTALL_DIR}/wp-guardian.py --telegram-setup"
+        fi
     fi
 fi
 

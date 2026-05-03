@@ -181,6 +181,65 @@ the trust check.)
 New rule id: `post_flood`. Default verbosity: `digest` (FP profile
 not yet proven; promote to `immediate` after 2+ weeks of clean data).
 
+### install.sh — input validation + Telegram-wizard UX fix
+
+**UX fix.** The "Run Telegram setup wizard now?" prompt used to be asked
+upfront in `gather_config`, but the wizard didn't actually run until the
+end of the install — after a dozen more questions (commands, alert mode,
+GeoIP, compromise detection, mail backend, profile, POST-flood). From
+the operator's perspective those questions looked "injected" into the
+Telegram step. The wizard prompt is now asked **right before the wizard
+runs**, only if `bot_token` or `chat_id` are still empty after upfront
+collection. No more interleaving.
+
+**Input validation.** All install prompts that previously accepted any
+string now validate format and retry on bad input. New helpers:
+
+- `ask_int <prompt> <default> [<min>] [<max>]` — integer with optional bounds
+- `ask_port <prompt> <default>` — `ask_int` clamped to 1–65535
+- `ask_choice <prompt> <default> <v1> <v2> …` — must match one of the values
+- `ask_ip <prompt> <default> <allow_empty> <allow_hostname>` — IPv4
+  octet-range checked, optional hostname acceptance
+- `ask_path <prompt> <default> <must_exist>` — optional file-existence check
+- `ask_telegram_token <prompt> <default>` — `^\d+:[\w-]+$` format check
+- `ask_telegram_chat_id <prompt> <default>` — numeric (incl. negative
+  group/channel IDs) or `@username` (4+ chars)
+
+Wired into: firewall backend choice, MikroTik host/port/key path,
+key-choice menu, pfSense platform/host/port, Telegram alert-mode menu,
+mail-recipe choice, mail-backend host/port, profile-mode choice. Bad
+input prints a one-line warning to stderr and re-prompts; the captured
+stdout (read by `var=$(ask_*)`) only ever contains a valid value.
+
+**Files changed:** `install.sh`.
+
+### Telegram commands for remote troubleshooting
+
+Five new commands so the operator can investigate v1.5 state from chat
+without SSHing into the box:
+
+- `/sites [cms]` — list detected vhosts with their CMS classification.
+  Tally by CMS at the top, then up to 30 sites listed (sorted). Optional
+  filter, e.g. `/sites joomla`. `*` next to a CMS name means the entry
+  was set via `vhosts.conf` rather than auto-detected.
+- `/site <name>` — full registry entry for one site: CMS, docroot,
+  admin paths, override flag, detection timestamp.
+- `/cmsrefresh` — force an immediate CMS-registry rebuild (vs waiting
+  for the 6h periodic refresh). Useful right after provisioning a new
+  vhost or editing `vhosts.conf`.
+- `/logs` — list of log files being tailed by each tailer (web / mail /
+  ssh / roundcube), inferred web-server type (OpenLiteSpeed / Apache /
+  nginx based on path patterns), `logfiles_list` location, and whether
+  `auto_discover` is on.
+- `/serverinfo` — version, schema version, firewall backend class,
+  profile mode, dry-run flag, plus a v1.5 feature-flag summary
+  (CMS auto-detect, POST-flood, ssh_root threshold).
+
+`TelegramCommander.__init__` gains `cms_registry`, `firewall`,
+`post_flood_detector`, `version`, and `config` parameters. Tailers are
+attached after start via a new `set_tailers(tailers)` setter, called
+from `Guardian.start()` once tailers exist.
+
 ### SSH tune-up
 
 - New rule id `ssh_root` — fires when `Failed password for root from

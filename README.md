@@ -133,6 +133,13 @@ When `commands_enabled = true` in your `[telegram]` config, WP-Guardian polls fo
 /verbosity <rule> <level>    — set immediate/digest/silent for a rule
 /verbosity clear <rule>      — remove one override
 /verbosity reset             — wipe all overrides
+
+/sites [cms]                 — (v1.5+) detected vhosts, optional CMS filter
+/site <name>                 — (v1.5+) full registry entry for one site
+/cmsrefresh                  — (v1.5+) rebuild the CMS registry now
+/logs                        — (v1.5+) log files being tailed + web-server type
+/serverinfo                  — (v1.5+) version, firewall, feature flags
+
 /help                        — list commands
 ```
 
@@ -247,6 +254,81 @@ backend = csf       # or: firewalld, nftables, mikrotik, pfsense, opnsense
 | pfSense / OPNsense | Network edge (appliance) | Networks with pfSense/OPNsense firewalls |
 
 See [backends/README.md](backends/README.md) for creating custom backends.
+
+## v1.5 Configuration
+
+The full reference is in [`wp-guardian.conf.example`](wp-guardian.conf.example). The options most operators will touch:
+
+### CMS auto-detect
+
+```ini
+[cms_detection]
+enabled = true
+refresh_interval = 21600          # 6h — how often to re-fingerprint vhosts
+vhosts_overrides = /opt/wp-guardian/vhosts.conf
+```
+
+The registry walks `logfiles.txt`, derives site names from `/home/<site>/logs/...`, and fingerprints each docroot. To check what was detected: `/sites` from Telegram, or `--status` includes a tally.
+
+### Per-vhost overrides — `vhosts.conf`
+
+Drop this file next to `wp-guardian.conf` to override auto-detect or declare a renamed admin path. Empty / missing = pure auto-detect.
+
+```ini
+[example.com]
+cms = joomla
+admin_paths = /sekret-admin/index.php, /administrator/index.php
+
+[shop.com]
+cms = wordpress
+post_flood_threshold = 50         # raise threshold for high-traffic vhost
+```
+
+Force an immediate rebuild after editing: `/cmsrefresh` from Telegram, or restart the daemon.
+
+### POST-flood detector
+
+Off by default. Enable on servers running non-WordPress CMSes:
+
+```ini
+[post_flood]
+enabled = true
+threshold = 30                    # POSTs per IP per URL within window
+window = 300                      # 5 min
+behavioral_required = true        # require at least one bot signal — keep this ON
+behavioral_referer_pct = 80
+behavioral_content_length_pct = 80
+universal_paths =                 # comma-separated; extends built-in defaults
+```
+
+Built-in always-watched paths: `/phpmyadmin/`, `/cpanel`, `/login`, `/signin`, `/admin/login`, `/admin/index.php`. Per-CMS paths come from the CMS detector skeletons (Joomla → `/administrator/index.php`, Drupal → `/user/login`).
+
+Default verbosity is `digest` — alerts batch hourly so you can observe the FP profile before promoting. After 1–2 weeks of clean data:
+
+```
+/verbosity post_flood immediate
+```
+
+### SSH root brute force
+
+```ini
+[thresholds]
+ssh_fail_threshold = 3            # regular users
+ssh_root_fail_threshold = 1       # v1.5+ — root attempts (1 = instant block)
+                                  # set to 0 to disable the dedicated root rule
+```
+
+If you legitimately SSH as root from automation, whitelist its IP first or set `ssh_root_fail_threshold = 0`.
+
+### Remote troubleshooting
+
+All of the above is observable from Telegram once `commands_enabled = true`:
+
+- `/serverinfo` — version, firewall, feature flags at a glance
+- `/sites` — what CMS each vhost was detected as
+- `/site <name>` — full registry entry for one vhost
+- `/logs` — log files being tailed and inferred web-server type
+- `/cmsrefresh` — rebuild the CMS registry without restarting
 
 ## File Structure
 

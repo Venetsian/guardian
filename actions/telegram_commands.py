@@ -29,12 +29,15 @@ class TelegramCommander:
     """
 
     def __init__(self, config, db, blocker, whitelist, tripwires=None, base_dir=None,
-                 mail_backend=None, compromise_action=None, verbosity_router=None):
+                 mail_backend=None, compromise_action=None, verbosity_router=None,
+                 cms_registry=None, firewall=None, post_flood_detector=None,
+                 version='unknown'):
         self.enabled = config.getboolean('telegram', 'commands_enabled', fallback=False)
         self.bot_token = config.get('telegram', 'bot_token', fallback='')
         self.chat_id = config.get('telegram', 'chat_id', fallback='')
         self.poll_timeout = config.getint('telegram', 'commands_poll_timeout', fallback=30)
 
+        self.config = config
         self.db = db
         self.blocker = blocker
         self.whitelist = whitelist
@@ -43,6 +46,11 @@ class TelegramCommander:
         self.mail_backend = mail_backend  # may be None/disabled
         self.compromise_action = compromise_action  # may be None
         self.verbosity_router = verbosity_router  # may be None
+        self.cms_registry = cms_registry              # v1.5+
+        self.firewall = firewall                      # v1.5+ — for /serverinfo
+        self.post_flood_detector = post_flood_detector  # v1.5+
+        self.version = version
+        self.tailers = []                             # populated via set_tailers()
 
         self.running = False
         self._thread = None
@@ -79,6 +87,14 @@ class TelegramCommander:
         self._thread.daemon = True
         self._thread.start()
         logger.info("Telegram command polling started")
+
+    def set_tailers(self, tailers):
+        """Hand the live LogTailer list to the command handler.
+
+        Tailers are created in Guardian.start() AFTER TelegramCommander is
+        instantiated, so /logs needs them attached at that point.
+        """
+        self.tailers = list(tailers)
 
     def stop(self):
         """Stop the polling thread."""
@@ -212,6 +228,12 @@ class TelegramCommander:
             '/resolve': self._cmd_resolve,
             # v1.4.1
             '/verbosity': self._cmd_verbosity,
+            # v1.5 — remote troubleshooting
+            '/sites': self._cmd_sites,
+            '/site': self._cmd_site,
+            '/cmsrefresh': self._cmd_cmsrefresh,
+            '/logs': self._cmd_logs,
+            '/serverinfo': self._cmd_serverinfo,
         }
 
         handler = handlers.get(command)
@@ -846,6 +868,296 @@ class TelegramCommander:
         ok, msg = self.verbosity_router.set_override(rule, level)
         self._reply(msg)
 
+    # ------------------------------------------------------------------
+    # v1.5 — Remote troubleshooting commands
+    # ------------------------------------------------------------------
+    def _cmd_sites(self, args):
+        """Handle /sites — show CMS registry summary or filter by CMS.
+
+        /sites               — summary + first 30 sites
+        /sites <cms>         — only sites of that CMS (e.g. /sites joomla)
+        """
+        if self.cms_registry is None:
+            self._reply("CMS registry is not loaded.")
+            return
+
+        sites = self.cms_registry.all()
+        if not sites:
+            self._reply(
+                "CMS registry is empty.\n"
+                "If the daemon just started, /cmsrefresh forces a rebuild."
+            )
+            return
+
+        # Tally by CMS
+        tally = {}
+        for entry in sites.values():
+            tally[entry['cms']] = tally.get(entry['cms'], 0) + 1
+        tally_lines = ['  {cms}: {n}'.format(cms=k, n=v)
+                       for k, v in sorted(tally.items(), key=lambda x: (-x[1], x[0]))]
+
+        # Filter
+        cms_filter = args[0].lower() if args else None
+        if cms_filter:
+            filtered = {s: e for s, e in sites.items() if e['cms'] == cms_filter}
+            if not filtered:
+                self._reply(
+                    "<b>CMS Registry</b> ({total} sites)\n"
+                    "━━━━━━━━━━━━━━━━━━━━━\n"
+                    "No sites match cms={cms}.\n"
+                    "Known: {known}".format(
+                        total=len(sites), cms=cms_filter,
+                        known=', '.join(sorted(tally.keys()))
+                    )
+                )
+                return
+            display = filtered
+            header_extra = " (cms={cms})".format(cms=cms_filter)
+        else:
+            display = sites
+            header_extra = ''
+
+        # Format site list, capped to keep Telegram reply short
+        max_lines = 30
+        site_lines = []
+        for site_name in sorted(display.keys())[:max_lines]:
+            entry = display[site_name]
+            tag = entry['cms']
+            if entry.get('overridden'):
+                tag += '*'
+            site_lines.append('  {site} [{tag}]'.format(site=site_name, tag=tag))
+
+        truncated_note = ''
+        if len(display) > max_lines:
+            truncated_note = '\n  ... and {n} more'.format(n=len(display) - max_lines)
+
+        msg = (
+            "<b>CMS Registry</b>{extra} ({total} sites)\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "{tally}\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "{sites}{trunc}\n"
+            "\n"
+            "<i>* = overridden via vhosts.conf</i>\n"
+            "/site &lt;name&gt; for details · /cmsrefresh to rebuild"
+        ).format(
+            extra=header_extra,
+            total=len(sites),
+            tally='\n'.join(tally_lines),
+            sites='\n'.join(site_lines) if site_lines else '  (none)',
+            trunc=truncated_note,
+        )
+        self._reply(msg)
+
+    def _cmd_site(self, args):
+        """Handle /site <name> — full registry entry for one site."""
+        if self.cms_registry is None:
+            self._reply("CMS registry is not loaded.")
+            return
+        if not args:
+            self._reply("Usage: /site &lt;site_name&gt;")
+            return
+
+        site_name = args[0]
+        entry = self.cms_registry.get(site_name)
+
+        # cms_registry.get() always returns a dict; an unknown site has
+        # detected_at=0 and empty fields.
+        if entry.get('detected_at', 0) == 0 and not entry.get('docroot'):
+            self._reply(
+                "Site <code>{site}</code> is not in the registry.\n"
+                "Use /sites to list known sites, or /cmsrefresh to rebuild.".format(
+                    site=site_name
+                )
+            )
+            return
+
+        admin_paths = entry.get('admin_paths') or []
+        admin_block = '\n'.join('  ' + p for p in admin_paths) if admin_paths else '  (none)'
+
+        try:
+            ts = time.strftime('%Y-%m-%d %H:%M:%S',
+                               time.localtime(entry.get('detected_at', 0)))
+        except Exception:
+            ts = '?'
+
+        msg = (
+            "<b>{site}</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "CMS: <b>{cms}</b>{ov}\n"
+            "Docroot: <code>{docroot}</code>\n"
+            "Admin paths:\n"
+            "{paths}\n"
+            "Detected: {ts}"
+        ).format(
+            site=site_name,
+            cms=entry['cms'],
+            ov=' (overridden via vhosts.conf)' if entry.get('overridden') else ' (auto-detected)',
+            docroot=entry.get('docroot') or '(unknown)',
+            paths=admin_block,
+            ts=ts,
+        )
+        self._reply(msg)
+
+    def _cmd_cmsrefresh(self, args):
+        """Handle /cmsrefresh — force a CMS registry rebuild."""
+        if self.cms_registry is None:
+            self._reply("CMS registry is not loaded.")
+            return
+        if not getattr(self.cms_registry, 'enabled', False):
+            self._reply(
+                "CMS registry is disabled in config.\n"
+                "Set [cms_detection] enabled = true to use this feature."
+            )
+            return
+
+        try:
+            self.cms_registry.refresh()
+        except Exception as e:
+            self._reply("CMS refresh failed: {e}".format(e=e))
+            return
+
+        sites = self.cms_registry.all()
+        tally = {}
+        for entry in sites.values():
+            tally[entry['cms']] = tally.get(entry['cms'], 0) + 1
+        tally_str = ', '.join('{c}={n}'.format(c=k, n=v)
+                              for k, v in sorted(tally.items(), key=lambda x: (-x[1], x[0])))
+        self._reply(
+            "<b>CMS registry refreshed</b>\n"
+            "{n} sites: {tally}".format(n=len(sites), tally=tally_str or '(none)')
+        )
+
+    def _cmd_logs(self, args):
+        """Handle /logs — show what's being tailed and inferred web-server type."""
+        if not self.tailers:
+            self._reply(
+                "No log tailers are running yet.\n"
+                "(Either the daemon is still starting, or set_tailers() was not called.)"
+            )
+            return
+
+        # Group tailers by name
+        web_logs = []
+        other_lines = []
+        for t in self.tailers:
+            files = list(getattr(t, 'log_files', []) or [])
+            name = getattr(t, 'name', 'tailer')
+            if name == 'web':
+                web_logs.extend(files)
+            else:
+                if files:
+                    other_lines.append('  {n}: <code>{f}</code>'.format(
+                        n=name, f=files[0]
+                    ))
+
+        # Infer web-server type from path patterns. We don't have a
+        # configured "web_server_type" field — this is a best-effort
+        # inference for the operator.
+        srv_type = self._infer_web_server(web_logs)
+
+        # Show first 5 web log paths to keep the reply short.
+        sample_max = 5
+        web_sample = ['  <code>{p}</code>'.format(p=p) for p in web_logs[:sample_max]]
+        if len(web_logs) > sample_max:
+            web_sample.append('  ... and {n} more'.format(n=len(web_logs) - sample_max))
+        if not web_sample:
+            web_sample = ['  (none configured)']
+
+        # Auto-discover state
+        auto = self.config.getboolean('log_analysis', 'auto_discover', fallback=False)
+        auto_str = 'enabled' if auto else 'disabled'
+        if auto:
+            auto_str += ' (' + self.config.get('log_analysis', 'discover_interval', fallback='24h') + ')'
+
+        # Logfiles list path
+        logfiles_path = self.config.get(
+            'general', 'logfiles_list',
+            fallback=self.base_dir + '/logfiles.txt'
+        )
+
+        msg = (
+            "<b>WP-Guardian Logs</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "<b>Web</b> ({n} files, server: {srv})\n"
+            "{web}\n"
+            "\n"
+            "<b>Other tailers</b>\n"
+            "{other}\n"
+            "\n"
+            "Logfiles list: <code>{lf}</code>\n"
+            "Auto-discover: {auto}"
+        ).format(
+            n=len(web_logs), srv=srv_type,
+            web='\n'.join(web_sample),
+            other='\n'.join(other_lines) if other_lines else '  (none)',
+            lf=logfiles_path,
+            auto=auto_str,
+        )
+        self._reply(msg)
+
+    def _cmd_serverinfo(self, args):
+        """Handle /serverinfo — version, schema, firewall, profile."""
+        try:
+            schema = self.db.get_schema_version()
+        except Exception:
+            schema = '?'
+
+        backend_name = type(self.firewall).__name__ if self.firewall else 'none (dry-run)'
+        profile = self.config.get('profile', 'mode', fallback='steady')
+        dry_run = self.config.getboolean('general', 'dry_run', fallback=False)
+        alert_mode = self.config.get('telegram', 'alert_mode', fallback='verbose')
+        commands_enabled = self.config.getboolean('telegram', 'commands_enabled', fallback=False)
+        cms_enabled = self.config.getboolean('cms_detection', 'enabled', fallback=True)
+        post_flood_on = bool(self.post_flood_detector and getattr(self.post_flood_detector, 'enabled', False))
+        ssh_root_thr = self.config.getint('thresholds', 'ssh_root_fail_threshold', fallback=0)
+
+        msg = (
+            "<b>WP-Guardian Server Info</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "Version: <b>{ver}</b>\n"
+            "Schema:  v{schema}\n"
+            "Firewall: {fw}\n"
+            "Profile: {prof}\n"
+            "Dry-run: {dry}\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "<b>v1.5 features</b>\n"
+            "CMS auto-detect: {cms}\n"
+            "POST-flood: {pf}\n"
+            "ssh_root threshold: {sshr}\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "<b>Telegram</b>\n"
+            "Commands: {cmds}\n"
+            "Alert mode: {am}"
+        ).format(
+            ver=self.version,
+            schema=schema,
+            fw=backend_name,
+            prof=profile,
+            dry='yes' if dry_run else 'no',
+            cms='enabled' if cms_enabled else 'disabled',
+            pf='enabled' if post_flood_on else 'disabled',
+            sshr=ssh_root_thr if ssh_root_thr > 0 else 'disabled',
+            cmds='enabled' if commands_enabled else 'disabled',
+            am=alert_mode,
+        )
+        self._reply(msg)
+
+    def _infer_web_server(self, web_logs):
+        """Best-effort web-server type inference from configured log paths."""
+        if not web_logs:
+            return 'unknown'
+        markers = {
+            'OpenLiteSpeed (CyberPanel)': ['/home/'],
+            'OpenLiteSpeed (server-wide)': ['/usr/local/lsws/'],
+            'Apache': ['/var/log/httpd/', '/var/log/apache2/'],
+            'nginx': ['/var/log/nginx/'],
+        }
+        for srv, prefixes in markers.items():
+            if any(any(p.startswith(pref) for pref in prefixes) for p in web_logs):
+                return srv
+        return 'unknown'
+
     def _cmd_help(self, args):
         """Handle /help command."""
         msg = (
@@ -873,6 +1185,13 @@ class TelegramCommander:
             "/verbosity &lt;rule&gt; &lt;level&gt; — set (immediate/digest/silent)\n"
             "/verbosity clear &lt;rule&gt; — remove one override\n"
             "/verbosity reset — wipe all overrides\n"
+            "\n"
+            "<b>Remote troubleshooting (v1.5+)</b>\n"
+            "/sites [cms] — list detected sites (filter by cms)\n"
+            "/site &lt;name&gt; — details for one site\n"
+            "/cmsrefresh — rebuild the CMS registry now\n"
+            "/logs — log files being tailed + web-server type\n"
+            "/serverinfo — version, firewall, feature flags\n"
             "\n"
             "/help — this message"
         )
