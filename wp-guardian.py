@@ -14,7 +14,6 @@ import subprocess
 import threading
 import re
 import glob as glob_module
-from collections import defaultdict
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -31,6 +30,14 @@ from modules.verbosity import VerbosityRouter
 from backends.factory import create_backend
 from actions.telegram import TelegramAlerter
 from actions.telegram_commands import TelegramCommander
+from detectors import (
+    WebDetector,
+    MailDetector,
+    SSHDetector,
+    RoundcubeDetector,
+    DistributedAuthDetector,
+    PostFloodDetector,
+)
 
 
 def get_version(base_dir=None):
@@ -86,657 +93,6 @@ def setup_logging(config, base_dir=None):
 
     return logger
 
-
-# ---------------------------------------------------------------------------
-# Hit Tracker — in-memory counters with time windows
-# ---------------------------------------------------------------------------
-class HitTracker:
-    """Tracks hit counts per IP within a sliding time window."""
-
-    def __init__(self, time_window=300):
-        self.time_window = time_window
-        self._hits = defaultdict(list)  # ip -> [timestamp, timestamp, ...]
-
-    def add(self, ip):
-        """Record a hit and return current count within window."""
-        now = time.time()
-        self._hits[ip].append(now)
-        # Prune old entries
-        cutoff = now - self.time_window
-        self._hits[ip] = [t for t in self._hits[ip] if t > cutoff]
-        return len(self._hits[ip])
-
-    def get_count(self, ip):
-        """Get current hit count within window."""
-        now = time.time()
-        cutoff = now - self.time_window
-        self._hits[ip] = [t for t in self._hits[ip] if t > cutoff]
-        return len(self._hits[ip])
-
-    def cleanup(self):
-        """Remove stale entries."""
-        now = time.time()
-        cutoff = now - self.time_window
-        stale = [ip for ip, hits in self._hits.items() if not hits or hits[-1] < cutoff]
-        for ip in stale:
-            del self._hits[ip]
-
-
-# ---------------------------------------------------------------------------
-# Web Log Parser
-# ---------------------------------------------------------------------------
-class WebDetector:
-    """Parses web access logs and detects attacks."""
-
-    def __init__(self, config, blocker, db, tripwires, whitelist=None):
-        self.blocker = blocker
-        self.db = db
-        self.tripwires = tripwires
-        self.whitelist = whitelist
-        self.time_window = config.getint('thresholds', 'time_window', fallback=300)
-
-        # Thresholds
-        self.wp_login_threshold = config.getint('thresholds', 'wp_login_threshold', fallback=10)
-        self.xmlrpc_threshold = config.getint('thresholds', 'xmlrpc_threshold', fallback=5)
-        self.author_enum_threshold = config.getint('thresholds', 'author_enum_threshold', fallback=8)
-        self.php_404_threshold = config.getint('thresholds', 'php_404_threshold', fallback=20)
-        self.general_404_threshold = config.getint('thresholds', 'general_404_threshold', fallback=50)
-
-        # Auth tracking
-        self.trust_duration = config.getint('auth_tracking', 'wp_trust_duration', fallback=24) * 3600
-
-        # Hit trackers (separate per rule type)
-        self.hits_login = HitTracker(self.time_window)
-        self.hits_xmlrpc = HitTracker(self.time_window)
-        self.hits_author = HitTracker(self.time_window)
-        self.hits_php404 = HitTracker(self.time_window)
-        self.hits_404 = HitTracker(self.time_window)
-
-        # Structural tripwires (always active, no file needed)
-        self.structural_patterns = [
-            re.compile(r'/wp-content/uploads/.*\.php', re.IGNORECASE),
-        ]
-
-        # Pattern tripwires — INSTANT block (known malicious, no legitimate use ever)
-        self.instant_patterns = [
-            (re.compile(r'/(alfa|c99|r57|wso|b374k|eval-stdin)\.php', re.IGNORECASE), 'Known webshell'),
-        ]
-
-        # Short PHP filenames that are legitimate (not suspicious)
-        self.legit_short_php = {
-            '/api.php', '/ajax.php', '/public.php',
-            '/cron.php', '/rss.php', '/feed.php',
-        }
-
-        # Paths that should NEVER be tripwires (legitimate WordPress/app paths)
-        self.safe_path_patterns = [
-            re.compile(r'^/wp-admin/'),           # All WordPress admin pages
-            re.compile(r'^/wp-includes/'),         # WordPress core includes
-            re.compile(r'^.*/wp-admin/'),          # Subdir WP admin (e.g., /blog/wp-admin/)
-        ]
-
-        # Pattern tripwires — THRESHOLD based (suspicious but could be a mistake)
-        self.suspicious_patterns = [
-            re.compile(r'^/[a-z0-9]{1,4}\.php$'),
-            re.compile(r'^/[a-z]{6,}\.php$'),
-            re.compile(r'/wp-content/themes/[^/]+/(db|admin|shell|config|cmd)\.php', re.IGNORECASE),
-            re.compile(r'^/(wp-good|wp-plain|xmrlpc)\.php$'),
-        ]
-
-        self.hits_suspicious = HitTracker(self.time_window)
-        self.suspicious_threshold = 3
-
-        # Login isolation detection
-        self.login_isolation_threshold = config.getint('thresholds', 'login_isolation_threshold', fallback=3)
-        self.login_isolation_window = config.getint('thresholds', 'login_isolation_window', fallback=120)
-
-    def process_line(self, line, site=''):
-        """Process a single access log line."""
-        # OLS wraps lines in quotes — strip them
-        if line.startswith('"'):
-            line = line[1:]
-        if line.endswith('"'):
-            line = line[:-1]
-
-        # Parse the line: IP - - [date] "METHOD /path HTTP/x.x" STATUS SIZE ...
-        ip_match = re.match(r'^(\d+\.\d+\.\d+\.\d+)', line)
-        if not ip_match:
-            return
-
-        ip = ip_match.group(1)
-
-        # Extract request
-        req_match = re.search(r'"(GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH) ([^ ]+) HTTP', line)
-        if not req_match:
-            return
-
-        method = req_match.group(1)
-        path = req_match.group(2)
-
-        # Extract status
-        status_match = re.search(r'" (\d{3}) ', line)
-        if not status_match:
-            return
-
-        status = status_match.group(1)
-
-        # Clean path — remove query string, lowercase
-        clean_path = re.sub(r'\?.*$', '', path).lower()
-
-        # ----- WHITELIST EARLY BYPASS -----
-        # Skip all detection for whitelisted IPs, but still record successful WP logins
-        if self.whitelist and self.whitelist.is_whitelisted(ip):
-            if method == 'POST' and 'wp-login.php' in clean_path and status == '302':
-                wp_user = 'wp@{s}'.format(s=site) if site else 'wp@unknown'
-                self.db.record_auth(ip, 'wordpress', wp_user, site=site, country='', city='')
-            return
-
-        # ----- LOGIN ISOLATION: track CSS loads (real browser signal) -----
-        if clean_path.endswith('.css'):
-            self.db.login_isolation_record_css(ip)
-
-        # ----- AUTHENTICATION TRACKING -----
-        if method == 'POST' and 'wp-login.php' in clean_path and status == '302':
-            wp_user = 'wp@{s}'.format(s=site) if site else 'wp@unknown'
-            self.db.record_auth(ip, 'wordpress', wp_user, site=site, country='', city='')
-            return
-
-        # ----- TRIPWIRE RULES (instant block for non-authenticated) -----
-
-        # Skip safe paths (wp-admin, wp-includes — always legitimate)
-        for pattern in self.safe_path_patterns:
-            if pattern.search(clean_path):
-                return
-
-        # Check structural tripwires first (e.g., PHP in uploads)
-        for pattern in self.structural_patterns:
-            if pattern.search(clean_path):
-                if self.db.is_ip_authenticated(ip, self.trust_duration):
-                    logging.getLogger('wp-guardian.web').warning(
-                        f"Authenticated IP {ip} hit structural tripwire: {clean_path}"
-                    )
-                    return
-                self.blocker.block(ip, f"PHP in uploads: {clean_path}", service='web', site=site, rule='structural')
-                return
-
-        # Check instant-block patterns (known webshells)
-        if clean_path.endswith('.php'):
-            for pattern, description in self.instant_patterns:
-                if pattern.search(clean_path):
-                    if self.db.is_ip_authenticated(ip, self.trust_duration):
-                        logging.getLogger('wp-guardian.web').warning(
-                            f"Authenticated IP {ip} hit instant pattern: {description} ({clean_path})"
-                        )
-                        return
-                    self.blocker.block(ip, f"{description}: {clean_path}", service='web', site=site, rule='instant')
-                    return
-
-        # Check suspicious patterns (threshold-based)
-        if clean_path.endswith('.php') and status in ('404', '401', '403'):
-            if clean_path not in self.legit_short_php:
-                for pattern in self.suspicious_patterns:
-                    if pattern.search(clean_path):
-                        count = self.hits_suspicious.add(ip)
-                        if count >= self.suspicious_threshold:
-                            self.blocker.block(ip, f"Suspicious PHP scanning ({count} pattern hits in {self.time_window}s)", service='web', site=site, rule='suspicious')
-                        return
-
-        # Check file-based tripwires (PHP only)
-        if clean_path.endswith('.php') and clean_path in self.tripwires:
-            if self.db.is_ip_authenticated(ip, self.trust_duration):
-                logging.getLogger('wp-guardian.web').warning(
-                    f"Authenticated IP {ip} hit tripwire: {clean_path}"
-                )
-                return
-            self.db.record_tripwire_hit(clean_path)
-            self.blocker.block(ip, f"Tripwire: {clean_path}", service='web', site=site, rule='tripwire')
-            return
-
-        # ----- LOGIN ISOLATION DETECTION -----
-        if 'wp-login.php' in clean_path:
-            if not self.db.is_ip_authenticated(ip, self.trust_duration):
-                login_hits, has_css = self.db.login_isolation_record_hit(ip)
-                if login_hits >= self.login_isolation_threshold and not has_css:
-                    self.blocker.block(
-                        ip,
-                        f"Login isolation: {login_hits} wp-login.php hits, zero CSS loads",
-                        service='web',
-                        site=site,
-                        rule='login_isolation'
-                    )
-                    return
-
-        # ----- THRESHOLD RULES -----
-
-        # wp-login.php brute force
-        if 'wp-login.php' in clean_path and method == 'POST' and status != '302':
-            count = self.hits_login.add(ip)
-            if count >= self.wp_login_threshold:
-                self.blocker.block(ip, f"wp-login brute force ({count} in {self.time_window}s)", service='web', site=site, rule='wp_login')
-            return
-
-        # xmlrpc.php
-        if 'xmlrpc.php' in clean_path:
-            count = self.hits_xmlrpc.add(ip)
-            if count >= self.xmlrpc_threshold:
-                self.blocker.block(ip, f"xmlrpc abuse ({count} in {self.time_window}s)", service='web', site=site, rule='xmlrpc')
-            return
-
-        # Author enumeration
-        if re.search(r'\?author=\d', path):
-            count = self.hits_author.add(ip)
-            if count >= self.author_enum_threshold:
-                self.blocker.block(ip, f"Author enumeration ({count} in {self.time_window}s)", service='web', site=site, rule='author_enum')
-            return
-
-        # PHP file 404s
-        if status in ('404', '401') and clean_path.endswith('.php'):
-            count = self.hits_php404.add(ip)
-            if count >= self.php_404_threshold:
-                self.blocker.block(ip, f"PHP scanning ({count} 404s in {self.time_window}s)", service='web', site=site, rule='php_scan')
-            return
-
-        # General 404 storm
-        if status in ('404', '403'):
-            count = self.hits_404.add(ip)
-            if count >= self.general_404_threshold:
-                self.blocker.block(ip, f"404 storm ({count} in {self.time_window}s)", service='web', site=site, rule='general_404')
-            return
-
-
-# ---------------------------------------------------------------------------
-# Mail Log Parser
-# ---------------------------------------------------------------------------
-class MailDetector:
-    """Parses /var/log/maillog for SMTP and IMAP/POP3 attacks."""
-
-    def __init__(self, config, blocker, db, whitelist=None,
-                 geoip=None, distributed_auth_detector=None):
-        self.blocker = blocker
-        self.db = db
-        self.whitelist = whitelist
-        self.geoip = geoip
-        self.distributed_auth_detector = distributed_auth_detector
-        self.time_window = config.getint('thresholds', 'time_window', fallback=300)
-
-        self.smtp_threshold = config.getint('thresholds', 'smtp_auth_fail_threshold', fallback=10)
-        self.imap_threshold = config.getint('thresholds', 'imap_auth_fail_threshold', fallback=10)
-        self.trust_duration = config.getint('auth_tracking', 'mail_trust_duration', fallback=24) * 3600
-
-        self.hits_smtp = HitTracker(self.time_window)
-        self.hits_imap = HitTracker(self.time_window)
-
-    def _geo(self, ip):
-        if self.geoip and getattr(self.geoip, 'enabled', False):
-            try:
-                return self.geoip.lookup(ip)
-            except Exception as e:
-                logging.getLogger('wp-guardian.mail').debug(
-                    "GeoIP lookup error for {ip}: {e}".format(ip=ip, e=e)
-                )
-        return None
-
-    def _on_auth(self, ip, service, username):
-        """Common post-auth hook: geo-enrich, record, notify compromise detector."""
-        geo = self._geo(ip)
-        self.db.record_auth(ip, service, username, geo=geo)
-        if self.distributed_auth_detector:
-            try:
-                self.distributed_auth_detector.on_successful_auth(
-                    username, ip, service, geo or {}
-                )
-            except Exception as e:
-                logging.getLogger('wp-guardian.mail').error(
-                    "DistributedAuthDetector error: {e}".format(e=e)
-                )
-
-    def process_line(self, line):
-        """Process a single maillog line."""
-
-        # SMTP failed auth
-        if 'authentication failed' in line.lower():
-            ip_match = re.search(r'unknown\[(\d+\.\d+\.\d+\.\d+)\]', line)
-            if not ip_match:
-                ip_match = re.search(r'\[(\d+\.\d+\.\d+\.\d+)\]', line)
-            if ip_match:
-                ip = ip_match.group(1)
-                if self.whitelist and self.whitelist.is_whitelisted(ip):
-                    return
-                # Username is best-effort on Postfix fail lines; most configs
-                # don't log it on failure. Left blank when unavailable.
-                user_match = re.search(r'sasl_username=(\S+)', line)
-                username = user_match.group(1) if user_match else ''
-                count = self.hits_smtp.add(ip)
-                if count >= self.smtp_threshold:
-                    if self.db.is_ip_authenticated(ip, self.trust_duration):
-                        logging.getLogger('wp-guardian.mail').warning(
-                            f"Authenticated IP {ip} hit SMTP fail threshold ({count} in {self.time_window}s) — not blocking (likely misconfigured mail client)"
-                        )
-                        self.blocker.alert_trusted_skip(ip, 'smtp', count, self.time_window, username)
-                        return
-                    self.blocker.block(ip, f"SMTP auth brute force ({count} in {self.time_window}s)",
-                                      service='smtp', username=username, rule='smtp_fail')
-            return
-
-        # SMTP successful auth — record for geo tracking.
-        # Gated on `sasl_method=` which Postfix only logs on real successes
-        # (the auth failed case above has already returned, but this is
-        # defence-in-depth so the two paths agree with the backfill tool).
-        if 'sasl_method=' in line:
-            ip_match = re.search(r'client=[^,\s]*\[(\d+\.\d+\.\d+\.\d+)\]', line)
-            user_match = re.search(r'sasl_username=(\S+)', line)
-            if ip_match and user_match:
-                ip = ip_match.group(1)
-                username = user_match.group(1)
-                self._on_auth(ip, 'smtp', username)
-            return
-
-        # Dovecot failed auth (IMAP/POP3)
-        if 'auth failed' in line:
-            ip_match = re.search(r'rip=(\d+\.\d+\.\d+\.\d+)', line)
-            if ip_match:
-                ip = ip_match.group(1)
-                if self.whitelist and self.whitelist.is_whitelisted(ip):
-                    return
-                # Dovecot reliably logs user=<...> on failed auth lines.
-                user_match = re.search(r'user=<([^>]+)>', line)
-                username = user_match.group(1) if user_match else ''
-                count = self.hits_imap.add(ip)
-                if count >= self.imap_threshold:
-                    service = 'imap' if 'imap-login' in line else 'pop3'
-                    if self.db.is_ip_authenticated(ip, self.trust_duration):
-                        logging.getLogger('wp-guardian.mail').warning(
-                            f"Authenticated IP {ip} hit {service.upper()} fail threshold ({count} in {self.time_window}s) — not blocking (likely misconfigured mail client)"
-                        )
-                        self.blocker.alert_trusted_skip(ip, service, count, self.time_window, username)
-                        return
-                    rule = 'imap_fail' if service == 'imap' else 'pop3_fail'
-                    self.blocker.block(ip, f"{service.upper()} auth brute force ({count} in {self.time_window}s)",
-                                      service=service, username=username, rule=rule)
-            return
-
-        # Dovecot successful auth — record for geo tracking
-        if 'Login: user=' in line:
-            ip_match = re.search(r'rip=(\d+\.\d+\.\d+\.\d+)', line)
-            user_match = re.search(r'user=<([^>]+)>', line)
-            if ip_match and user_match:
-                ip = ip_match.group(1)
-                username = user_match.group(1)
-                service = 'imap' if 'imap-login' in line else 'pop3'
-                self._on_auth(ip, service, username)
-            return
-
-
-# ---------------------------------------------------------------------------
-# SSH Log Parser
-# ---------------------------------------------------------------------------
-class SSHDetector:
-    """Parses /var/log/secure for SSH attacks."""
-
-    def __init__(self, config, blocker, db, whitelist=None,
-                 geoip=None, distributed_auth_detector=None):
-        self.blocker = blocker
-        self.db = db
-        self.whitelist = whitelist
-        self.geoip = geoip
-        self.distributed_auth_detector = distributed_auth_detector
-        self.time_window = config.getint('thresholds', 'time_window', fallback=300)
-
-        self.ssh_threshold = config.getint('thresholds', 'ssh_fail_threshold', fallback=3)
-        self.instant_block_invalid = config.getboolean(
-            'thresholds', 'ssh_invalid_user_instant_block', fallback=True
-        )
-
-        self.hits_ssh = HitTracker(self.time_window)
-
-    def _geo(self, ip):
-        if self.geoip and getattr(self.geoip, 'enabled', False):
-            try:
-                return self.geoip.lookup(ip)
-            except Exception:
-                return None
-        return None
-
-    def process_line(self, line):
-        """Process a single secure log line."""
-
-        # Invalid user — instant block
-        if 'Invalid user' in line or 'invalid user' in line:
-            ip_match = re.search(r'from (\d+\.\d+\.\d+\.\d+)', line)
-            if ip_match and self.instant_block_invalid:
-                ip = ip_match.group(1)
-                if self.whitelist and self.whitelist.is_whitelisted(ip):
-                    return
-                user_match = re.search(r'[Ii]nvalid user (\S+)', line)
-                username = user_match.group(1) if user_match else 'unknown'
-                self.blocker.block(ip, f"SSH invalid user: {username}", service='ssh',
-                                   username=username, rule='ssh_invalid')
-            return
-
-        # Failed password
-        if 'Failed password' in line:
-            ip_match = re.search(r'from (\d+\.\d+\.\d+\.\d+)', line)
-            if ip_match:
-                ip = ip_match.group(1)
-                if self.whitelist and self.whitelist.is_whitelisted(ip):
-                    return
-                count = self.hits_ssh.add(ip)
-                if count >= self.ssh_threshold:
-                    self.blocker.block(ip, f"SSH brute force ({count} in {self.time_window}s)",
-                                       service='ssh', rule='ssh_fail')
-            return
-
-        # Successful login — record for geo tracking
-        if 'Accepted password' in line or 'Accepted publickey' in line:
-            ip_match = re.search(r'from (\d+\.\d+\.\d+\.\d+)', line)
-            user_match = re.search(r'for (\S+) from', line)
-            if ip_match and user_match:
-                ip = ip_match.group(1)
-                username = user_match.group(1)
-                geo = self._geo(ip)
-                self.db.record_auth(ip, 'ssh', username, geo=geo)
-                if self.distributed_auth_detector:
-                    try:
-                        self.distributed_auth_detector.on_successful_auth(
-                            username, ip, 'ssh', geo or {}
-                        )
-                    except Exception as e:
-                        logging.getLogger('wp-guardian.ssh').error(
-                            "DistributedAuthDetector error: {e}".format(e=e)
-                        )
-            return
-
-
-# ---------------------------------------------------------------------------
-# Roundcube Error Log Parser (v1.4+)
-# ---------------------------------------------------------------------------
-class RoundcubeDetector:
-    """Parses Roundcube errors.log for failed webmail logins.
-
-    Log line example:
-        [14-Apr-2026 15:11:15 +0000]: <abc> IMAP Error: Login failed for
-        user@example.com against localhost from 198.51.100.21. ...
-    """
-
-    _FAIL_RE = re.compile(
-        r'IMAP Error:\s*Login failed for (?P<user>\S+) against \S+ from (?P<ip>\d+\.\d+\.\d+\.\d+)'
-    )
-
-    def __init__(self, config, blocker, db, whitelist=None):
-        self.blocker = blocker
-        self.db = db
-        self.whitelist = whitelist
-        self.time_window = config.getint('thresholds', 'time_window', fallback=300)
-        self.threshold = config.getint('thresholds', 'roundcube_fail_threshold', fallback=10)
-        self.trust_duration = config.getint('auth_tracking', 'mail_trust_duration', fallback=24) * 3600
-        self.hits = HitTracker(self.time_window)
-
-    def process_line(self, line):
-        m = self._FAIL_RE.search(line)
-        if not m:
-            return
-        ip = m.group('ip')
-        username = m.group('user')
-
-        if self.whitelist and self.whitelist.is_whitelisted(ip):
-            return
-
-        count = self.hits.add(ip)
-        if count >= self.threshold:
-            if self.db.is_ip_authenticated(ip, self.trust_duration):
-                logging.getLogger('wp-guardian.roundcube').warning(
-                    "Authenticated IP {ip} hit Roundcube fail threshold ({c} in {w}s, last user={u}) — not blocking".format(
-                        ip=ip, c=count, w=self.time_window, u=username
-                    )
-                )
-                self.blocker.alert_trusted_skip(ip, 'roundcube', count, self.time_window, username)
-                return
-            self.blocker.block(
-                ip,
-                "Roundcube auth brute force ({c} fails in {w}s, last user={u})".format(
-                    c=count, w=self.time_window, u=username
-                ),
-                service='roundcube',
-                username=username,
-                rule='roundcube',
-            )
-
-
-# ---------------------------------------------------------------------------
-# DistributedAuthDetector (v1.4+ — the headline detector)
-# ---------------------------------------------------------------------------
-class DistributedAuthDetector:
-    """Watches successful authentications across services and flags accounts
-    showing distributed-source patterns indicative of credential compromise.
-
-    Not a process_line detector — it's fed by a callback from MailDetector,
-    SSHDetector, and the backfill tool after every successful auth.
-    """
-
-    def __init__(self, config, db, compromise_action):
-        self.enabled = config.getboolean(
-            'compromise_detection', 'enabled', fallback=False
-        )
-        self.db = db
-        self.compromise_action = compromise_action
-        self.window_seconds = config.getint(
-            'compromise_detection', 'window_seconds', fallback=3600
-        )
-        self.threshold_countries = config.getint(
-            'compromise_detection', 'threshold_distinct_countries', fallback=3
-        )
-        self.threshold_asns = config.getint(
-            'compromise_detection', 'threshold_distinct_asns', fallback=5
-        )
-        self.threshold_ips = config.getint(
-            'compromise_detection', 'threshold_distinct_ips', fallback=20
-        )
-        self.suppression_seconds = config.getint(
-            'compromise_detection', 'suppression_seconds', fallback=1800
-        )
-
-        # Trusted ASNs — excluded from country / ASN counts but NOT IP count.
-        # Cloud mail providers (Microsoft 365, Google Workspace, iCloud) relay
-        # the same user through DCs in many countries; without this filter
-        # legitimate users repeatedly trip threshold_distinct_countries.
-        trusted_raw = config.get(
-            'compromise_detection', 'trusted_asns', fallback='8075, 15169, 714'
-        )
-        self.trusted_asns = set()
-        for token in trusted_raw.replace('\n', ',').split(','):
-            token = token.strip()
-            if not token or token.startswith('#'):
-                continue
-            try:
-                self.trusted_asns.add(int(token))
-            except ValueError:
-                logging.getLogger('wp-guardian.compromise-detector').warning(
-                    "Invalid trusted_asns entry '{t}' — must be an integer ASN".format(t=token)
-                )
-
-        # Exclude regex list (one pattern per line in config)
-        excl_raw = config.get('compromise_detection', 'exclude_usernames', fallback='')
-        self._exclude_regexes = []
-        for line in excl_raw.splitlines():
-            pattern = line.strip()
-            if pattern and not pattern.startswith('#'):
-                try:
-                    self._exclude_regexes.append(re.compile(pattern, re.IGNORECASE))
-                except re.error as e:
-                    logging.getLogger('wp-guardian.compromise-detector').warning(
-                        "Invalid exclude_usernames regex '{p}': {e}".format(p=pattern, e=e)
-                    )
-
-        self._suppressed = {}  # username -> epoch expiry
-        self._logger = logging.getLogger('wp-guardian.compromise-detector')
-
-    def on_successful_auth(self, username, ip, service, geo):
-        """Called after every successful auth. Must be fast."""
-        if not self.enabled:
-            return
-        if not username:
-            return
-        if self._is_excluded(username):
-            return
-        if self._is_suppressed(username):
-            return
-
-        # Need at least some geo data for the country/asn rules to be meaningful;
-        # the IP rule still works without.
-        try:
-            counts = self.db.distinct_auth_counts(
-                username, self.window_seconds,
-                trusted_asns=self.trusted_asns,
-            )
-        except Exception as e:
-            self._logger.error("distinct_auth_counts failed: {e}".format(e=e))
-            return
-
-        triggered = None
-        if counts['countries'] >= self.threshold_countries:
-            triggered = 'countries'
-        elif counts['asns'] >= self.threshold_asns:
-            triggered = 'asns'
-        elif counts['ips'] >= self.threshold_ips:
-            triggered = 'ips'
-
-        if not triggered:
-            return
-
-        self._mark_suppressed(username)
-        self._logger.warning(
-            "Compromise trigger: user={u} rule={r} counts={c}".format(
-                u=username, r=triggered, c=counts
-            )
-        )
-        try:
-            self.compromise_action.handle(
-                username=username,
-                service=service or 'unknown',
-                trigger_rule=triggered,
-                counts=counts,
-                window_seconds=self.window_seconds,
-            )
-        except Exception as e:
-            self._logger.error("CompromiseAction.handle failed: {e}".format(e=e))
-
-    def _is_excluded(self, username):
-        for rx in self._exclude_regexes:
-            if rx.search(username):
-                return True
-        return False
-
-    def _is_suppressed(self, username):
-        expires = self._suppressed.get(username)
-        if not expires:
-            return False
-        if time.time() > expires:
-            del self._suppressed[username]
-            return False
-        return True
-
-    def _mark_suppressed(self, username):
-        self._suppressed[username] = time.time() + self.suppression_seconds
 
 
 # ---------------------------------------------------------------------------
@@ -955,6 +311,33 @@ class Guardian:
         self.tripwires.update(db_tripwires.keys())
         self.logger.info(f"Loaded {len(self.tripwires)} tripwire paths")
 
+        # CMS site registry (v1.5)
+        from modules.cms_registry import CMSRegistry
+        logfiles_path = self.config.get(
+            'general', 'logfiles_list',
+            fallback=os.path.join(self.base_dir, 'logfiles.txt'),
+        )
+        self.cms_registry = CMSRegistry(self.config, self.db, logfiles_path)
+        if self.cms_registry.enabled:
+            self.cms_registry.refresh()
+            self.logger.info(f"CMS registry: {len(self.cms_registry.all())} sites")
+        else:
+            self.logger.info("CMS registry disabled")
+
+        # POST-flood detector (v1.5) — opt-in via config
+        self.post_flood_detector = PostFloodDetector(
+            self.config, self.blocker, self.db, self.whitelist,
+            cms_registry=self.cms_registry,
+        )
+        if self.post_flood_detector.enabled:
+            self.logger.info(
+                f"POST-flood detector active (threshold={self.post_flood_detector.threshold}/"
+                f"{self.post_flood_detector.window}s, behavioral_required="
+                f"{self.post_flood_detector.behavioral_required})"
+            )
+        else:
+            self.logger.info("POST-flood detector disabled")
+
         # Initialize Telegram command handler (after tripwires so we can pass the set)
         self.telegram_cmd = TelegramCommander(
             self.config, self.db, self.blocker, self.whitelist,
@@ -1045,7 +428,11 @@ class Guardian:
         # Start web log tailing
         web_logs = self._load_web_logs()
         if web_logs:
-            web_detector = WebDetector(self.config, self.blocker, self.db, self.tripwires, self.whitelist)
+            web_detector = WebDetector(
+                self.config, self.blocker, self.db, self.tripwires, self.whitelist,
+                post_flood_detector=self.post_flood_detector,
+                cms_registry=self.cms_registry,
+            )
             web_tailer = LogTailer(web_logs, web_detector, name='web', track_site=True)
             web_tailer.start()
             self.tailers.append(web_tailer)
@@ -1104,6 +491,7 @@ class Guardian:
         last_log_discovery = 0
         last_whitelist_check = 0
         last_friendly_refresh = 0
+        last_cms_refresh = time.time()  # already refreshed at startup
         cleanup_interval = 3600        # Hourly
         summary_interval = 86400       # Daily
         tracker_interval = 300         # Every 5 minutes
@@ -1169,6 +557,11 @@ class Guardian:
                 if auto_discover_enabled and now - last_log_discovery > discover_interval:
                     self._auto_discover_logs()
                     last_log_discovery = now
+
+                # CMS registry refresh (v1.5)
+                if self.cms_registry.enabled and (now - last_cms_refresh) > self.cms_registry.refresh_interval:
+                    self.cms_registry.refresh()
+                    last_cms_refresh = now
 
                 # Alert digest flush (v1.4+)
                 try:

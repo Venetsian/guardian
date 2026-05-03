@@ -53,6 +53,15 @@ imap_nonexistent_user_threshold = 3
 ssh_fail_threshold = 3
 ssh_invalid_user_instant_block = true
 
+# Root SSH attempts are higher signal than ordinary failed passwords —
+# a default-deny rule on the firewall side hides legitimate root usage.
+# Default: max(1, ssh_fail_threshold // 2). With ssh_fail_threshold = 3
+# this works out to 1 = instant block on first 'Failed password for root'.
+# Set to 0 to disable the dedicated root rule (root attempts then count
+# against the regular ssh_fail_threshold).
+# (v1.5+)
+ssh_root_fail_threshold = 1
+
 # Roundcube webmail failed-login threshold (v1.4+)
 roundcube_fail_threshold = 10
 
@@ -306,6 +315,62 @@ exclude_usernames =
 #   15169  = Google (Gmail / Workspace)
 #   714    = Apple (iCloud Mail)
 trusted_asns = 8075, 15169, 714
+
+# ---------------------------------------------------------------------------
+# v1.5 — CMS auto-detect & POST-flood
+# ---------------------------------------------------------------------------
+
+[cms_detection]
+# Build an in-memory map of {site -> CMS} at startup so per-CMS detectors
+# (and the POST-flood watchlist) know what's running on each vhost.
+#
+# Detection: walks logfiles_list, derives site names from /home/<site>/logs/
+# paths, and fingerprints each docroot (wp-config.php = WordPress, etc.).
+# Sites that can't be fingerprinted are recorded as 'unknown' and only get
+# the universal web rules — no harm done.
+enabled = true
+
+# How often to re-detect (seconds). Useful when new sites are provisioned.
+refresh_interval = 21600
+
+# Per-vhost overrides — INI file, optional. Format:
+#   [example.com]
+#   cms = joomla
+#   admin_paths = /sekret-admin/index.php, /administrator/index.php
+#   post_flood_threshold = 50
+# Operator only edits this when auto-detect is wrong or to declare a renamed
+# admin path. Empty / missing file = pure auto-detect.
+vhosts_overrides = /opt/wp-guardian/vhosts.conf
+
+[post_flood]
+# Generic POST-flood detector (v1.5). Watchlist-only — only paths registered
+# by a CMS module (or vhosts.conf) get watched, plus the universal_paths list
+# below. WordPress wp-login.php is NOT watched here because the dedicated
+# wp_login rule already covers it.
+#
+# Two-stage gate to minimize FPs on offices behind shared NAT:
+#   Stage 1: threshold POSTs to one URL from one IP within window
+#   Stage 2: at least one behavioral signal — no CSS loads, off-host Referer,
+#            or identical Content-Length across recent POSTs.
+#
+# Trusted IPs (recently authenticated on any service) bypass the detector.
+enabled = false
+
+# Stage 1 — rate gate
+threshold = 30
+window = 300
+
+# Stage 2 — behavioral confirmation
+# Set to false to disable behavioral checks (NOT recommended; will FP heavily
+# behind office NAT or on busy contact forms).
+behavioral_required = true
+behavioral_referer_pct = 80
+behavioral_content_length_pct = 80
+
+# Universal paths watched on every vhost regardless of CMS. Comma-separated;
+# extends the built-in defaults (/phpmyadmin/, /cpanel, /login, /signin,
+# /admin/login, /admin/index.php).
+universal_paths =
 
 [mail_backend]
 # Integration with the mail server's MariaDB, so CompromiseAction

@@ -434,6 +434,21 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
         fi
     fi
 
+    # --- POST-flood detector (v1.5+) ---
+    echo ""
+    echo -e "${BOLD}  POST-flood detector (v1.5+)${NC}"
+    echo "  Generic catch-all for admin/auth POST flooding. Watchlist-only —"
+    echo "  guards registered admin paths (Joomla /administrator, Drupal /user/login,"
+    echo "  /phpmyadmin/, etc.). Two-stage gate: rate threshold + behavioral check"
+    echo "  (no CSS / off-host Referer / uniform Content-Length) to stay safe behind"
+    echo "  office NAT. Off by default — enable on servers with non-WP CMSes."
+    POST_FLOOD_ENABLED="false"
+    if ask_yn "  Enable POST-flood detector?" "n"; then
+        POST_FLOOD_ENABLED="true"
+        echo "  POST-flood will start in digest mode (alerts batched hourly) so you"
+        echo "  can observe FPs before promoting to immediate via /verbosity."
+    fi
+
     # --- Mail backend (v1.4+) ---
     echo ""
     echo -e "${BOLD}  Mail Backend Integration (v1.4+)${NC}"
@@ -584,6 +599,11 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
     # v1.4 — Compromise detection
     if [[ "${COMPROMISE_ENABLED:-false}" == "true" ]]; then
         sed -i "/^\[compromise_detection\]/,/^\[/ s|^enabled = .*|enabled = true|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+    fi
+
+    # v1.5 — POST-flood detector
+    if [[ "${POST_FLOOD_ENABLED:-false}" == "true" ]]; then
+        sed -i "/^\[post_flood\]/,/^\[/ s|^enabled = .*|enabled = true|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
     fi
 
     # v1.4 — Mail backend
