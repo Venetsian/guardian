@@ -53,6 +53,49 @@ ask() {
     echo "${answer:-$default}"
 }
 
+ensure_pip3() {
+    # Make sure `pip3` is on PATH. On a minimal AlmaLinux/RHEL/CL install
+    # python3 is present but python3-pip is a separate package — detect
+    # and install via the system package manager. Returns 0 on success,
+    # 1 if we couldn't find or install pip3.
+    if command -v pip3 &>/dev/null; then
+        return 0
+    fi
+
+    print_step "pip3 not found — installing python3-pip via system package manager..."
+
+    local pkg_mgr=""
+    if command -v dnf &>/dev/null; then pkg_mgr="dnf"
+    elif command -v yum &>/dev/null; then pkg_mgr="yum"
+    elif command -v apt-get &>/dev/null; then pkg_mgr="apt-get"
+    elif command -v zypper &>/dev/null; then pkg_mgr="zypper"
+    fi
+
+    if [[ -z "$pkg_mgr" ]]; then
+        print_err "No supported package manager found (dnf/yum/apt-get/zypper)."
+        return 1
+    fi
+
+    case "$pkg_mgr" in
+        dnf|yum)
+            $pkg_mgr install -y python3-pip || return 1
+            ;;
+        apt-get)
+            apt-get update >/dev/null 2>&1 || true
+            apt-get install -y python3-pip || return 1
+            ;;
+        zypper)
+            zypper --non-interactive install python3-pip || return 1
+            ;;
+    esac
+
+    if command -v pip3 &>/dev/null; then
+        print_ok "python3-pip installed via ${pkg_mgr}"
+        return 0
+    fi
+    return 1
+}
+
 ask_yn() {
     # $1 = prompt, $2 = default (y or n)
     local prompt="$1"
@@ -93,13 +136,49 @@ if ! python3 -c "import sqlite3" 2>/dev/null; then
     exit 1
 fi
 
-# Check requests
-if ! python3 -c "import requests" 2>/dev/null; then
-    print_warn "Python 'requests' module not found (needed for Telegram)"
-    if ask_yn "  Install it now?"; then
-        pip3 install requests --break-system-packages 2>/dev/null || pip3 install requests || {
-            print_warn "Could not install 'requests'. Telegram alerts will not work."
-        }
+# Install Python dependencies from requirements.txt.
+#
+# We always install ALL listed deps (requests + geoip2 + PyMySQL), not just
+# `requests`, because operators often enable [geoip] or [mail_backend]
+# during this same install wizard or shortly after — and discovering the
+# Python module is missing on first daemon run produces silent feature
+# failures (DistributedAuthDetector country/ASN rules never fire if
+# geoip2 isn't installed; mailbox auto-disable can't fire without PyMySQL).
+if [[ -f "${SCRIPT_DIR}/requirements.txt" ]]; then
+    print_step "Installing Python dependencies from requirements.txt..."
+    if ensure_pip3; then
+        # Try with --break-system-packages first (needed on PEP 668-marked
+        # installs, e.g. EL10, modern Debian/Ubuntu); fall back without it
+        # for older pip versions that don't recognize the flag.
+        if pip3 install -r "${SCRIPT_DIR}/requirements.txt" --break-system-packages 2>&1 \
+                || pip3 install -r "${SCRIPT_DIR}/requirements.txt" 2>&1; then
+            print_ok "Python dependencies installed"
+        else
+            print_err "pip install failed. Some features will not work:"
+            print_err "  - Telegram alerts (requests)"
+            print_err "  - GeoIP enrichment / compromise detection (geoip2)"
+            print_err "  - Mailbox auto-disable (PyMySQL)"
+            print_warn "Install manually after install.sh completes:"
+            print_warn "  pip3 install -r ${SCRIPT_DIR}/requirements.txt --break-system-packages"
+        fi
+    else
+        print_err "pip3 unavailable and could not be installed automatically."
+        print_warn "Install python3-pip manually, then run:"
+        print_warn "  pip3 install -r ${SCRIPT_DIR}/requirements.txt --break-system-packages"
+    fi
+else
+    # No requirements.txt — fall back to the legacy requests-only check.
+    if ! python3 -c "import requests" 2>/dev/null; then
+        print_warn "Python 'requests' module not found (needed for Telegram)"
+        if ask_yn "  Install it now?"; then
+            if ensure_pip3; then
+                pip3 install requests --break-system-packages 2>/dev/null || pip3 install requests || {
+                    print_warn "Could not install 'requests'. Telegram alerts will not work."
+                }
+            else
+                print_warn "pip3 unavailable. Telegram alerts will not work."
+            fi
+        fi
     fi
 fi
 

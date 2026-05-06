@@ -62,6 +62,49 @@ ask_yn() {
     [[ "$answer" =~ ^[Yy] ]]
 }
 
+ensure_pip3() {
+    # Make sure `pip3` is on PATH. On a minimal AlmaLinux/RHEL/CL install
+    # python3 is present but python3-pip is a separate package — detect
+    # and install via the system package manager. Returns 0 on success,
+    # 1 if we couldn't find or install pip3.
+    if command -v pip3 &>/dev/null; then
+        return 0
+    fi
+
+    print_step "pip3 not found — installing python3-pip via system package manager..."
+
+    local pkg_mgr=""
+    if command -v dnf &>/dev/null; then pkg_mgr="dnf"
+    elif command -v yum &>/dev/null; then pkg_mgr="yum"
+    elif command -v apt-get &>/dev/null; then pkg_mgr="apt-get"
+    elif command -v zypper &>/dev/null; then pkg_mgr="zypper"
+    fi
+
+    if [[ -z "$pkg_mgr" ]]; then
+        print_err "No supported package manager found (dnf/yum/apt-get/zypper)."
+        return 1
+    fi
+
+    case "$pkg_mgr" in
+        dnf|yum)
+            $pkg_mgr install -y python3-pip || return 1
+            ;;
+        apt-get)
+            apt-get update >/dev/null 2>&1 || true
+            apt-get install -y python3-pip || return 1
+            ;;
+        zypper)
+            zypper --non-interactive install python3-pip || return 1
+            ;;
+    esac
+
+    if command -v pip3 &>/dev/null; then
+        print_ok "python3-pip installed via ${pkg_mgr}"
+        return 0
+    fi
+    return 1
+}
+
 get_version() {
     local dir="$1"
     if [[ -f "${dir}/VERSION" ]]; then
@@ -390,11 +433,12 @@ elif [[ "$DEP_CHECK" == MISSING:* ]]; then
 
     if [[ -f "$REQ_FILE" ]] && ask_yn "  Install missing dependencies now (pip3 install -r requirements.txt)?" "y"; then
         echo ""
-        print_step "Running: pip3 install -r ${REQ_FILE} --break-system-packages"
-        if pip3 install -r "${REQ_FILE}" --break-system-packages; then
-            echo ""
-            print_ok "Dependencies installed — re-checking..."
-            RECHECK=$(python3 -c "
+        if ensure_pip3; then
+            print_step "Running: pip3 install -r ${REQ_FILE} --break-system-packages"
+            if pip3 install -r "${REQ_FILE}" --break-system-packages; then
+                echo ""
+                print_ok "Dependencies installed — re-checking..."
+                RECHECK=$(python3 -c "
 import sys
 sys.path.insert(0, '${INSTALL_DIR}')
 from modules.config import load_config
@@ -412,11 +456,21 @@ if config.get('telegram', 'enabled', fallback='false').strip().lower() == 'true'
     except ImportError: still_missing.append('requests')
 print('|'.join(still_missing) if still_missing else 'OK')
 " 2>/dev/null)
-            if [[ "$RECHECK" == "OK" ]]; then
-                print_ok "All dependencies now satisfied"
-                echo ""
+                if [[ "$RECHECK" == "OK" ]]; then
+                    print_ok "All dependencies now satisfied"
+                    echo ""
+                else
+                    print_err "Still missing after install: ${RECHECK}"
+                    if ask_yn "  Continue update with FEATURES DISABLED anyway?" "n"; then
+                        print_warn "Proceeding with known-broken features."
+                        echo ""
+                    else
+                        print_err "Update aborted. Nothing has been changed."
+                        exit 1
+                    fi
+                fi
             else
-                print_err "Still missing after install: ${RECHECK}"
+                print_err "pip install failed — see output above."
                 if ask_yn "  Continue update with FEATURES DISABLED anyway?" "n"; then
                     print_warn "Proceeding with known-broken features."
                     echo ""
@@ -426,7 +480,11 @@ print('|'.join(still_missing) if still_missing else 'OK')
                 fi
             fi
         else
-            print_err "pip install failed — see output above."
+            print_err "Could not get pip3 onto PATH (system package manager couldn't install python3-pip)."
+            print_err "Install python3-pip manually, then re-run update.sh:"
+            print_err "  EL/CL/Fedora:  dnf install python3-pip"
+            print_err "  Debian/Ubuntu: apt-get install python3-pip"
+            echo ""
             if ask_yn "  Continue update with FEATURES DISABLED anyway?" "n"; then
                 print_warn "Proceeding with known-broken features."
                 echo ""
