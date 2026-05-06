@@ -22,11 +22,13 @@ from posture_checks.base import (
 from posture_checks.check_pwnkit import PwnKitCheck
 from posture_checks.check_hidepid import HidePidCheck
 from posture_checks.check_smart import SmartCheck
+from posture_checks.check_copy_fail import CopyFailCheck
 
 ALL_CHECKS = [
-    PwnKitCheck,
-    HidePidCheck,
-    SmartCheck,
+    CopyFailCheck,    # CVE-2026-31431 — high-priority current kernel CVE
+    PwnKitCheck,      # CVE-2021-4034 — long-known polkit priv-esc
+    HidePidCheck,     # /proc cross-tenant isolation
+    SmartCheck,       # drive health with growth detection
 ]
 
 __all__ = [

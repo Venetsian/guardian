@@ -59,6 +59,18 @@ whose severity meets `[posture] alert_severity_min`.
 
 ### Checks
 
+- `kernel_copy_fail` (CRITICAL) — Linux kernel patched against
+  CVE-2026-31431 ("Copy Fail") — local privilege escalation in the
+  algif_aead crypto userspace API. Patched-kernel baselines for CL/RHEL/
+  AlmaLinux/Rocky 9 + 10 and CL 8 (CL 7 not affected). Reads `uname -r`,
+  strips arch suffix, compares against vendor-published patched RPM
+  strings (e.g. `5.14.0-611.49.2.el9_7` for EL9). Also probes
+  `/proc/cmdline` for the GRUB mitigation
+  `initcall_blacklist=algif_aead_init` — if mitigation is active on a
+  vulnerable kernel, severity drops from CRITICAL to MEDIUM (operator
+  encouraged to patch before next reboot anyway). Detail string includes
+  exact remediation commands (`dnf upgrade kernel && reboot` or
+  `grubby --update-kernel=ALL --args="initcall_blacklist=algif_aead_init"`).
 - `pwnkit` (CRITICAL) — polkit/pkexec patched against CVE-2021-4034.
   Per-distro patched-version table for RHEL/AlmaLinux/Rocky/CloudLinux
   8 + 9 + 10 and Debian/Ubuntu 11/12 + 20.04/22.04/24.04. EL10 baseline

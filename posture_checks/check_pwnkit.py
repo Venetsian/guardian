@@ -28,6 +28,7 @@ import logging
 import os
 
 from posture_checks.base import Check, CheckResult, Severity, Status
+from posture_checks._utils import python_vercmp, distro_major
 
 logger = logging.getLogger('wp-guardian.posture.pwnkit')
 
@@ -66,13 +67,6 @@ _MIN_PATCHED = {
 }
 
 
-def _major(version_id):
-    """Extract the major version from VERSION_ID (e.g. '9.4' -> '9')."""
-    if not version_id:
-        return ''
-    return version_id.split('.', 1)[0].strip()
-
-
 def _query_rpm(pkg):
     """Return installed RPM version-release for `pkg`, or '' if missing."""
     import subprocess
@@ -105,50 +99,6 @@ def _query_dpkg(pkg):
         return ''
 
 
-def _python_vercmp(a, b):
-    """Pure-Python RPM-style version comparator.
-
-    Splits each string into runs of digits and runs of letters, dropping
-    separators (.-_+~ etc.), and compares pairwise. Numeric segments
-    compare numerically; alphabetic segments compare lexically; numeric
-    segments sort GREATER than alphabetic at the same position (RPM
-    convention — '1' > 'a').
-
-    Handles the version strings we actually care about:
-      125-4.el10        vs 121-1.el10        -> 1   (125 > 121)
-      0.117-13.el9_4    vs 0.117-13.el9      -> 1   (extra '4' segment)
-      0.115-13.el8_5.2  vs 0.115-13.el8_5.2  -> 0   (equal)
-      0.105-31+deb11u1  vs 0.105-31+deb11u1  -> 0
-    Does NOT handle epoch prefixes or RPM tilde/caret pre-release ordering;
-    we don't ship baselines that would surface those.
-    """
-    import re
-    if a == b:
-        return 0
-    sa = re.findall(r'\d+|[A-Za-z]+', a or '')
-    sb = re.findall(r'\d+|[A-Za-z]+', b or '')
-
-    for ea, eb in zip(sa, sb):
-        a_num = ea.isdigit()
-        b_num = eb.isdigit()
-        if a_num and b_num:
-            ia, ib = int(ea), int(eb)
-            if ia != ib:
-                return -1 if ia < ib else 1
-        elif a_num != b_num:
-            # Numeric segments sort greater than alphabetic at the same
-            # position (RPM convention).
-            return 1 if a_num else -1
-        else:
-            if ea != eb:
-                return -1 if ea < eb else 1
-
-    if len(sa) != len(sb):
-        # Whichever has more segments wins (e.g. el9_4 > el9).
-        return -1 if len(sa) < len(sb) else 1
-    return 0
-
-
 def _rpm_vercmp(a, b):
     """RPM-style version comparison. Returns -1/0/1.
 
@@ -174,7 +124,7 @@ def _rpm_vercmp(a, b):
                 return -1
         except (OSError, subprocess.TimeoutExpired):
             pass
-    return _python_vercmp(a, b)
+    return python_vercmp(a, b)
 
 
 def _dpkg_vercmp(a, b):
@@ -195,7 +145,7 @@ def _dpkg_vercmp(a, b):
             return 1
         return -1
     except (OSError, subprocess.TimeoutExpired):
-        return _python_vercmp(a, b)
+        return python_vercmp(a, b)
 
 
 class PwnKitCheck(Check):
@@ -213,7 +163,7 @@ class PwnKitCheck(Check):
         # `previous` is unused — this check is stateless (just compares
         # current installed polkit against the patched-version baseline).
         distro_id = (profile.get('distro_id') or '').lower()
-        major = _major(profile.get('distro_version'))
+        major = distro_major(profile.get('distro_version'))
         key = (distro_id, major)
 
         baseline = _MIN_PATCHED.get(key)
