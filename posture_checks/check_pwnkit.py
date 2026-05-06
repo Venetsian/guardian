@@ -209,7 +209,9 @@ class PwnKitCheck(Check):
         # helpful detail string rather than silently skipping.
         return bool(profile.get('is_linux', True))
 
-    def run(self, profile):
+    def run(self, profile, previous=None):
+        # `previous` is unused — this check is stateless (just compares
+        # current installed polkit against the patched-version baseline).
         distro_id = (profile.get('distro_id') or '').lower()
         major = _major(profile.get('distro_version'))
         key = (distro_id, major)

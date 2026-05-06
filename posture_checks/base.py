@@ -134,8 +134,20 @@ class Check(object):
         """
         return bool(profile.get('is_linux', True))
 
-    def run(self, profile):
+    def run(self, profile, previous=None):
         """Execute the check. Must return a `CheckResult`.
+
+        Args:
+            profile: host profile dict from HostProfileDetector.
+            previous: previously-stored state for this check, or None on
+                first run. When non-None it is a dict with keys:
+                  status       — last status string ('pass'/'fail'/'warn'/...)
+                  value        — parsed dict of the previous current_value JSON
+                  detail       — last detail string
+                  last_run_at  — UNIX timestamp of the previous run
+                Used by checks that need delta detection across runs
+                (e.g. SMART growth in reallocated sectors). Most checks
+                ignore it.
 
         Subclasses should catch their own expected errors and return
         `CheckResult.errored(...)` rather than raising — exceptions that

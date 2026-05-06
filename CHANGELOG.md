@@ -3,12 +3,12 @@
 ## v1.5.0 — Multi-CMS scaffolding & POST-flood detector (2026-05-03)
 
 > **Updated 2026-05-06 (task #122)**: posture-audit + host-health module
-> foundation added. Foundation + two reference checks (PwnKit, /proc
-> hidepid). Additional checks land incrementally in subsequent v1.5
-> updates: SUID drift, sshd config, listening ports, tenant home perms,
-> mod_hostinglimits / mod_lsapi UID switching, CageFS state, SMART, disk
-> usage, worker saturation, DB health, modsec volume, MTA queue, and
-> active /tmp cleanup with dry-run rollout.
+> foundation added. Foundation + three checks (PwnKit, /proc hidepid,
+> SMART drive health with growth detection). Additional checks land
+> incrementally in subsequent v1.5 updates: SUID drift, sshd config,
+> listening ports, tenant home perms, mod_hostinglimits / mod_lsapi UID
+> switching, CageFS state, disk usage, worker saturation, DB health,
+> modsec volume, MTA queue, and active /tmp cleanup with dry-run rollout.
 
 ### Posture audit + host-health module (added 2026-05-06)
 
@@ -50,21 +50,36 @@ whose severity meets `[posture] alert_severity_min`.
 
 - `posture_checks/base.py` — `Check` ABC plus `CheckResult`, `Severity`,
   `Status`, `Module` enums. `applies_to(profile) -> bool` and
-  `run(profile) -> CheckResult`. Checks may override severity per result
-  via `severity_override`.
+  `run(profile, previous=None) -> CheckResult`. Checks may override
+  severity per result via `severity_override`. The `previous` arg
+  carries the prior run's stored state to checks that need delta
+  detection across runs (SMART growth, etc.) — most checks ignore it.
 - `posture_checks/__init__.py` registers checks in `ALL_CHECKS` — adding
   a new check is a one-line registry edit.
 
-### Reference checks
+### Checks
 
 - `pwnkit` (CRITICAL) — polkit/pkexec patched against CVE-2021-4034.
   Per-distro patched-version table for RHEL/AlmaLinux/Rocky/CloudLinux
-  8 + 9 and Debian/Ubuntu 11/12 + 20.04/22.04/24.04. Falls back to
-  WARN+LOW on unrecognized distros so we never raise a false CRITICAL.
+  8 + 9 + 10 and Debian/Ubuntu 11/12 + 20.04/22.04/24.04. EL10 baseline
+  uses the post-rewrite single-integer polkit versioning (121+).
+  Pure-Python RPM/Debian-style version comparator (no rpmdevtools
+  dependency). Falls back to WARN+LOW on unrecognized distros so we
+  never raise a false CRITICAL.
 - `proc_hidepid` (MEDIUM, escalates HIGH on multi-tenant) — `/proc`
   mounted with `hidepid=invisible`. Reads `/proc/mounts` directly.
   Reports PASS-with-note on single-site hosts since there's nobody to
   hide from.
+- `smart` (host-health module) — per-drive SMART health with growth
+  detection. Discovers physical drives via `lsblk`, queries each via
+  `smartctl -a -j` (JSON), tracks reallocated/pending/uncorrectable/
+  command-timeout counters across runs and alerts on ANY new bad
+  sectors. Endurance ladder: ≥70% used → MEDIUM, ≥85% → HIGH, ≥95% →
+  CRITICAL. SMART-overall-FAILED → CRITICAL "replace immediately".
+  Skips on virtualized hosts (SMART through virtio is rarely meaningful)
+  and on hosts without smartmontools installed. Stored value omits
+  endurance % so daily creep doesn't generate transitions; severity
+  changes still do.
 
 ### Telegram
 

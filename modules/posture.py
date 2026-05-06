@@ -149,14 +149,31 @@ class PostureAuditor:
                 }
                 continue
 
+            # Pull the previous state (if any) and hand it to the check.
+            # Most checks ignore it — SMART and similar growth-tracking
+            # checks use it to compute deltas across runs.
+            previous_row = self.db.posture_state_get(
+                self.hostname, check.module, check.check_id
+            )
+            previous_arg = self._previous_to_dict(previous_row)
+
             try:
-                result = check.run(profile)
+                result = check.run(profile, previous=previous_arg)
+            except TypeError:
+                # Backward-compat: a check whose run() doesn't accept
+                # `previous=` (older signature) still works.
+                try:
+                    result = check.run(profile)
+                except Exception as e:
+                    logger.error("Check %s run() crashed: %s", check.check_id, e)
+                    from posture_checks.base import CheckResult
+                    result = CheckResult.errored(detail="check crashed: {e}".format(e=e))
             except Exception as e:
                 logger.error("Check %s run() crashed: %s", check.check_id, e)
                 from posture_checks.base import CheckResult
                 result = CheckResult.errored(detail="check crashed: {e}".format(e=e))
 
-            transitioned, severity = self._persist_and_diff(check, result)
+            transitioned, severity = self._persist_and_diff(check, result, previous_row=previous_row)
             results[check.check_id] = {
                 'status': result.status,
                 'severity': severity,
@@ -199,10 +216,40 @@ class PostureAuditor:
             changed=changed,
         )
 
-    def _persist_and_diff(self, check, result):
+    def _previous_to_dict(self, row):
+        """Translate a posture_state row into the dict shape `Check.run()`
+        expects via `previous=`. Returns None when there's no prior state.
+
+        Parses current_value JSON eagerly so checks can use the dict
+        directly without round-tripping JSON.
+        """
+        if not row:
+            return None
+        raw = row.get('current_value') or ''
+        try:
+            value = json.loads(raw) if raw else {}
+            if not isinstance(value, dict):
+                value = {'_raw': value}
+        except (ValueError, TypeError):
+            value = {'_raw': raw}
+        return {
+            'status': row.get('status'),
+            'value': value,
+            'detail': row.get('detail') or '',
+            'last_run_at': row.get('last_run_at'),
+        }
+
+    def _persist_and_diff(self, check, result, previous_row=None):
         """Write the new state, compare against previous, append an event
-        on transition. Returns (transitioned: bool, effective_severity: str)."""
-        previous = self.db.posture_state_get(self.hostname, check.module, check.check_id)
+        on transition. Returns (transitioned: bool, effective_severity: str).
+
+        `previous_row` is the row already fetched in run_now() (so we don't
+        re-query). If None, we re-fetch — keeps this callable from other
+        contexts where the caller hasn't pre-fetched.
+        """
+        previous = previous_row
+        if previous is None:
+            previous = self.db.posture_state_get(self.hostname, check.module, check.check_id)
         new_value_json = _serialize_value(result.value)
         severity = result.severity_override or check.severity
 

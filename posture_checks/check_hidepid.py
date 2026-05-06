@@ -64,7 +64,8 @@ class HidePidCheck(Check):
         # there's no other user to hide from.
         return bool(profile.get('is_linux', True))
 
-    def run(self, profile):
+    def run(self, profile, previous=None):
+        # `previous` is unused — this check reads current /proc state only.
         options = _read_proc_mount_options()
         if not options:
             return CheckResult.errored(

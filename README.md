@@ -12,7 +12,7 @@ WP-Guardian monitors web, SMTP, IMAP/POP3, and SSH logs, automatically blocks at
 - **POST-flood detector (v1.5+)** — generic catch-all for admin/auth POST flooding. Watchlist-only (registered admin paths + universal `/login`, `/signin`, `/phpmyadmin/`, etc.) plus a two-stage gate (rate threshold + behavioral confirmation: zero CSS / off-host Referer / uniform Content-Length) so it doesn't false-positive on offices behind shared NAT. Off by default, opt-in per server.
 - **SSH root brute-force rule (v1.5+)** — `ssh_root` rule fires on the first `Failed password for root` attempt by default. Port-agnostic (works on sshd port 22, 69, or anything else).
 - **Smart detection pipeline** — structural tripwires, known webshells, login isolation (CSS-based bot detection), brute force thresholds, PHP scanning detection, author enumeration, 404 storms
-- **Posture audit + host-health module (v1.5+)** — daily read-only scan for security and operational drift (PwnKit/polkit version, `/proc hidepid`, with more checks added incrementally — SUID drift, sshd config, listening ports, tenant home perms, mod_hostinglimits / mod_lsapi UID switching, CageFS state, SMART, disk usage, worker saturation, DB health, modsec volume, MTA queue). Each check declares its applicability against an auto-detected host profile so a free single-site VPS only runs the generic Linux checks while a multi-tenant CL+Apache box gets the full set. Telegram alerts fire on transitions whose severity meets `[posture] alert_severity_min` (default `high`).
+- **Posture audit + host-health module (v1.5+)** — daily read-only scan for security and operational drift (PwnKit/polkit version, `/proc hidepid`, **SMART drive health with growth detection** — alerts on new reallocated/pending/uncorrectable sectors and SSD endurance thresholds, telling you when to plan or expedite drive replacement). More checks added incrementally — SUID drift, sshd config, listening ports, tenant home perms, mod_hostinglimits / mod_lsapi UID switching, CageFS state, disk usage, worker saturation, DB health, modsec volume, MTA queue. Each check declares its applicability against an auto-detected host profile so a free single-site VPS only runs the generic Linux checks while a multi-tenant CL+Apache box gets the full set. Telegram alerts fire on transitions whose severity meets `[posture] alert_severity_min` (default `high`).
 - **Credential compromise detection (v1.4+)** — `DistributedAuthDetector` catches the classic distributed credential-abuse botnet pattern (same mailbox authenticating from many countries/ASNs/IPs in a short window), automatically blocks source IPs, and disables the mailbox in the mail backend
 - **GeoIP enrichment (v1.4+)** — every auth event and block is tagged with country, city, ASN, and ASN organization via MaxMind GeoLite2
 - **Three-tier escalation** — 24h block, 30d block, permanent ban with automatic tier advancement
@@ -187,6 +187,7 @@ On first run (and every `profile_refresh_seconds`, default daily) guardian probe
 | `db_server`, `mta` | `mariadb`/`mysql`/`none`, `postfix`/`none` |
 | `has_modsec` | mod_security config present |
 | `behind_perimeter_firewall` | Operator-declared (config-driven; affects severity of port-binding checks) |
+| `extras.is_virtualized` | `systemd-detect-virt` reports a hypervisor (kvm/qemu/vmware/xen/lxc); SMART check skips when true |
 
 Override `is_multi_tenant` and `behind_perimeter_firewall` in `[posture]` if auto-detect is wrong for your setup.
 
@@ -288,7 +289,8 @@ See [backends/README.md](backends/README.md) for creating custom backends.
 ├── posture_checks/         # v1.5+ — one posture/health check per file
 │   ├── base.py             # Check ABC, CheckResult, Severity/Status enums
 │   ├── check_pwnkit.py     # PwnKit / CVE-2021-4034 polkit version
-│   └── check_hidepid.py    # /proc hidepid=invisible
+│   ├── check_hidepid.py    # /proc hidepid=invisible
+│   └── check_smart.py      # SMART drive health + growth detection
 ├── backends/
 │   ├── base.py             # Firewall backend interface (ABC)
 │   ├── factory.py          # Backend registry + instantiation

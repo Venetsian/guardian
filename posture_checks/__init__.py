@@ -15,15 +15,18 @@ from posture_checks.base import (
     Module,
 )
 
-# Phase 1 reference checks. New checks land here as they're written —
-# the orchestrator iterates this list and applies each check's own
-# `applies_to(profile)` gate.
+# Registered checks. New checks land here as they're written — the
+# orchestrator iterates this list and applies each check's own
+# `applies_to(profile)` gate. Mix of posture (security) and health
+# (system) modules; each check declares which one it belongs to.
 from posture_checks.check_pwnkit import PwnKitCheck
 from posture_checks.check_hidepid import HidePidCheck
+from posture_checks.check_smart import SmartCheck
 
 ALL_CHECKS = [
     PwnKitCheck,
     HidePidCheck,
+    SmartCheck,
 ]
 
 __all__ = [

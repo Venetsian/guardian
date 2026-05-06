@@ -167,8 +167,11 @@ class HostProfileDetector:
         else:
             behind_perimeter = self._perimeter_override
 
+        virt = self._detect_virtualization()
         extras = {
             'kernel': self._detect_kernel(),
+            'is_virtualized': virt['is_virtualized'],
+            'virt_type': virt['type'],
         }
 
         return {
@@ -336,3 +339,20 @@ class HostProfileDetector:
     def _detect_kernel(self):
         rc, out = _safe_run(['uname', '-r'])
         return out.strip() if rc == 0 else ''
+
+    def _detect_virtualization(self):
+        """Return {'is_virtualized': bool, 'type': str}.
+
+        Uses systemd-detect-virt which ships with systemd on every modern
+        Linux. Returns 'none' on bare metal, otherwise the virt type
+        ('kvm', 'qemu', 'vmware', 'xen', 'lxc', 'docker', etc.). Used by
+        host-health checks (notably SMART) to decide whether they apply —
+        SMART through virtio is rarely meaningful.
+        """
+        rc, out = _safe_run(['systemd-detect-virt'])
+        # systemd-detect-virt exits 0 when virtualization detected, 1 when
+        # bare metal — we ignore the rc because both produce useful stdout.
+        virt_type = (out or '').strip().lower()
+        if not virt_type or virt_type == 'none':
+            return {'is_virtualized': False, 'type': 'none'}
+        return {'is_virtualized': True, 'type': virt_type}
