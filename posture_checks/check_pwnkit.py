@@ -39,7 +39,16 @@ logger = logging.getLogger('wp-guardian.posture.pwnkit')
 # version string we'll string-compare against (rpmdev-vercmp / dpkg
 # --compare-versions when available; coarse string compare otherwise).
 _MIN_PATCHED = {
-    # RHEL family — polkit
+    # RHEL 10 family. Upstream polkit was rewritten and switched from 0.x
+    # versioning to a single integer (121, 122, ...); EL10 ships polkit-125
+    # (verified on AlmaLinux 10.1: polkit-125-4.el10). The rewrite is
+    # post-PwnKit by construction, so any 3-digit version >= 121 is patched.
+    # Floor at 121-1.el10 so all real EL10 builds pass.
+    ('rhel', '10'):        ('polkit', '121-1.el10'),
+    ('almalinux', '10'):   ('polkit', '121-1.el10'),
+    ('rocky', '10'):       ('polkit', '121-1.el10'),
+    ('cloudlinux', '10'):  ('polkit', '121-1.el10'),
+    # RHEL family — polkit (0.x version line, EL8/EL9)
     ('rhel', '9'):         ('polkit', '0.117-13.el9'),
     ('almalinux', '9'):    ('polkit', '0.117-13.el9'),
     ('rocky', '9'):        ('polkit', '0.117-13.el9'),
