@@ -204,22 +204,15 @@ if [[ "${1:-}" == "--rollback" ]]; then
     cp "${LATEST}/wp-guardian.py" "${INSTALL_DIR}/" 2>/dev/null || true
     cp "${LATEST}/VERSION" "${INSTALL_DIR}/" 2>/dev/null || true
 
-    # Restore modules
-    if [[ -d "${LATEST}/modules" ]]; then
-        cp "${LATEST}/modules/"*.py "${INSTALL_DIR}/modules/"
-    fi
+    # Restore Python packages — modules, actions, backends, detectors, posture_checks
+    for dir in modules actions backends detectors posture_checks; do
+        if [[ -d "${LATEST}/${dir}" ]]; then
+            mkdir -p "${INSTALL_DIR}/${dir}"
+            cp "${LATEST}/${dir}/"*.py "${INSTALL_DIR}/${dir}/" 2>/dev/null || true
+        fi
+    done
 
-    # Restore actions
-    if [[ -d "${LATEST}/actions" ]]; then
-        cp "${LATEST}/actions/"*.py "${INSTALL_DIR}/actions/"
-    fi
-
-    # Restore backends
-    if [[ -d "${LATEST}/backends" ]]; then
-        cp "${LATEST}/backends/"*.py "${INSTALL_DIR}/backends/"
-    fi
-
-    # Restore tools
+    # Restore tools (mixed .py + .sh)
     if [[ -d "${LATEST}/tools" ]]; then
         cp "${LATEST}/tools/"* "${INSTALL_DIR}/tools/" 2>/dev/null || true
     fi
@@ -473,7 +466,7 @@ mkdir -p "${BACKUP_DIR}"
 cp "${INSTALL_DIR}/wp-guardian.py" "${BACKUP_DIR}/" 2>/dev/null || true
 cp "${INSTALL_DIR}/VERSION" "${BACKUP_DIR}/" 2>/dev/null || true
 
-for dir in modules actions backends tools migrations; do
+for dir in modules actions backends detectors posture_checks tools migrations; do
     if [[ -d "${INSTALL_DIR}/${dir}" ]]; then
         mkdir -p "${BACKUP_DIR}/${dir}"
         cp -r "${INSTALL_DIR}/${dir}/"* "${BACKUP_DIR}/${dir}/" 2>/dev/null || true
@@ -521,8 +514,8 @@ else
     # VERSION file
     cp "${SOURCE_DIR}/VERSION" "${INSTALL_DIR}/" 2>/dev/null || true
 
-    # Modules
-    for dir in modules actions backends tools; do
+    # Modules + sibling Python packages (detectors/, posture_checks/)
+    for dir in modules actions backends detectors posture_checks tools; do
         if [[ -d "${SOURCE_DIR}/${dir}" ]]; then
             mkdir -p "${INSTALL_DIR}/${dir}"
             cp "${SOURCE_DIR}/${dir}/"*.py "${INSTALL_DIR}/${dir}/" 2>/dev/null || true

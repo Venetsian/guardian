@@ -2,6 +2,97 @@
 
 ## v1.5.0 — Multi-CMS scaffolding & POST-flood detector (2026-05-03)
 
+> **Updated 2026-05-06 (task #122)**: posture-audit + host-health module
+> foundation added. Foundation + two reference checks (PwnKit, /proc
+> hidepid). Additional checks land incrementally in subsequent v1.5
+> updates: SUID drift, sshd config, listening ports, tenant home perms,
+> mod_hostinglimits / mod_lsapi UID switching, CageFS state, SMART, disk
+> usage, worker saturation, DB health, modsec volume, MTA queue, and
+> active /tmp cleanup with dry-run rollout.
+
+### Posture audit + host-health module (added 2026-05-06)
+
+Extensible subsystem for daily security-drift and host-health checks.
+Each check declares its applicability against an auto-detected host
+profile, so a free single-site VPS only runs the generic Linux checks
+while a multi-tenant CL+Apache box gets the full set. Checks share a
+two-table schema (`posture_state` upserted on every run, `posture_events`
+append-only with a 30-day TTL) and Telegram alerts fire on transitions
+whose severity meets `[posture] alert_severity_min`.
+
+### Schema (migration 008)
+
+- `host_profile` — single-row-per-host facts driving check applicability
+  (is_cloudlinux, web_server, db_server, mta, has_modsec,
+  is_multi_tenant, behind_perimeter_firewall, distro_id/version, plus
+  free-form `extras_json` for future fields).
+- `posture_state` — `(host, module, check_id)` PK, upserted every run
+  with `status`, `severity`, `current_value` JSON, `detail`, `last_run_at`,
+  `last_change_at`.
+- `posture_events` — append-only transitions log with
+  `from_status/to_status`, `from_value/to_value`, `severity`, `alerted`,
+  pruned daily after `events_retention_days` (default 30).
+
+### New modules
+
+- `modules/host_profile.py` — `HostProfileDetector` probes the host
+  defensively (every probe wrapped, falls back to safe defaults). Caches
+  to `host_profile`; refreshes after `profile_refresh_seconds` (default
+  daily). Allows config overrides for `behind_perimeter_firewall` and
+  `is_multi_tenant`.
+- `modules/posture.py` — `PostureAuditor` orchestrator: load profile,
+  iterate registered checks, persist state, diff for transitions, append
+  to `posture_events`, fire Telegram alerts above the severity floor.
+  First-run grace dampens alerts to CRITICAL only on bootstrap so a
+  fresh install doesn't flood chat.
+
+### Check API
+
+- `posture_checks/base.py` — `Check` ABC plus `CheckResult`, `Severity`,
+  `Status`, `Module` enums. `applies_to(profile) -> bool` and
+  `run(profile) -> CheckResult`. Checks may override severity per result
+  via `severity_override`.
+- `posture_checks/__init__.py` registers checks in `ALL_CHECKS` — adding
+  a new check is a one-line registry edit.
+
+### Reference checks
+
+- `pwnkit` (CRITICAL) — polkit/pkexec patched against CVE-2021-4034.
+  Per-distro patched-version table for RHEL/AlmaLinux/Rocky/CloudLinux
+  8 + 9 and Debian/Ubuntu 11/12 + 20.04/22.04/24.04. Falls back to
+  WARN+LOW on unrecognized distros so we never raise a false CRITICAL.
+- `proc_hidepid` (MEDIUM, escalates HIGH on multi-tenant) — `/proc`
+  mounted with `hidepid=invisible`. Reads `/proc/mounts` directly.
+  Reports PASS-with-note on single-site hosts since there's nobody to
+  hide from.
+
+### Telegram
+
+- `actions/telegram.py` gains `alert_posture_drift(check_id, module,
+  severity, host, status, detail, description)` — formatted message
+  with severity emoji and module label, mapped to send-priority.
+
+### Daemon + CLI
+
+- `Guardian.__init__` constructs `HostProfileDetector` + `PostureAuditor`
+  after the digest buffer. The daemon's main loop calls
+  `posture_auditor.run_if_due()` every tick; the orchestrator no-ops
+  unless `interval_seconds` has elapsed since the last run.
+- New CLI flags:
+  - `--posture-profile [--refresh]` — print the detected host profile
+  - `--posture-run [--refresh]` — run all checks now and print results
+  - `--posture-status` — show current state of every check
+  - `--posture-events` — show recent transitions with timestamps
+
+### Config
+
+- New `[posture]` section in `wp-guardian.conf.example` with
+  `enabled`, `interval_seconds`, `alert_severity_min`,
+  `events_retention_days`, `profile_refresh_seconds`, plus optional
+  overrides for `behind_perimeter_firewall` and `is_multi_tenant`.
+
+### Original v1.5.0 release notes (2026-05-03)
+
 This is an **extensibility release**. Every detector class moved out of
 the 2200-line `wp-guardian.py` into a `detectors/` package, the access-log
 parser is now format-aware (OpenLiteSpeed, Apache combined, nginx), and a

@@ -198,6 +198,59 @@ class TelegramAlerter:
         )
         self.send(msg, priority='CRITICAL')
 
+    def alert_posture_drift(self, check_id, module, severity, host,
+                            status, detail, description=''):
+        """Alert about a posture or host-health check transition.
+
+        Severity controls the sender priority — CRITICAL/HIGH go through
+        immediately, lower severities are queued via the digest path
+        (the orchestrator filters those out before calling, but we still
+        respect the severity-based priority here for any future caller).
+        """
+        emoji = {
+            'critical': '🔴',
+            'high': '🟠',
+            'medium': '🟡',
+            'low': '🔵',
+            'info': '⚪',
+        }.get(severity, '⚪')
+
+        status_label = {
+            'pass': 'now PASSING',
+            'fail': 'FAILED',
+            'warn': 'WARNING',
+            'error': 'ERRORED',
+            'skipped': 'skipped',
+            'unknown': 'unknown',
+        }.get(status, status)
+
+        module_label = 'Posture' if module == 'posture' else 'Host-health'
+
+        desc_line = "\n<i>{d}</i>".format(d=description) if description else ''
+
+        msg = (
+            "{e} <b>WP-Guardian — {ml} drift</b>\n"
+            "Host: <code>{h}</code>\n"
+            "Check: <code>{c}</code>\n"
+            "Severity: {s}\n"
+            "Status: {st}{desc}\n"
+            "\n"
+            "{d}"
+        ).format(
+            e=emoji, ml=module_label, h=host, c=check_id,
+            s=severity.upper(), st=status_label, desc=desc_line,
+            d=detail or '(no detail)',
+        )
+
+        priority_map = {
+            'critical': 'CRITICAL',
+            'high': 'HIGH',
+            'medium': 'MEDIUM',
+            'low': 'INFO',
+            'info': 'INFO',
+        }
+        self.send(msg, priority=priority_map.get(severity, 'MEDIUM'))
+
     def alert_daily_summary(self, stats):
         """Send daily summary."""
         msg = (

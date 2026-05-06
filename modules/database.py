@@ -1154,6 +1154,238 @@ class GuardianDB:
         )
         return cursor.fetchone()[0]
 
+    # ------------------------------------------------------------------
+    # Posture audit + host-health (task #122)
+    # ------------------------------------------------------------------
+    # Three tables back the new modules:
+    #   host_profile    — flags driving check applicability (one row/host)
+    #   posture_state   — current value of every (host, module, check_id)
+    #   posture_events  — append-only transitions log, 30-day TTL
+    #
+    # All writes commit immediately to keep a crash-safe audit trail.
+
+    def host_profile_get(self, host):
+        """Return the stored profile dict for `host`, or None if not detected yet."""
+        cursor = self.conn.execute(
+            "SELECT host, is_linux, is_cloudlinux, is_multi_tenant, is_single_site, "
+            "       web_server, db_server, mta, has_modsec, behind_perimeter_firewall, "
+            "       distro_id, distro_version, extras_json, detected_at, detection_method "
+            "FROM host_profile WHERE host = ?",
+            (host,)
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        try:
+            extras = json.loads(row['extras_json'] or '{}')
+        except (ValueError, TypeError):
+            extras = {}
+        return {
+            'host': row['host'],
+            'is_linux': bool(row['is_linux']),
+            'is_cloudlinux': bool(row['is_cloudlinux']),
+            'is_multi_tenant': bool(row['is_multi_tenant']),
+            'is_single_site': bool(row['is_single_site']),
+            'web_server': row['web_server'],
+            'db_server': row['db_server'],
+            'mta': row['mta'],
+            'has_modsec': bool(row['has_modsec']),
+            'behind_perimeter_firewall': bool(row['behind_perimeter_firewall']),
+            'distro_id': row['distro_id'] or '',
+            'distro_version': row['distro_version'] or '',
+            'extras': extras,
+            'detected_at': row['detected_at'],
+            'detection_method': row['detection_method'],
+        }
+
+    def host_profile_upsert(self, host, profile, detection_method='auto'):
+        """Insert or replace the host's profile row.
+
+        `profile` is a dict with the bool/str fields from host_profile_get
+        (extras key optional). detected_at is set automatically.
+        """
+        now = int(time.time())
+        extras = profile.get('extras') or {}
+        try:
+            extras_json = json.dumps(extras)
+        except (TypeError, ValueError):
+            extras_json = '{}'
+
+        self.conn.execute("""
+            INSERT OR REPLACE INTO host_profile
+                (host, is_linux, is_cloudlinux, is_multi_tenant, is_single_site,
+                 web_server, db_server, mta, has_modsec, behind_perimeter_firewall,
+                 distro_id, distro_version, extras_json, detected_at, detection_method)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            host,
+            1 if profile.get('is_linux', True) else 0,
+            1 if profile.get('is_cloudlinux') else 0,
+            1 if profile.get('is_multi_tenant') else 0,
+            1 if profile.get('is_single_site') else 0,
+            profile.get('web_server') or 'none',
+            profile.get('db_server') or 'none',
+            profile.get('mta') or 'none',
+            1 if profile.get('has_modsec') else 0,
+            1 if profile.get('behind_perimeter_firewall') else 0,
+            profile.get('distro_id') or '',
+            profile.get('distro_version') or '',
+            extras_json,
+            now,
+            detection_method,
+        ))
+        self.conn.commit()
+
+    def posture_state_get(self, host, module, check_id):
+        """Return the latest stored state for one check, or None."""
+        cursor = self.conn.execute(
+            "SELECT host, module, check_id, status, severity, current_value, "
+            "       detail, last_run_at, last_change_at "
+            "FROM posture_state WHERE host = ? AND module = ? AND check_id = ?",
+            (host, module, check_id)
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            'host': row['host'],
+            'module': row['module'],
+            'check_id': row['check_id'],
+            'status': row['status'],
+            'severity': row['severity'],
+            'current_value': row['current_value'] or '',
+            'detail': row['detail'] or '',
+            'last_run_at': row['last_run_at'],
+            'last_change_at': row['last_change_at'],
+        }
+
+    def posture_state_upsert(self, host, module, check_id, status, severity,
+                             current_value='', detail='', changed=False):
+        """Upsert a posture_state row. `changed` should be True when the
+        caller has detected a transition vs. the previous value/status — that
+        bumps last_change_at; otherwise the previous last_change_at is kept
+        and only last_run_at moves forward."""
+        now = int(time.time())
+        if changed:
+            last_change = now
+        else:
+            existing = self.conn.execute(
+                "SELECT last_change_at FROM posture_state "
+                "WHERE host = ? AND module = ? AND check_id = ?",
+                (host, module, check_id)
+            ).fetchone()
+            last_change = existing['last_change_at'] if existing else 0
+        self.conn.execute("""
+            INSERT OR REPLACE INTO posture_state
+                (host, module, check_id, status, severity, current_value,
+                 detail, last_run_at, last_change_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (host, module, check_id, status, severity, current_value or '',
+              detail or '', now, last_change))
+        self.conn.commit()
+
+    def posture_state_all(self, host=None, module=None):
+        """Return all posture_state rows, optionally filtered by host/module."""
+        sql = ("SELECT host, module, check_id, status, severity, current_value, "
+               "       detail, last_run_at, last_change_at FROM posture_state ")
+        clauses = []
+        params = []
+        if host:
+            clauses.append("host = ?")
+            params.append(host)
+        if module:
+            clauses.append("module = ?")
+            params.append(module)
+        if clauses:
+            sql += "WHERE " + " AND ".join(clauses) + " "
+        sql += "ORDER BY module, check_id"
+        rows = self.conn.execute(sql, tuple(params)).fetchall()
+        return [{
+            'host': r['host'],
+            'module': r['module'],
+            'check_id': r['check_id'],
+            'status': r['status'],
+            'severity': r['severity'],
+            'current_value': r['current_value'] or '',
+            'detail': r['detail'] or '',
+            'last_run_at': r['last_run_at'],
+            'last_change_at': r['last_change_at'],
+        } for r in rows]
+
+    def posture_event_insert(self, host, module, check_id, from_status, to_status,
+                             from_value='', to_value='', severity='low', detail=''):
+        """Append a transition row to posture_events. Returns the new id."""
+        now = int(time.time())
+        cursor = self.conn.execute("""
+            INSERT INTO posture_events
+                (host, module, check_id, occurred_at, from_status, to_status,
+                 from_value, to_value, severity, detail, alerted)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+        """, (host, module, check_id, now, from_status or '', to_status,
+              from_value or '', to_value or '', severity, detail or ''))
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def posture_event_mark_alerted(self, event_id):
+        """Mark a posture event as having been alerted on, to avoid duplicates."""
+        self.conn.execute(
+            "UPDATE posture_events SET alerted = 1 WHERE id = ?", (event_id,)
+        )
+        self.conn.commit()
+
+    def posture_events_recent(self, host=None, module=None, severity_min=None,
+                              since_ts=None, limit=100):
+        """Return recent posture events, newest first.
+
+        severity_min: optional set of severities to include (e.g. {'high','critical'}).
+        """
+        sql = ("SELECT id, host, module, check_id, occurred_at, from_status, to_status, "
+               "       from_value, to_value, severity, detail, alerted "
+               "FROM posture_events ")
+        clauses = []
+        params = []
+        if host:
+            clauses.append("host = ?")
+            params.append(host)
+        if module:
+            clauses.append("module = ?")
+            params.append(module)
+        if since_ts:
+            clauses.append("occurred_at >= ?")
+            params.append(int(since_ts))
+        if severity_min:
+            placeholders = ','.join(['?'] * len(severity_min))
+            clauses.append("severity IN ({p})".format(p=placeholders))
+            params.extend(list(severity_min))
+        if clauses:
+            sql += "WHERE " + " AND ".join(clauses) + " "
+        sql += "ORDER BY occurred_at DESC LIMIT ?"
+        params.append(int(limit))
+        rows = self.conn.execute(sql, tuple(params)).fetchall()
+        return [{
+            'id': r['id'],
+            'host': r['host'],
+            'module': r['module'],
+            'check_id': r['check_id'],
+            'occurred_at': r['occurred_at'],
+            'from_status': r['from_status'] or '',
+            'to_status': r['to_status'],
+            'from_value': r['from_value'] or '',
+            'to_value': r['to_value'] or '',
+            'severity': r['severity'],
+            'detail': r['detail'] or '',
+            'alerted': bool(r['alerted']),
+        } for r in rows]
+
+    def posture_events_cleanup(self, retention_days=30):
+        """Delete posture_events older than retention_days. Returns row count."""
+        cutoff = int(time.time()) - int(retention_days) * 86400
+        result = self.conn.execute(
+            "DELETE FROM posture_events WHERE occurred_at < ?", (cutoff,)
+        )
+        self.conn.commit()
+        return result.rowcount
+
     def close(self):
         """Close the database connection."""
         self.conn.close()

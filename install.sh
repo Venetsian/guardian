@@ -109,7 +109,7 @@ echo ""
 # Create directory structure
 # ===========================================================================
 print_step "Creating directories..."
-mkdir -p "${INSTALL_DIR}"/{modules,actions,backends,state,logs,tools,state/geoip}
+mkdir -p "${INSTALL_DIR}"/{modules,actions,backends,detectors,posture_checks,state,logs,tools,state/geoip}
 
 # ===========================================================================
 # Copy files (skip if running from the install directory, e.g. git clone)
@@ -121,9 +121,12 @@ if [[ "$SCRIPT_DIR" == "$INSTALL_DIR" ]]; then
 else
     print_step "Installing files..."
     cp "${SCRIPT_DIR}/wp-guardian.py" "${INSTALL_DIR}/"
-    cp "${SCRIPT_DIR}/modules/"*.py "${INSTALL_DIR}/modules/"
-    cp "${SCRIPT_DIR}/actions/"*.py "${INSTALL_DIR}/actions/"
-    cp "${SCRIPT_DIR}/backends/"*.py "${INSTALL_DIR}/backends/"
+    for dir in modules actions backends detectors posture_checks; do
+        if [[ -d "${SCRIPT_DIR}/${dir}" ]]; then
+            mkdir -p "${INSTALL_DIR}/${dir}"
+            cp "${SCRIPT_DIR}/${dir}/"*.py "${INSTALL_DIR}/${dir}/" 2>/dev/null || true
+        fi
+    done
 
     # Copy VERSION file
     if [[ -f "${SCRIPT_DIR}/VERSION" ]]; then

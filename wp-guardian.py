@@ -338,6 +338,22 @@ class Guardian:
         else:
             self.logger.info("POST-flood detector disabled")
 
+        # Posture-audit + host-health (v1.6+, task #122)
+        try:
+            from modules.host_profile import HostProfileDetector
+            from modules.posture import PostureAuditor
+            self.host_profile_detector = HostProfileDetector(
+                self.config, self.db, hostname=hostname,
+            )
+            self.posture_auditor = PostureAuditor(
+                self.config, self.db, self.host_profile_detector,
+                telegram=self.telegram, hostname=hostname, base_dir=self.base_dir,
+            )
+        except Exception as e:
+            self.logger.error(f"Posture auditor init failed: {e}")
+            self.host_profile_detector = None
+            self.posture_auditor = None
+
         # Initialize Telegram command handler (after tripwires so we can pass the set)
         self.telegram_cmd = TelegramCommander(
             self.config, self.db, self.blocker, self.whitelist,
@@ -568,6 +584,13 @@ class Guardian:
                     self.digest_buffer.flush_if_due()
                 except Exception as e:
                     self.logger.error(f"Digest flush error: {e}")
+
+                # Posture-audit + host-health daily run (v1.6+)
+                if self.posture_auditor is not None:
+                    try:
+                        self.posture_auditor.run_if_due()
+                    except Exception as e:
+                        self.logger.error(f"Posture run error: {e}")
 
                 time.sleep(1)
 
@@ -1167,6 +1190,18 @@ def main():
     parser.add_argument('--upgrade-config', action='store_true',
                         help='Check for new config options and run upgrade wizard')
 
+    # v1.6 — Posture-audit + host-health (task #122)
+    parser.add_argument('--posture-run', action='store_true',
+                        help='Run all applicable posture/health checks now')
+    parser.add_argument('--posture-status', action='store_true',
+                        help='Show current posture-audit status table')
+    parser.add_argument('--posture-events', action='store_true',
+                        help='Show recent posture-audit transition events')
+    parser.add_argument('--posture-profile', action='store_true',
+                        help='Show the detected host profile')
+    parser.add_argument('--refresh', action='store_true',
+                        help='With --posture-profile or --posture-run: re-detect the host profile first')
+
     args = parser.parse_args()
 
     # --- Commands that don't need full Guardian init ---
@@ -1584,6 +1619,96 @@ def main():
             return
         guardian.db.resolve_compromise_event(event_id, resolved_by='cli', note=args.note)
         print(f"Resolved compromise event {event_id} ({event['username']})")
+        return
+
+    # v1.6 — Posture audit / host-health
+    if args.posture_profile:
+        if not guardian.host_profile_detector:
+            print("Posture auditor not initialized. Check logs for errors.")
+            return
+        if args.refresh:
+            profile = guardian.host_profile_detector.detect_now(detection_method='cli')
+        else:
+            profile = guardian.host_profile_detector.get_or_detect()
+        if not profile:
+            print("Could not determine host profile.")
+            return
+        detected_at = profile.get('detected_at') or 0
+        when = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(detected_at)) if detected_at else 'never'
+        print("")
+        print(f"Host profile for {profile['host']}  (detected {when}, method={profile['detection_method']})")
+        print("-" * 68)
+        print(f"  is_linux                  : {profile['is_linux']}")
+        print(f"  distro                    : {profile['distro_id']} {profile['distro_version']}")
+        print(f"  is_cloudlinux             : {profile['is_cloudlinux']}")
+        print(f"  is_multi_tenant           : {profile['is_multi_tenant']}")
+        print(f"  is_single_site            : {profile['is_single_site']}")
+        print(f"  web_server                : {profile['web_server']}")
+        print(f"  db_server                 : {profile['db_server']}")
+        print(f"  mta                       : {profile['mta']}")
+        print(f"  has_modsec                : {profile['has_modsec']}")
+        print(f"  behind_perimeter_firewall : {profile['behind_perimeter_firewall']}")
+        if profile.get('extras'):
+            print("  extras                    :")
+            for k, v in profile['extras'].items():
+                print(f"      {k}: {v}")
+        return
+
+    if args.posture_run:
+        if not guardian.posture_auditor:
+            print("Posture auditor not initialized. Check logs for errors.")
+            return
+        results = guardian.posture_auditor.run_now(force_profile_refresh=args.refresh)
+        if not results:
+            print("No checks ran.")
+            return
+        print("")
+        print(f"Posture run on {guardian.posture_auditor.hostname}")
+        print(f"{'CHECK_ID':<24s} {'STATUS':<10s} {'SEV':<10s} {'XSN':<5s}  DETAIL")
+        print("-" * 100)
+        for cid, r in results.items():
+            xsn = 'yes' if r['transition'] else ''
+            detail = (r['detail'] or '')[:60]
+            print(f"  {cid:<22s} {r['status']:<10s} {r['severity']:<10s} {xsn:<5s}  {detail}")
+        print("")
+        return
+
+    if args.posture_status:
+        if not guardian.posture_auditor:
+            print("Posture auditor not initialized. Check logs for errors.")
+            return
+        rows = guardian.posture_auditor.status_table()
+        if not rows:
+            print("No posture state recorded yet. Run --posture-run first.")
+            return
+        print("")
+        print(f"Posture state for {guardian.posture_auditor.hostname}")
+        print(f"{'MODULE':<10s} {'CHECK_ID':<22s} {'STATUS':<10s} {'SEV':<10s} {'LAST_RUN':<20s}  DETAIL")
+        print("-" * 110)
+        for r in rows:
+            last_run = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(r['last_run_at']))
+            detail = (r['detail'] or '')[:50]
+            print(f"  {r['module']:<8s} {r['check_id']:<22s} {r['status']:<10s} {r['severity']:<10s} {last_run:<20s}  {detail}")
+        print("")
+        return
+
+    if args.posture_events:
+        if not guardian.posture_auditor:
+            print("Posture auditor not initialized. Check logs for errors.")
+            return
+        events = guardian.posture_auditor.recent_events(limit=50)
+        if not events:
+            print("No posture events recorded.")
+            return
+        print("")
+        print(f"Recent posture events for {guardian.posture_auditor.hostname}")
+        print(f"{'WHEN':<20s} {'CHECK_ID':<22s} {'FROM':<10s} -> {'TO':<10s} {'SEV':<10s}  DETAIL")
+        print("-" * 120)
+        for e in events:
+            when = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(e['occurred_at']))
+            detail = (e['detail'] or '')[:40]
+            print(f"  {when:<18s} {e['check_id']:<22s} {e['from_status']:<10s} -> {e['to_status']:<10s} {e['severity']:<10s}  {detail}")
+        print("")
         return
 
     # Default: run the daemon

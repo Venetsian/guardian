@@ -411,3 +411,48 @@ password =
 # email_column = email
 # enabled_column = enabled
 # password_column = password
+
+[posture]
+# Posture-audit + host-health module (task #122).
+#
+# Runs a daily set of read-only checks for security drift (file perms,
+# kernel/polkit versions, listening ports, multi-tenant isolation) and
+# system-health drift (SMART, disk, worker saturation, etc.). Each check
+# declares its own applicability against the auto-detected host profile,
+# so a free single-site install on a plain VPS only runs the generic
+# Linux checks; a multi-tenant CL+Apache box gets the full set.
+
+# Enable/disable the whole subsystem.
+enabled = true
+
+# How often the orchestrator runs (seconds). 86400 = daily.
+interval_seconds = 86400
+
+# Severity floor for Telegram alerts on transitions.
+# One of: info | low | medium | high | critical
+# Recommendation: 'high' (default) — keeps the chat quiet while still
+# paging on the things that actually matter.
+alert_severity_min = high
+
+# How long to keep posture_events rows. Older rows are pruned daily.
+events_retention_days = 30
+
+# How often to re-detect the host profile (seconds). The profile changes
+# rarely — distro upgrades, cluster role changes, perimeter rewiring —
+# so daily re-detection is plenty.
+profile_refresh_seconds = 86400
+
+# Profile overrides. Leave commented for auto-detect; uncomment to force.
+#
+# behind_perimeter_firewall = true
+#   Set true on hosts whose listening ports are not directly internet-
+#   reachable (e.g. behind a MikroTik, AWS SG, Cloudflare Tunnel).
+#   Affects severity of port-binding and sshd-config checks: a non-localhost
+#   bind on a perimeter-protected box is informational, on an exposed box
+#   it's medium severity.
+# behind_perimeter_firewall = auto
+#
+# is_multi_tenant = true
+#   Auto-detect counts /home tenant directories with public_html / web /
+#   logs subdirs. Override if your layout is non-standard.
+# is_multi_tenant = auto
