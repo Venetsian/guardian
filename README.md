@@ -12,6 +12,7 @@ WP-Guardian monitors web, SMTP, IMAP/POP3, and SSH logs, automatically blocks at
 - **POST-flood detector (v1.5+)** — generic catch-all for admin/auth POST flooding. Watchlist-only (registered admin paths + universal `/login`, `/signin`, `/phpmyadmin/`, etc.) plus a two-stage gate (rate threshold + behavioral confirmation: zero CSS / off-host Referer / uniform Content-Length) so it doesn't false-positive on offices behind shared NAT. Off by default, opt-in per server.
 - **SSH root brute-force rule (v1.5+)** — `ssh_root` rule fires on the first `Failed password for root` attempt by default. Port-agnostic (works on sshd port 22, 69, or anything else).
 - **Smart detection pipeline** — structural tripwires, known webshells, login isolation (CSS-based bot detection), brute force thresholds, PHP scanning detection, author enumeration, 404 storms
+- **Posture audit + host-health module (v1.5+)** — daily read-only scan for security and operational drift (PwnKit/polkit version, `/proc hidepid`, with more checks added incrementally — SUID drift, sshd config, listening ports, tenant home perms, mod_hostinglimits / mod_lsapi UID switching, CageFS state, SMART, disk usage, worker saturation, DB health, modsec volume, MTA queue). Each check declares its applicability against an auto-detected host profile so a free single-site VPS only runs the generic Linux checks while a multi-tenant CL+Apache box gets the full set. Telegram alerts fire on transitions whose severity meets `[posture] alert_severity_min` (default `high`).
 - **Credential compromise detection (v1.4+)** — `DistributedAuthDetector` catches the classic distributed credential-abuse botnet pattern (same mailbox authenticating from many countries/ASNs/IPs in a short window), automatically blocks source IPs, and disables the mailbox in the mail backend
 - **GeoIP enrichment (v1.4+)** — every auth event and block is tagged with country, city, ASN, and ASN organization via MaxMind GeoLite2
 - **Three-tier escalation** — 24h block, 30d block, permanent ban with automatic tier advancement
@@ -93,6 +94,13 @@ python3 wp-guardian.py --discover-logs-save       # Find and save
 python3 wp-guardian.py --telegram-setup          # Interactive setup wizard
 python3 wp-guardian.py --telegram-test           # Send test message
 
+# Posture audit (v1.5+)
+python3 wp-guardian.py --posture-profile         # Show detected host profile
+python3 wp-guardian.py --posture-profile --refresh  # Re-detect now
+python3 wp-guardian.py --posture-run             # Run all applicable checks now
+python3 wp-guardian.py --posture-status          # Current state of every check
+python3 wp-guardian.py --posture-events          # Recent transitions
+
 # Unblock
 python3 wp-guardian.py --unblock 1.2.3.4
 
@@ -161,6 +169,65 @@ For SSH (`/var/log/secure`):
 - `Failed password for root` → block after `ssh_root_fail_threshold` (default 1) (v1.5+, `ssh_root`)
 - `Failed password` for any other user → block after `ssh_fail_threshold` (default 3) (`ssh_fail`)
 
+## Posture Audit (v1.5+)
+
+A separate read-only subsystem that runs daily and watches for **drift** rather than active attacks. Each check declares its applicability against an auto-detected host profile, so the catalog scales with the box: a single-site VPS only runs the generic Linux checks; a multi-tenant CloudLinux+Apache box gets the full set.
+
+### Host profile
+
+On first run (and every `profile_refresh_seconds`, default daily) guardian probes the host and stores a profile:
+
+| Flag | Meaning |
+|------|---------|
+| `is_linux`, `distro_id`, `distro_version` | OS / distro family |
+| `is_cloudlinux` | CloudLinux 8/9/10 detected (kmodlve loaded or distro ID match) |
+| `is_multi_tenant` | At least 2 `/home/*` entries with `public_html` / `web` / `logs` subdirs |
+| `is_single_site` | The opposite — at most one tenant-shaped /home entry |
+| `web_server` | Detected from `systemctl is-active`: `ols`, `apache`, `nginx`, or `none` |
+| `db_server`, `mta` | `mariadb`/`mysql`/`none`, `postfix`/`none` |
+| `has_modsec` | mod_security config present |
+| `behind_perimeter_firewall` | Operator-declared (config-driven; affects severity of port-binding checks) |
+
+Override `is_multi_tenant` and `behind_perimeter_firewall` in `[posture]` if auto-detect is wrong for your setup.
+
+### Storage
+
+Two SQLite tables, both pruned automatically:
+
+- `posture_state` — one row per `(host, module, check_id)`, upserted every run with current `status` (`pass` / `fail` / `warn` / `error` / `skipped`), `severity`, JSON `current_value`, `last_run_at`, `last_change_at`.
+- `posture_events` — append-only log of transitions (status or value change) with a 30-day TTL. Inserted only when a check actually changes — quiet steady-state, full forensic trail when something drifts.
+
+### Telegram alerts
+
+Fire only on transitions whose severity meets `[posture] alert_severity_min` (default `high`). On the very first run after install, only `critical` transitions alert — bootstrap dampening prevents a fresh deploy from flooding your chat with the initial state of every check. After the second run, the configured floor takes over.
+
+### Adding a new check
+
+Drop a new file in `posture_checks/`:
+
+```python
+from posture_checks.base import Check, CheckResult, Severity, Status
+
+class MyCheck(Check):
+    check_id = 'my_thing'
+    severity = Severity.HIGH
+    description = 'short human description'
+
+    def applies_to(self, profile):
+        # Return True only on hosts where this check makes sense.
+        return profile.get('is_cloudlinux') and profile.get('is_multi_tenant')
+
+    def run(self, profile):
+        if all_good():
+            return CheckResult.passing(detail='looks fine')
+        return CheckResult.failing(
+            detail='something drifted: ...',
+            value={'measured': 123},
+        )
+```
+
+Register it in `posture_checks/__init__.py` (`ALL_CHECKS = [...]`). The orchestrator handles persistence, transition diffing, and alerting — checks just declare applicability and produce a `CheckResult`.
+
 ## Firewall Backends
 
 WP-Guardian supports pluggable firewall backends. Choose one in `wp-guardian.conf`:
@@ -214,8 +281,14 @@ See [backends/README.md](backends/README.md) for creating custom backends.
 │   ├── digest.py           # Hourly Telegram digest buffer
 │   ├── verbosity.py        # Per-rule alert routing
 │   ├── cms_registry.py     # Auto-detected vhost → CMS map (v1.5+)
+│   ├── host_profile.py     # Posture-audit host profile detector (v1.5+)
+│   ├── posture.py          # Posture-audit orchestrator (v1.5+)
 │   ├── mail_backend.py     # MariaDB mailbox-disable integration
 │   └── migrator.py         # Database migration runner
+├── posture_checks/         # v1.5+ — one posture/health check per file
+│   ├── base.py             # Check ABC, CheckResult, Severity/Status enums
+│   ├── check_pwnkit.py     # PwnKit / CVE-2021-4034 polkit version
+│   └── check_hidepid.py    # /proc hidepid=invisible
 ├── backends/
 │   ├── base.py             # Firewall backend interface (ABC)
 │   ├── factory.py          # Backend registry + instantiation
@@ -235,7 +308,7 @@ See [backends/README.md](backends/README.md) for creating custom backends.
 │   ├── backfill_ip_history.py   # Geo-enrich ip_history rows (v1.4.2+ repair)
 │   └── config-upgrade.py        # Detect & merge new config options on upgrade
 ├── migrations/
-│   └── *.sql               # Database migrations (v1.5: 007_cms_sites.sql)
+│   └── *.sql               # Database migrations (v1.5: 007_cms_sites.sql, 008_posture_audit.sql)
 ├── state/
 │   └── guardian.db          # SQLite database
 └── logs/
