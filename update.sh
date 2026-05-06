@@ -434,8 +434,13 @@ elif [[ "$DEP_CHECK" == MISSING:* ]]; then
     if [[ -f "$REQ_FILE" ]] && ask_yn "  Install missing dependencies now (pip3 install -r requirements.txt)?" "y"; then
         echo ""
         if ensure_pip3; then
-            print_step "Running: pip3 install -r ${REQ_FILE} --break-system-packages"
-            if pip3 install -r "${REQ_FILE}" --break-system-packages; then
+            # Try `--break-system-packages` first (needed on PEP 668-marked
+            # installs — EL10, modern Debian/Ubuntu); fall back without it
+            # for older pip versions that don't recognize the flag (e.g.
+            # pip 21.3.1 on EL9/CL9, where the flag isn't needed anyway).
+            print_step "Running: pip3 install -r ${REQ_FILE}"
+            if pip3 install -r "${REQ_FILE}" --break-system-packages 2>/dev/null \
+                    || pip3 install -r "${REQ_FILE}"; then
                 echo ""
                 print_ok "Dependencies installed — re-checking..."
                 RECHECK=$(python3 -c "
