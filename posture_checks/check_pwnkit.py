@@ -105,32 +105,84 @@ def _query_dpkg(pkg):
         return ''
 
 
+def _python_vercmp(a, b):
+    """Pure-Python RPM-style version comparator.
+
+    Splits each string into runs of digits and runs of letters, dropping
+    separators (.-_+~ etc.), and compares pairwise. Numeric segments
+    compare numerically; alphabetic segments compare lexically; numeric
+    segments sort GREATER than alphabetic at the same position (RPM
+    convention — '1' > 'a').
+
+    Handles the version strings we actually care about:
+      125-4.el10        vs 121-1.el10        -> 1   (125 > 121)
+      0.117-13.el9_4    vs 0.117-13.el9      -> 1   (extra '4' segment)
+      0.115-13.el8_5.2  vs 0.115-13.el8_5.2  -> 0   (equal)
+      0.105-31+deb11u1  vs 0.105-31+deb11u1  -> 0
+    Does NOT handle epoch prefixes or RPM tilde/caret pre-release ordering;
+    we don't ship baselines that would surface those.
+    """
+    import re
+    if a == b:
+        return 0
+    sa = re.findall(r'\d+|[A-Za-z]+', a or '')
+    sb = re.findall(r'\d+|[A-Za-z]+', b or '')
+
+    for ea, eb in zip(sa, sb):
+        a_num = ea.isdigit()
+        b_num = eb.isdigit()
+        if a_num and b_num:
+            ia, ib = int(ea), int(eb)
+            if ia != ib:
+                return -1 if ia < ib else 1
+        elif a_num != b_num:
+            # Numeric segments sort greater than alphabetic at the same
+            # position (RPM convention).
+            return 1 if a_num else -1
+        else:
+            if ea != eb:
+                return -1 if ea < eb else 1
+
+    if len(sa) != len(sb):
+        # Whichever has more segments wins (e.g. el9_4 > el9).
+        return -1 if len(sa) < len(sb) else 1
+    return 0
+
+
 def _rpm_vercmp(a, b):
-    """Wraps `rpmdev-vercmp` if installed; else returns None to indicate
-    we can't tell. Returns: -1 if a<b, 0 if a==b, 1 if a>b."""
+    """RPM-style version comparison. Returns -1/0/1.
+
+    Tries `rpmdev-vercmp` (canonical, from rpmdevtools) first; falls back
+    to the pure-Python comparator when that package isn't installed —
+    which is the common case on stock AlmaLinux/Rocky/CloudLinux. Never
+    returns None: we always produce a real answer.
+    """
     import subprocess
-    if not os.path.exists('/usr/bin/rpmdev-vercmp'):
-        return None
-    try:
-        proc = subprocess.run(
-            ['rpmdev-vercmp', a, b],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=5, universal_newlines=True,
-        )
-        # rpmdev-vercmp exit codes: 0 equal, 11 a>b, 12 a<b
-        if proc.returncode == 0:
-            return 0
-        if proc.returncode == 11:
-            return 1
-        if proc.returncode == 12:
-            return -1
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    return None
+    if os.path.exists('/usr/bin/rpmdev-vercmp'):
+        try:
+            proc = subprocess.run(
+                ['rpmdev-vercmp', a, b],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=5, universal_newlines=True,
+            )
+            # rpmdev-vercmp exit codes: 0 equal, 11 a>b, 12 a<b
+            if proc.returncode == 0:
+                return 0
+            if proc.returncode == 11:
+                return 1
+            if proc.returncode == 12:
+                return -1
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return _python_vercmp(a, b)
 
 
 def _dpkg_vercmp(a, b):
-    """Use `dpkg --compare-versions a ge b`. Returns 1/0/-1 or None."""
+    """Debian-style version comparison. Returns -1/0/1.
+
+    Tries `dpkg --compare-versions` first (always present on Debian/Ubuntu);
+    falls back to the pure-Python comparator if dpkg isn't reachable.
+    """
     import subprocess
     try:
         eq = subprocess.run(['dpkg', '--compare-versions', a, 'eq', b],
@@ -143,7 +195,7 @@ def _dpkg_vercmp(a, b):
             return 1
         return -1
     except (OSError, subprocess.TimeoutExpired):
-        return None
+        return _python_vercmp(a, b)
 
 
 class PwnKitCheck(Check):
@@ -178,16 +230,19 @@ class PwnKitCheck(Check):
 
         pkg, min_version = baseline
 
-        # Pick the right package manager probe
+        # Pick the right package manager probe + version comparator
         if distro_id in ('rhel', 'almalinux', 'rocky', 'cloudlinux', 'centos', 'fedora'):
             installed = _query_rpm(pkg)
-            cmp_result = _rpm_vercmp(installed, min_version) if installed else None
+            comparator = 'rpm'
+            cmp_fn = _rpm_vercmp
         elif distro_id in ('debian', 'ubuntu'):
             installed = _query_dpkg(pkg)
-            cmp_result = _dpkg_vercmp(installed, min_version) if installed else None
+            comparator = 'dpkg'
+            cmp_fn = _dpkg_vercmp
         else:
             installed = ''
-            cmp_result = None
+            comparator = 'unknown'
+            cmp_fn = None
 
         if not installed:
             # Package not present at all — depending on distro this might
@@ -200,13 +255,19 @@ class PwnKitCheck(Check):
                 severity=Severity.LOW,
             )
 
-        if cmp_result is None:
-            # Vercmp tool unavailable — fall back to a string compare.
-            # Conservative: only treat exact match or trivial-newer as patched.
-            cmp_result = 0 if installed == min_version else -1
-            comparator = 'string-fallback'
-        else:
-            comparator = 'native'
+        if cmp_fn is None:
+            # Unknown distro family — _MIN_PATCHED only ships entries for
+            # rpm/dpkg families, so reaching here means a baseline was added
+            # for a distro we don't know how to query. Surface as WARN.
+            return CheckResult.warning(
+                detail=("baseline known for {d}/{m} but no version comparator "
+                        "for that distro family".format(d=distro_id, m=major)),
+                value={'distro': distro_id, 'major': major,
+                       'installed': installed, 'min_patched': min_version},
+                severity=Severity.LOW,
+            )
+
+        cmp_result = cmp_fn(installed, min_version)
 
         value = {
             'distro': distro_id,
