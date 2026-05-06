@@ -63,6 +63,14 @@ class PostureAuditor:
         self.events_retention_days = config.getint(
             'posture', 'events_retention_days', fallback=30
         )
+        # Whether transitions BACK to PASS should fire Telegram alerts.
+        # Default off — once the FAIL alert has been delivered, operator
+        # doesn't need a recovery ping; the new state is visible via
+        # --posture-status and the events log. Set true if you want
+        # confirmation-of-resolution messages.
+        self.alert_on_recovery = config.getboolean(
+            'posture', 'alert_on_recovery', fallback=False
+        )
 
         # Instantiate every registered check once. Checks are stateless;
         # the orchestrator owns the storage.
@@ -180,7 +188,7 @@ class PostureAuditor:
                 'detail': result.detail,
                 'transition': transitioned,
             }
-            if transitioned and self._should_alert(severity):
+            if transitioned and self._should_alert(severity, result.status):
                 self._fire_alert(check, result, severity)
                 events_fired += 1
 
@@ -289,14 +297,24 @@ class PostureAuditor:
     # ------------------------------------------------------------------
     # Alerts
     # ------------------------------------------------------------------
-    def _should_alert(self, severity):
-        """Filter on configured severity floor + first-run grace.
+    def _should_alert(self, severity, status):
+        """Filter on configured severity floor + first-run grace + recovery
+        suppression.
 
         On the very first run after install, every result is a transition
         (UNKNOWN -> something). We don't want to flood Telegram on bootstrap,
         so the first run only alerts on CRITICAL.
+
+        Transitions back to PASS ("recovery") are suppressed by default —
+        once the FAIL alert was delivered, the operator doesn't need a
+        recovery ping; current state is in --posture-status. Flip
+        [posture] alert_on_recovery = true to receive resolution pings
+        (useful when the check is something you actively repaired and
+        want confirmation it took effect).
         """
         if not self.telegram or not getattr(self.telegram, 'enabled', False):
+            return False
+        if status == Status.PASS and not self.alert_on_recovery:
             return False
         if not Severity.gte(severity, self.alert_severity_min):
             return False

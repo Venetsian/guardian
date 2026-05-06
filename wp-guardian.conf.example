@@ -434,6 +434,14 @@ interval_seconds = 86400
 # paging on the things that actually matter.
 alert_severity_min = high
 
+# Whether transitions BACK to PASS should fire Telegram alerts.
+# Default false: once the original FAIL alert has been delivered, you
+# don't need a recovery ping — current state is visible via
+# --posture-status / --posture-events. Set true if you specifically
+# want resolution-confirmed messages (e.g. on hosts where you actively
+# repair things and want a Telegram nudge that the fix took effect).
+alert_on_recovery = false
+
 # How long to keep posture_events rows. Older rows are pruned daily.
 events_retention_days = 30
 
