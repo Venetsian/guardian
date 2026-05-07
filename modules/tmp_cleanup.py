@@ -572,8 +572,16 @@ class TmpCleanup(object):
             results['errors'], results['bytes_freed'],
         )
 
-        # Suppress empty pings unless errors fired
-        if not results['paths'] and not results['errors']:
+        # Digest dispatch policy (v1.6.2):
+        #   * live mode: suppress empty runs (no paths + no errors) —
+        #     once the host is in steady state, daily empty pings would
+        #     just be channel noise.
+        #   * dry_run mode: ALWAYS send. The operator is explicitly
+        #     evaluating the module; every run is signal. Even an empty
+        #     dry_run confirms the module is alive AND ships the
+        #     top-largest visibility view.
+        suppress_empty = (results['mode'] == 'live')
+        if suppress_empty and not results['paths'] and not results['errors']:
             return
         if not self.telegram or not getattr(self.telegram, 'enabled', False):
             return
@@ -595,7 +603,7 @@ class TmpCleanup(object):
 
         if results['paths']:
             lines.append("")
-            lines.append("Cleaned:")
+            lines.append("Cleaned:" if results['mode'] == 'live' else "Would clean:")
             for p in results['paths'][:SAMPLE_LIMIT]:
                 tag = '/' if p['type'] == 'dir' else ''
                 lines.append("  {n}{t} ({sz} KB, {a}d)".format(
@@ -604,6 +612,14 @@ class TmpCleanup(object):
             if len(results['paths']) > SAMPLE_LIMIT:
                 lines.append("  +{n} more".format(
                     n=len(results['paths']) - SAMPLE_LIMIT))
+        elif results['mode'] == 'dry_run':
+            # Empty dry_run: confirm the module is alive and explain
+            # what we'd have done if there had been candidates.
+            lines.append("")
+            lines.append("/tmp clean — no entries match cleanup criteria")
+            lines.append("(would delete root-owned, allowlisted entries "
+                         "older than {d}d, lsof-clean, not in system "
+                         "excludelist)".format(d=self.age_seconds // 86400))
 
         # Top-N largest in /tmp — pure visibility. Highlights bloat we're
         # NOT touching (live runtime dirs, etc.) so the operator can see

@@ -1,5 +1,41 @@
 # WP-Guardian Changelog
 
+## v1.6.2 — tmp_cleanup digest fix: dry_run always sends (2026-05-07)
+
+Same-day patch on top of v1.6.1. The empty-suppression rule in
+`_send_digest` was originally a "don't spam the Telegram channel on
+quiet days" heuristic, but it accidentally suppressed the entire
+*evaluation* phase: an operator who enables `dry_run` to evaluate the
+module never sees a single Telegram message if their /tmp happens to
+be clean — leaving them unable to tell whether the module is even
+running.
+
+### Behavior change
+
+- **`mode = dry_run`**: digest is now sent on EVERY scheduled run,
+  including empty ones. Daily ping confirms the module is alive,
+  reports the candidate count (zero or otherwise), and ships the
+  `Largest /tmp entries` top-N visibility view (which is the most
+  useful part of the message anyway, since it surfaces bloat that's
+  not even cleanable — like `/tmp/lshttpd/swap`).
+- **`mode = live`**: unchanged. Empty runs still suppressed; you only
+  hear from the module when something was actually cleaned or errored.
+- The digest body now distinguishes "Cleaned:" vs "Would clean:" based
+  on mode, and adds a clear "/tmp clean — no entries match cleanup
+  criteria" line when a dry_run finds nothing, plus a one-liner
+  reminder of what the criteria are.
+
+### Files modified
+
+- `modules/tmp_cleanup.py` — `_send_digest` policy + body refinements
+- `VERSION` — 1.6.1 → 1.6.2
+
+### Backwards compat
+
+No config or schema changes. Live-mode users see no difference.
+Dry_run-mode users see one extra Telegram message per day on hosts
+where /tmp is clean — that's the entire point of the patch.
+
 ## v1.6.1 — tmp_cleanup module redesign after operational sweep (2026-05-07)
 
 Same-day patch release after the Phase 6 operational sweep on
