@@ -18,18 +18,33 @@ Detection strategy:
   * Probe `/proc/cmdline` for the `initcall_blacklist=algif_aead_init`
     GRUB mitigation flag (handles both standalone and comma-list forms).
 
-Severity ladder:
-  * CRITICAL — kernel below patched AND no GRUB mitigation
-                (root local priv-esc reachable; patch and reboot)
-  * MEDIUM   — kernel below patched BUT GRUB mitigation active
-                (mitigated for now, but still patch — operator might
-                accidentally remove the GRUB arg later)
-  * PASS     — kernel at or above patched version
+Severity ladder (highest mitigation wins):
+  * PASS     — kernel at or above patched version (definitive)
+  * LOW      — kernel below patched but a livepatch service
+                (KernelCare/kpatch/Ksplice) is active. The livepatch
+                tool patches the running kernel binary; we trust the
+                operator's subscription is doing its job. Detail
+                points the operator at the verify command for the
+                provider so they can check CVE-specific coverage.
+  * MEDIUM   — kernel below patched, no livepatch, BUT GRUB mitigation
+                (initcall_blacklist=algif_aead_init) active. Mitigated
+                for now but still need to patch — the GRUB arg only
+                takes effect at next reboot.
+  * CRITICAL — kernel below patched AND no livepatch AND no GRUB
+                mitigation (root local priv-esc reachable; patch and
+                reboot or apply mitigation immediately).
 
-Stored value includes the kernel string and the patched baseline so
-transitions surface clean diffs. Mitigation flag is included too —
-if someone removes the GRUB arg without patching, the check transitions
-back to CRITICAL on next run.
+Livepatch awareness (v1.7.1): on hosts where KernelCare or kpatch is
+running, the running kernel image string from `uname -r` will still
+report the OLD pre-livepatch version even when CVEs are patched at
+runtime. Without livepatch awareness this check would false-alarm
+CRITICAL on every KernelCare-protected host. Profile field
+`extras.livepatch_provider` and `extras.livepatch_active` come from
+the host profile detector.
+
+Stored value includes the kernel string, patched baseline, GRUB
+mitigation flag, and livepatch state — so any change in any of those
+surfaces a transition.
 """
 
 import logging
@@ -178,28 +193,60 @@ class CopyFailCheck(Check):
             )
 
         cmp = python_vercmp(kernel, baseline)
+        extras = profile.get('extras') or {}
+        livepatch_provider = (extras.get('livepatch_provider') or 'none').lower()
+        livepatch_active = bool(extras.get('livepatch_active'))
+
         value = {
             'distro': distro,
             'major': major,
             'kernel': kernel,
             'patched_min': baseline,
             'mitigation_active': mitigated,
+            'livepatch_provider': livepatch_provider,
+            'livepatch_active': livepatch_active,
         }
 
         # Patched kernel — definitive PASS regardless of mitigation flag.
         if cmp >= 0:
-            mit_note = ""
+            extras_notes = []
             if mitigated:
-                mit_note = (" (initcall_blacklist=algif_aead_init also active "
-                            "— belt-and-braces, can be removed)")
+                extras_notes.append(
+                    "initcall_blacklist=algif_aead_init also active "
+                    "(belt-and-braces, can be removed)")
+            if livepatch_active:
+                extras_notes.append(
+                    "{p} livepatch active".format(p=livepatch_provider))
+            note = (" (" + "; ".join(extras_notes) + ")") if extras_notes else ""
             return CheckResult.passing(
-                detail="kernel {k} >= {p} (CVE-2026-31431 patched){m}".format(
-                    k=kernel, p=baseline, m=mit_note),
+                detail="kernel {k} >= {p} (CVE-2026-31431 patched){n}".format(
+                    k=kernel, p=baseline, n=note),
                 value=value,
             )
 
-        # Vulnerable kernel — severity depends on whether GRUB mitigation
-        # is in place.
+        # Vulnerable kernel by uname-version. Severity ladder:
+        # 1. Livepatch service active   → LOW (binary-patched at runtime)
+        # 2. GRUB initcall mitigation    → MEDIUM (mitigates exploitation
+        #                                   path but kernel still vulnerable
+        #                                   until reboot)
+        # 3. Neither                     → CRITICAL
+        if livepatch_active:
+            verify_cmd = {
+                'kernelcare': 'kcarectl --patch-info',
+                'kpatch':     'kpatch list',
+                'ksplice':    'uptrack-show',
+            }.get(livepatch_provider, 'livepatch tool')
+            return CheckResult.warning(
+                detail=("kernel {k} below patched {p}, but {prov} "
+                        "livepatch service is active — trusting it to "
+                        "have applied the CVE-2026-31431 patch at "
+                        "runtime. Verify CVE-specific coverage with "
+                        "`{vc}`.").format(
+                    k=kernel, p=baseline, prov=livepatch_provider, vc=verify_cmd),
+                value=value,
+                severity=Severity.LOW,
+            )
+
         if mitigated:
             return CheckResult.warning(
                 detail=("kernel {k} below patched {p} BUT "
@@ -218,7 +265,8 @@ class CopyFailCheck(Check):
                     "`dnf upgrade kernel && reboot` (preferred), OR "
                     "`grubby --update-kernel=ALL "
                     "--args=\"initcall_blacklist=algif_aead_init\"` and "
-                    "reboot to mitigate without patching.").format(
+                    "reboot to mitigate without patching, OR install a "
+                    "livepatch tool (KernelCare/kpatch).").format(
                 k=kernel, p=baseline, d=distro, maj=major),
             value=value,
             severity=Severity.CRITICAL,

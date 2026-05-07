@@ -168,10 +168,13 @@ class HostProfileDetector:
             behind_perimeter = self._perimeter_override
 
         virt = self._detect_virtualization()
+        livepatch = self._detect_livepatch()
         extras = {
             'kernel': self._detect_kernel(),
             'is_virtualized': virt['is_virtualized'],
             'virt_type': virt['type'],
+            'livepatch_provider': livepatch['provider'],
+            'livepatch_active': livepatch['active'],
         }
 
         return {
@@ -356,3 +359,97 @@ class HostProfileDetector:
         if not virt_type or virt_type == 'none':
             return {'is_virtualized': False, 'type': 'none'}
         return {'is_virtualized': True, 'type': virt_type}
+
+    def _detect_livepatch(self):
+        """Return {'provider': str, 'active': bool}.
+
+        Detects whether a kernel livepatch service (KernelCare, kpatch,
+        Ksplice) is installed on the host, and whether a livepatch is
+        currently APPLIED to the running kernel.
+
+        Provider values:
+          'kernelcare' — CloudLinux paid livepatch (also available standalone)
+          'kpatch'     — RHEL/AlmaLinux upstream livepatch (free)
+          'ksplice'    — Oracle Linux livepatch
+          'none'       — no livepatch tool detected; operator relies on
+                         the reboot cycle for kernel patching
+
+        Detection order: KernelCare → kpatch → Ksplice. KernelCare wins
+        on CL hosts where it ships with the OS subscription; the others
+        cover non-CL operators (third-party deploys on plain RHEL/Alma/
+        Rocky/OL where the operator picked a free alternative).
+
+        IMPORTANT — what 'active' means (v1.7.2 fix):
+        We do NOT use `systemctl is-active <service>` as the active
+        signal. KernelCare ships `kcare.service` as a oneshot unit that
+        exits after pulling and applying patches; `is-active` reports
+        'inactive' between timer firings even on a fully-functional
+        host. The authoritative signal for each provider is its own CLI
+        tool reporting that a patch is currently loaded into the running
+        kernel:
+
+          * KernelCare:  `kcarectl --info` contains 'patch is applied'
+          * kpatch:      `kpatch list` shows patches in 'enabled' state
+                         (or `/sys/kernel/livepatch/` is non-empty)
+          * Ksplice:     `uptrack-show` succeeds with patch entries
+
+        Falling back to `is-enabled` for the systemd unit covers the
+        case where a tool is installed but the operator hasn't started
+        applying patches yet (they want a finding for that).
+        """
+        # KernelCare
+        for binary in ('/usr/bin/kcarectl', '/usr/local/bin/kcarectl'):
+            if not os.path.exists(binary):
+                continue
+            # Authoritative: kpatch loaded into running kernel?
+            rc, out = _safe_run([binary, '--info'], timeout=5)
+            if rc == 0 and 'patch is applied' in (out or '').lower():
+                return {'provider': 'kernelcare', 'active': True}
+            # Fallback 1: kcare.timer is the recurring fire trigger
+            rc, _ = _safe_run(
+                ['systemctl', 'is-active', '--quiet', 'kcare.timer'], timeout=3
+            )
+            if rc == 0:
+                return {'provider': 'kernelcare', 'active': True}
+            # Installed but no patch applied and no timer running —
+            # report installed-but-not-active so the livepatch_state
+            # check can flag it as MEDIUM.
+            return {'provider': 'kernelcare', 'active': False}
+
+        # kpatch (upstream RHEL/Alma)
+        for binary in ('/usr/sbin/kpatch', '/usr/bin/kpatch'):
+            if not os.path.exists(binary):
+                continue
+            # Authoritative: any patches loaded?
+            rc, out = _safe_run([binary, 'list'], timeout=5)
+            if rc == 0:
+                low = (out or '').lower()
+                # `kpatch list` prints "Loaded patch modules:" and an entry
+                # per loaded patch. Empty output = none loaded.
+                if 'loaded patch modules:' in low and any(
+                    line.strip() and 'no patches' not in line
+                    for line in (out or '').splitlines()[1:]
+                ):
+                    return {'provider': 'kpatch', 'active': True}
+            # Filesystem fallback — the kernel exposes loaded livepatches here
+            try:
+                if os.path.isdir('/sys/kernel/livepatch') and any(
+                    True for _ in os.listdir('/sys/kernel/livepatch')
+                ):
+                    return {'provider': 'kpatch', 'active': True}
+            except OSError:
+                pass
+            return {'provider': 'kpatch', 'active': False}
+
+        # Ksplice (Oracle Linux)
+        for binary in ('/usr/sbin/uptrack-uname', '/usr/bin/uptrack-uname'):
+            if not os.path.exists(binary):
+                continue
+            rc, out = _safe_run(
+                [os.path.dirname(binary) + '/uptrack-show'], timeout=5
+            )
+            if rc == 0 and (out or '').strip():
+                return {'provider': 'ksplice', 'active': True}
+            return {'provider': 'ksplice', 'active': False}
+
+        return {'provider': 'none', 'active': False}

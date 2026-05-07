@@ -1,5 +1,230 @@
 # WP-Guardian Changelog
 
+## v1.7.2 — Livepatch detection: use tool-state, not systemd is-active (2026-05-07)
+
+Same-day correctness fix on top of v1.7.1. The detection added in
+v1.7.1 used `systemctl is-active <service>` as the "is the livepatch
+running?" signal. That works for long-running daemons but is wrong for
+KernelCare, whose `kcare.service` is a **oneshot** unit that exits
+after pulling and applying patches via the timer. Between timer
+firings, `is-active` returns `inactive` — even though the kernel is
+fully livepatched.
+
+Result: every KernelCare-protected host (including srv.dotcom.services
+on AlmaLinux 9 with KernelCare 3.6) would have shipped a false
+MEDIUM "kernelcare installed but service inactive" finding from the
+new `livepatch_state` check, AND `kernel_copy_fail` would not have
+demoted CRITICAL on those hosts.
+
+### Detection now uses authoritative per-provider signals
+
+For each provider, the v1.7.2 detection asks the provider's own CLI
+whether a patch is loaded into the running kernel — that's what we
+actually care about, regardless of whether a systemd service happens
+to be running RIGHT NOW.
+
+  * **KernelCare**: `kcarectl --info` output contains
+    `patch is applied`. Fallback: `kcare.timer` reports active.
+  * **kpatch**: `kpatch list` shows loaded patch modules. Fallback:
+    `/sys/kernel/livepatch/` directory non-empty (kernel-exposed
+    livepatch entries).
+  * **Ksplice**: `uptrack-show` succeeds with at least one entry.
+
+If a tool is installed but no livepatch is currently loaded AND no
+recurring timer/service is enabled, the detection reports
+`active=False` — which is the genuinely-dangerous state the
+`livepatch_state` MEDIUM finding is for.
+
+### Verified on srv.dotcom.services
+
+Before fix: detection would have reported
+`{provider:'kernelcare', active:False}`.
+
+After fix: `kcarectl --info` returns
+`kpatch-state: patch is applied` → detection reports
+`{provider:'kernelcare', active:True}`.
+
+`kernel_copy_fail` correctly demotes severity from CRITICAL to LOW
+(and notes "verify CVE coverage with `kcarectl --patch-info`").
+`livepatch_state` reports PASS.
+
+### Files modified
+
+- `modules/host_profile.py` — `_detect_livepatch()` rewritten with
+  per-provider authoritative signals + sensible fallbacks
+- `VERSION` — 1.7.1 → 1.7.2
+
+### Backwards compat
+
+No schema, config, or check API changes. Existing
+`extras.livepatch_provider` / `extras.livepatch_active` field
+contract is unchanged; only the *values* the detector produces become
+correct on KernelCare hosts.
+
+## v1.7.1 — Kernel livepatch awareness (KernelCare / kpatch / Ksplice) (2026-05-07)
+
+Defensive-correctness fix on top of v1.7.0. The v1.6.0 `kernel_copy_fail`
+check assumed kernel patches always come via "upgrade kernel + reboot"
+and compared `uname -r` against a per-distro patched-RPM baseline. This
+false-alarms CRITICAL on every host running KernelCare or kpatch — the
+kernel image string still reports the OLD pre-livepatch version even
+when CVEs are patched at runtime. The check now correctly understands
+that scenario, plus we surface the livepatch posture as its own check
+since not every operator runs one.
+
+### Profile detection
+
+`modules/host_profile.py` gains `_detect_livepatch()` which probes for:
+  * **KernelCare** — `kcarectl` binary + `kcare` systemd unit
+  * **kpatch** — `kpatch` binary + `kpatch` systemd unit (RHEL/Alma free)
+  * **Ksplice** — `uptrack-uname` binary + `uptrack` unit (Oracle Linux)
+
+Detection result lands in `extras.livepatch_provider` (one of
+`kernelcare`/`kpatch`/`ksplice`/`none`) and `extras.livepatch_active`
+(bool — provider's systemd unit reports active). KernelCare wins on
+hosts with multiple installed (the CL stack convention).
+
+### `check_kernel_copy_fail` — livepatch-aware severity ladder
+
+New cascade when the kernel uname is below the patched baseline:
+
+  1. **Livepatch service active** → LOW. Trust the running livepatch
+     subscription to have applied the CVE patch at runtime; surface
+     the provider's verify command (`kcarectl --patch-info`,
+     `kpatch list`, `uptrack-show`) so the operator can spot-check
+     CVE-specific coverage.
+  2. **GRUB initcall mitigation** → MEDIUM (unchanged from v1.6).
+  3. **Neither** → CRITICAL (unchanged).
+
+Patched-by-version is still PASS regardless of livepatch state. The
+PASS detail mentions both belt-and-braces signals (GRUB mitigation
+and active livepatch) when present.
+
+### New `livepatch_state` check
+
+Standalone visibility check, applies to all Linux:
+  * **Provider installed AND active** → PASS
+  * **Provider installed BUT service inactive** → MEDIUM. The dangerous
+    state — operator may believe kernel patches are being applied when
+    they're not. Detail points at `systemctl status` and the CLI tool.
+  * **No provider detected** → PASS-with-note. Doesn't penalize
+    third-party operators on the public GitHub repo who don't run a
+    paid livepatch subscription; just surfaces the choice and lists
+    options (KernelCare paid, kpatch free on RHEL/Alma 8+).
+
+### `ALL_CHECKS` count: 21 → 22
+
+### Files added
+
+- `posture_checks/check_livepatch_state.py`
+
+### Files modified
+
+- `modules/host_profile.py` — `_detect_livepatch()` + extras additions
+- `posture_checks/check_copy_fail.py` — livepatch-aware severity cascade
+- `posture_checks/__init__.py` — register `LivepatchStateCheck`
+- `VERSION` — 1.7.0 → 1.7.1
+- `CHANGELOG.md`, `README.md`, `CLAUDE.md`
+
+### Why this is 1.7.1 not 1.7.0
+
+v1.7.0 had already shipped (in our local repo); rather than amend-and-
+force-push a still-young commit, the livepatch correctness landed as a
+patch release on top.
+
+### Backwards compat
+
+- New extras fields default safely (`'none'`/`False`) on existing
+  profiles. Profile re-detection on next posture run picks them up.
+- No schema or config changes.
+- Hosts WITHOUT KernelCare see no behavior change in
+  `check_kernel_copy_fail` — the existing severity cascade still applies.
+- Hosts WITH KernelCare go from false-CRITICAL to LOW with a
+  helpful detail. Bootstrap dampening keeps the upgrade quiet on
+  Telegram.
+
+## v1.7.0 — Layered defense Sprint 1: generic CVE feed + SELinux + ModSec mode (2026-05-07)
+
+First batch of task #123 — the post-#122 defensive layering aimed at
+the AI-accelerated CVE disclosure rate. Hand-curated per-CVE checks
+(`pwnkit`, `kernel_copy_fail`) don't scale to that pace; this release
+replaces the long tail with one generic check that consults the distro
+security team's curated errata feed, and adds two visibility checks
+for defense-in-depth measures that are commonly disabled on shared-
+hosting boxes.
+
+### New posture checks
+
+- **`security_updates`** — generic "pending security errata?" check.
+  Consults the distro security team's curated feed:
+    * RHEL/CL/Alma/Rocky/CentOS/Fedora/OL 8+: `dnf updateinfo list security`
+    * RHEL/CL 7: `yum --security check-update`
+    * Debian/Ubuntu/Mint: `apt list --upgradable` filtered for *-security suite
+  Severity ladder (worst-of pending):
+    * 0 pending → PASS
+    * any Moderate/Low/unclassified → LOW
+    * any Important → MEDIUM
+    * any Critical → HIGH
+    * Critical AND kernel package → CRITICAL
+  Stored value is bucket-only so day-to-day errata count drift doesn't
+  fire transitions; only severity-class crossings (or kernel-critical
+  appearing) do. The named-CVE checks (`pwnkit`, `kernel_copy_fail`)
+  stay as overrides for high-priority bugs where distro tagging is
+  too quiet or the alert needs to fire before the errata shows up.
+- **`selinux`** — runtime state via `getenforce`. Reports Enforcing
+  (PASS), Permissive (LOW), Disabled-on-single-site (PASS-with-note),
+  Disabled-on-multi-tenant (MEDIUM). Pure visibility; no remediation —
+  re-enabling SELinux on a long-running multi-tenant box requires a
+  labeling pass and is its own operational project. Applies: EL family.
+- **`modsec_mode`** — companion to existing `modsec_volume` (which
+  measures audit log size health). This check looks at the
+  `SecRuleEngine` directive: On (PASS), DetectionOnly (LOW — common
+  transitional state during rule rollout, but reported so the operator
+  doesn't forget to promote to On), Off (MEDIUM — module loaded but
+  not doing its primary job). Applies: has_modsec.
+
+### `ALL_CHECKS` count: 18 → 21
+
+### Files added
+
+- `posture_checks/check_security_updates.py`
+- `posture_checks/check_selinux.py`
+- `posture_checks/check_modsec_mode.py`
+
+### Files modified
+
+- `posture_checks/__init__.py` — register new checks
+- `VERSION` — 1.6.2 → 1.7.0
+- `README.md` — features list + file tree
+- `CLAUDE.md` — applicability matrix + v1.7 section
+
+### Why these three together
+
+All three address the same gap: **defense layers that are commonly
+absent or degraded on shared hosting**, where the operator needs the
+state surfaced rather than auto-remediated. They share the `applies_to`
+gating pattern, ship as drop-in posture checks with no new config, and
+match the visibility-first philosophy of the v1.5/1.6 modules.
+
+### Backwards compat
+
+No config or schema changes. `git pull && update.sh` on an existing
+v1.6.x host enables the three new checks on the next posture-audit
+run. Bootstrap dampening continues to apply on the first run, so the
+upgrade doesn't flood Telegram even on hosts where the new checks
+land in MEDIUM/HIGH state immediately (the typical case for SELinux
+Disabled and ModSec DetectionOnly across the maiahost fleet).
+
+### Still pending from #123
+
+Coming in subsequent sprints:
+- Sprint 2: operational runbooks (`dnf-automatic` rollout, KernelCare
+  audit) + SECURITY.md
+- Sprint 3: outbound SMTP volume detector (complement to
+  `DistributedAuthDetector`)
+- Deferred: vuls/trivy integration, AIDE/FIM, postfwd outbound rate
+  limits — separate followup tasks once Sprints 1–3 land
+
 ## v1.6.2 — tmp_cleanup digest fix: dry_run always sends (2026-05-07)
 
 Same-day patch on top of v1.6.1. The empty-suppression rule in

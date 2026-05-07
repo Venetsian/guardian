@@ -12,7 +12,7 @@ WP-Guardian monitors web, SMTP, IMAP/POP3, and SSH logs, automatically blocks at
 - **POST-flood detector (v1.5+)** — generic catch-all for admin/auth POST flooding. Watchlist-only (registered admin paths + universal `/login`, `/signin`, `/phpmyadmin/`, etc.) plus a two-stage gate (rate threshold + behavioral confirmation: zero CSS / off-host Referer / uniform Content-Length) so it doesn't false-positive on offices behind shared NAT. Off by default, opt-in per server.
 - **SSH root brute-force rule (v1.5+)** — `ssh_root` rule fires on the first `Failed password for root` attempt by default. Port-agnostic (works on sshd port 22, 69, or anything else).
 - **Smart detection pipeline** — structural tripwires, known webshells, login isolation (CSS-based bot detection), brute force thresholds, PHP scanning detection, author enumeration, 404 storms
-- **Posture audit + host-health module (v1.5+, expanded v1.6)** — daily read-only scan for security and operational drift. **18 checks shipped in v1.6**: kernel CVEs (`kernel_copy_fail` / `pwnkit`); generic Linux (`/proc hidepid`, sshd config, listening ports, SUID drift, /tmp hygiene); multi-tenant + CloudLinux (tenant home perms 0711, public_html 0750, CageFS/LVE state, mod_hostinglimits, Apache vhost UID mapping); host-health (SMART with growth detection, disk usage, MTA queue, Apache worker saturation, DB connection/slow/buffer-pool, mod_security audit-log volume). Each check declares its applicability against an auto-detected host profile so a free single-site VPS only runs the generic Linux checks while a multi-tenant CL+Apache box gets the full set. Telegram alerts fire on transitions whose severity meets `[posture] alert_severity_min` (default `high`); recoveries silent by default.
+- **Posture audit + host-health module (v1.5+, expanded v1.6 + v1.7)** — daily read-only scan for security and operational drift. **22 checks shipped through v1.7.1**: kernel CVEs (`kernel_copy_fail` / `pwnkit`) — livepatch-aware (KernelCare / kpatch / Ksplice) so they don't false-alarm CRITICAL on hosts where binary patches are applied at runtime; generic distro security errata (`security_updates`, the long-tail successor to hand-coded per-CVE checks); kernel livepatch posture (`livepatch_state`); generic Linux (`/proc hidepid`, sshd config, listening ports, SUID drift, /tmp hygiene); defense-in-depth visibility (SELinux state, mod_security mode); multi-tenant + CloudLinux (tenant home perms 0711, public_html 0750, CageFS/LVE state, mod_hostinglimits, Apache vhost UID mapping); host-health (SMART with growth detection, disk usage, MTA queue, Apache worker saturation, DB connection/slow/buffer-pool, mod_security audit-log volume). Each check declares its applicability against an auto-detected host profile so a free single-site VPS only runs the generic Linux checks while a multi-tenant CL+Apache box gets the full set. Telegram alerts fire on transitions whose severity meets `[posture] alert_severity_min` (default `high`); recoveries silent by default.
 - **Active /tmp cleanup module (v1.6+)** — opt-in daily janitor for stale, root-owned, world-readable, allowlisted files in /tmp. Three modes: `off` (default), `dry_run` (scan + log + Telegram digest), `live` (delete + log to `posture_events`). Strict criteria (realpath under /tmp, owner uid 0, mode o+r, age ≥ 7d, allowlist match, lsof-clean). Recommended rollout: enable as `dry_run` for ~14 days, review the digests, promote to `live`.
 - **Credential compromise detection (v1.4+)** — `DistributedAuthDetector` catches the classic distributed credential-abuse botnet pattern (same mailbox authenticating from many countries/ASNs/IPs in a short window), automatically blocks source IPs, and disables the mailbox in the mail backend
 - **GeoIP enrichment (v1.4+)** — every auth event and block is tagged with country, city, ASN, and ASN organization via MaxMind GeoLite2
@@ -39,6 +39,13 @@ sudo bash install.sh
 The interactive installer will walk you through choosing a firewall backend, setting up Telegram alerts, whitelisting your IPs, and discovering your access logs.
 
 For detailed step-by-step instructions, see [INSTALL.md](INSTALL.md).
+
+For the broader security strategy WP-Guardian fits into (threat model,
+layered defense, hardening recommendations), see [SECURITY.md](SECURITY.md).
+
+Operational runbooks for completing the layered defense (security-only
+auto-updates, kernel livepatch audit) live in
+[docs/runbooks/](docs/runbooks/).
 
 ## How It Works
 
@@ -390,7 +397,11 @@ All of the above is observable from Telegram once `commands_enabled = true`:
 │   ├── check_mta_queue.py              # postfix queue depth (v1.6+)
 │   ├── check_worker_saturation.py      # Apache BusyWorkers / Max (v1.6+)
 │   ├── check_db_health.py              # DB conn / slow / hit rate (v1.6+)
-│   └── check_modsec_volume.py          # mod_security audit volume (v1.6+)
+│   ├── check_modsec_volume.py          # mod_security audit volume (v1.6+)
+│   ├── check_security_updates.py       # distro security errata feed (v1.7+)
+│   ├── check_selinux.py                # SELinux runtime state (v1.7+)
+│   ├── check_modsec_mode.py            # mod_security SecRuleEngine mode (v1.7+)
+│   └── check_livepatch_state.py        # KernelCare/kpatch/Ksplice (v1.7.1+)
 ├── backends/
 │   ├── base.py             # Firewall backend interface (ABC)
 │   ├── factory.py          # Backend registry + instantiation

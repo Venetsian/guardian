@@ -37,16 +37,23 @@ from posture_checks.check_mta_queue import MtaQueueCheck
 from posture_checks.check_worker_saturation import WorkerSaturationCheck
 from posture_checks.check_db_health import DbHealthCheck
 from posture_checks.check_modsec_volume import ModsecVolumeCheck
+from posture_checks.check_security_updates import SecurityUpdatesCheck
+from posture_checks.check_selinux import SelinuxCheck
+from posture_checks.check_modsec_mode import ModsecModeCheck
+from posture_checks.check_livepatch_state import LivepatchStateCheck
 
 ALL_CHECKS = [
     CopyFailCheck,            # CVE-2026-31431 — high-priority current kernel CVE
     PwnKitCheck,              # CVE-2021-4034 — long-known polkit priv-esc
+    SecurityUpdatesCheck,     # generic distro security errata (v1.7+)
+    LivepatchStateCheck,      # KernelCare/kpatch/Ksplice state (v1.7.1+)
     HidePidCheck,             # /proc cross-tenant isolation
     SmartCheck,               # drive health with growth detection
     TmpHygieneCheck,          # /tmp bloat (passive LOW signal)
     SshdConfigCheck,          # sshd auth options
     ListeningPortsCheck,      # listening TCP/UDP inventory
     SuidBaselineCheck,        # new/modified SUID binaries
+    SelinuxCheck,             # SELinux Enforcing/Permissive/Disabled (v1.7+)
     TenantHomePermsCheck,     # /home/<tenant> 0711
     PublicHtmlPermsCheck,     # public_html 0750 + web-server group
     CageFSStateCheck,         # CL CageFS / LVE active
@@ -57,6 +64,7 @@ ALL_CHECKS = [
     WorkerSaturationCheck,    # Apache BusyWorkers / MaxRequestWorkers
     DbHealthCheck,            # MariaDB/MySQL connection + slow + hit-rate
     ModsecVolumeCheck,        # mod_security audit log rotation health
+    ModsecModeCheck,          # mod_security SecRuleEngine mode (v1.7+)
 ]
 
 __all__ = [
