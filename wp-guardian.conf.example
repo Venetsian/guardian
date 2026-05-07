@@ -464,3 +464,62 @@ profile_refresh_seconds = 86400
 #   Auto-detect counts /home tenant directories with public_html / web /
 #   logs subdirs. Override if your layout is non-standard.
 # is_multi_tenant = auto
+
+[tmp_cleanup]
+# Active /tmp janitor (task #122 Part D — companion to the read-only
+# `tmp_hygiene` posture check). v1.6.1 expanded the module to handle
+# directories, dropped the world-readable mode bit requirement (it
+# excluded legitimate operator scratch like *.bak.* files at 0750),
+# added an always-wins SYSTEM excludelist for live system state
+# (/tmp/lshttpd, /tmp/systemd-private-*, X11 sockets, DB unix sockets,
+# etc.), and added top-N-by-size reporting to the digest.
+#
+# A path is a cleanup candidate only when ALL of these match:
+#   * top-level entry of /tmp (no recursion at the candidate level)
+#   * basename does NOT match the SYSTEM excludelist (always denies,
+#     higher precedence than allowlist)
+#   * is NOT itself a mountpoint (defends against systemd PrivateTmp)
+#   * realpath strictly under /tmp/ (no symlink escape)
+#   * owner uid 0 (root)
+#   * mtime older than `age_days`
+#   * basename matches one of `allowlist_patterns`
+#   * file/dir is not currently held open (lsof)
+# For directories, the recursive walker additionally requires every
+# contained file to be uid 0, every symlink to point inside /tmp, and
+# no subdir to be a mountpoint.
+#
+# Default mode = off. Recommended rollout: enable as `dry_run`, watch
+# the daily Telegram digest for ~14 days, then promote to `live`.
+
+# off | dry_run | live
+# off:     module disabled (default — opt-in only).
+# dry_run: scan + log + Telegram digest reports what WOULD be deleted.
+# live:    same as dry_run, plus actually deletes each candidate.
+mode = off
+
+# Files older than this many days are eligible for cleanup.
+age_days = 7
+
+# How often the cleanup runs (seconds). 86400 = daily.
+interval_seconds = 86400
+
+# v1.6.1: include directories as candidates. Operator-dropped scratch
+# (claude-*, *-fresh, restore-*, new-vhosts, node-compile-cache) is
+# almost always directories; turning this off reverts to the v1.6.0
+# files-only behavior for a more conservative posture.
+include_directories = true
+
+# Comma-separated glob patterns matched against entry basenames. A path
+# is only deleted if its name matches at least one pattern AND every
+# other criterion above. v1.6.1 expanded the defaults to cover the
+# operator scratch we observed in production (timestamped *.bak.*
+# files, *-fresh extract dirs, restore-* dirs, language compile caches,
+# Python multiprocessing leftovers).
+allowlist_patterns = *.log, *.bak.*, *.backup.*, body-*, curl-*, *-init.log, claude-*, tmp-*.log, last_resp.json, build-manual-*.log, *-fresh, restore-*, staging-*, new-vhosts, node-compile-cache, python-compile-cache, pip-*-build, pip-tmp-*, pip-build-*, pymp-*, cagefs-init.log
+
+# v1.6.1: hardcoded SYSTEM excludelist always applies (lshttpd*,
+# systemd-private-*, .X11-unix, .ICE-unix, .font-unix, .XIM-unix,
+# tmux-*, mysql.sock, .s.PGSQL.*, .crontab.lock, cagefs.sock, snap-private-*).
+# Use this option to ADD additional patterns to deny on this host —
+# you cannot make the list shorter than the safe baseline.
+additional_excludes =

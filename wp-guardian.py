@@ -354,6 +354,16 @@ class Guardian:
             self.host_profile_detector = None
             self.posture_auditor = None
 
+        # Active /tmp cleanup (v1.6+, task #122 Part D — opt-in, default off)
+        try:
+            from modules.tmp_cleanup import TmpCleanup
+            self.tmp_cleanup = TmpCleanup(
+                self.config, self.db, telegram=self.telegram, hostname=hostname,
+            )
+        except Exception as e:
+            self.logger.error(f"TmpCleanup init failed: {e}")
+            self.tmp_cleanup = None
+
         # Initialize Telegram command handler (after tripwires so we can pass the set)
         self.telegram_cmd = TelegramCommander(
             self.config, self.db, self.blocker, self.whitelist,
@@ -599,6 +609,13 @@ class Guardian:
                         self.posture_auditor.run_if_due()
                     except Exception as e:
                         self.logger.error(f"Posture run error: {e}")
+
+                # Active /tmp cleanup (v1.6+, opt-in via [tmp_cleanup] mode)
+                if self.tmp_cleanup is not None:
+                    try:
+                        self.tmp_cleanup.run_if_due()
+                    except Exception as e:
+                        self.logger.error(f"TmpCleanup run error: {e}")
 
                 time.sleep(1)
 
@@ -1210,6 +1227,12 @@ def main():
     parser.add_argument('--refresh', action='store_true',
                         help='With --posture-profile or --posture-run: re-detect the host profile first')
 
+    # v1.6 — Active /tmp cleanup (task #122 Part D)
+    parser.add_argument('--tmp-cleanup-status', action='store_true',
+                        help='Show /tmp cleanup module status (mode, allowlist, last run)')
+    parser.add_argument('--tmp-cleanup-run', action='store_true',
+                        help='Run /tmp cleanup once now (respects configured mode)')
+
     args = parser.parse_args()
 
     # --- Commands that don't need full Guardian init ---
@@ -1716,6 +1739,43 @@ def main():
             when = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(e['occurred_at']))
             detail = (e['detail'] or '')[:40]
             print(f"  {when:<18s} {e['check_id']:<22s} {e['from_status']:<10s} -> {e['to_status']:<10s} {e['severity']:<10s}  {detail}")
+        print("")
+        return
+
+    if args.tmp_cleanup_status:
+        if not guardian.tmp_cleanup:
+            print("TmpCleanup module not initialized. Check logs for errors.")
+            return
+        print("")
+        print(f"TmpCleanup status on {guardian.tmp_cleanup.hostname}")
+        print("-" * 68)
+        print(f"  {guardian.tmp_cleanup.status_summary()}")
+        print("")
+        return
+
+    if args.tmp_cleanup_run:
+        if not guardian.tmp_cleanup:
+            print("TmpCleanup module not initialized. Check logs for errors.")
+            return
+        if guardian.tmp_cleanup.mode == 'off':
+            print("TmpCleanup mode=off. Set [tmp_cleanup] mode = dry_run (or live) in config first.")
+            return
+        results = guardian.tmp_cleanup.run_now()
+        action = 'would-delete' if results['mode'] == 'dry_run' else 'deleted'
+        print("")
+        print(f"TmpCleanup run on {guardian.tmp_cleanup.hostname} (mode={results['mode']})")
+        print(f"  scanned        : {results['scanned']}")
+        print(f"  {action:<14s} : {results['deleted']}")
+        print(f"  skipped (open) : {results['skipped_open']}")
+        print(f"  errors         : {results['errors']}")
+        print(f"  bytes freed    : {results['bytes_freed']:,}")
+        if results['paths']:
+            print("")
+            print("  paths:")
+            for p in results['paths'][:20]:
+                print(f"    {p['path']}  ({p['size']:,} B, {p['age_days']}d)")
+            if len(results['paths']) > 20:
+                print(f"    +{len(results['paths']) - 20} more")
         print("")
         return
 

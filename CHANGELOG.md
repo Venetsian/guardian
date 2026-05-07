@@ -1,5 +1,249 @@
 # WP-Guardian Changelog
 
+## v1.6.1 — tmp_cleanup module redesign after operational sweep (2026-05-07)
+
+Same-day patch release after the Phase 6 operational sweep on
+srv.dotcom.services revealed the v1.6.0 module would have caught
+roughly none of the actual /tmp bloat on a real production host. The
+operator-dropped artifacts were directories (claude-*, *-fresh,
+restore-*, new-vhosts, node-compile-cache) plus mode-0750 timestamped
+backup files — both excluded by v1.6.0's files-only and world-readable
+gates. v1.6.1 fixes this without compromising the safety story.
+
+### Module behavior changes (`modules/tmp_cleanup.py`)
+
+- **Directory cleanup support.** Top-level `/tmp/<dir>` entries that
+  match the allowlist now qualify, subject to a recursive validator
+  that walks every contained file and rejects the whole tree if ANY
+  file is non-root, ANY symlink targets outside /tmp, ANY subdir is a
+  mountpoint, or the lsof check shows anything open. Single failure
+  short-circuits — no partial deletes inside a candidate dir.
+- **Hardcoded SYSTEM excludelist** that ALWAYS denies, with higher
+  precedence than the allowlist. Initial entries protect: `lshttpd*`
+  (OLS runtime — we observed 886 MB of `/tmp/lshttpd/swap` on srv;
+  delete that and you take the web server down), `systemd-private-*`
+  and `snap-private-*` (PrivateTmp bind-mounts), `.X11-unix`,
+  `.ICE-unix`, `.font-unix`, `.XIM-unix` (X11 sockets), `tmux-*`
+  (tmux server dirs), `mysql.sock` / `mariadb.sock` / `.s.PGSQL.*`
+  (DB unix sockets in /tmp), `.crontab.lock`, `cagefs.sock`. Operator
+  can EXTEND via `[tmp_cleanup] additional_excludes` but cannot make
+  the list shorter than the safe baseline.
+- **Mountpoint check** — `os.path.ismount()` per top-level entry, plus
+  refusal to descend into subdir mountpoints during recursive validation.
+  Defends against any tmpfs-mounted subtree we don't own.
+- **World-readable requirement dropped.** v1.6.0 required mode bit
+  `o+r` as a heuristic for "this was meant to be temp scratch", but it
+  excluded legitimate root-owned scratch like `*.bak.*` files at 0750
+  and the operator's own 0700 dirs. The allowlist + uid-0 + age + lsof
+  remain as the gate; the mode bit added safety theatre, not safety.
+- **Default allowlist expanded** to match what we actually saw in the
+  field: `*.bak.*`, `*.backup.*`, `*-fresh`, `restore-*`, `staging-*`,
+  `new-vhosts`, `node-compile-cache`, `python-compile-cache`,
+  `pip-*-build` / `pip-tmp-*` / `pip-build-*`, `pymp-*` (Python
+  multiprocessing leftover shared-mem dirs), `last_resp.json`,
+  `build-manual-*.log`. Existing patterns retained.
+- **Top-N-by-size reporting.** Every digest now includes a "Largest
+  /tmp entries" section listing the 10 biggest top-level entries
+  regardless of allowlist/age/owner. Pure visibility — surfaces the
+  bloat the module is *correctly not touching* (active runtime dirs)
+  so the operator sees the full picture, not just what got cleaned.
+
+### New config options ([tmp_cleanup])
+
+- `include_directories = true` (default) — set false to revert to
+  v1.6.0 files-only behavior on more conservative hosts.
+- `additional_excludes =` — comma-separated glob patterns; ADDED to
+  the hardcoded SYSTEM excludelist, cannot remove from it.
+
+### Files modified
+
+- `modules/tmp_cleanup.py` — substantial rewrite; same public API
+  (`run_now()`, `run_if_due()`, `status_summary()`)
+- `wp-guardian.conf.example` — expanded `[tmp_cleanup]` section
+- `wp-guardian.conf` — matching changes
+- `VERSION` — 1.6.0 → 1.6.1
+
+### Backwards compat
+
+- Existing operators who already customized `allowlist_patterns` keep
+  exactly their list — the broader defaults only ship to operators who
+  haven't overridden it.
+- `mode = off` default unchanged.
+- Existing config files without `include_directories` or
+  `additional_excludes` get safe defaults (true / empty respectively).
+- The orchestrator wiring in `wp-guardian.py` is unchanged — same
+  `Guardian.tmp_cleanup` attribute, same `run_if_due()` call site.
+
+### What v1.6.1 would have done on srv.dotcom.services
+
+Comparing against the actual operational sweep (Group A: 8 paths;
+Group B: 11 pymp-* dirs):
+- Group A: `claude-0/`, `*-fresh/` extract dirs, `restore-staging/`,
+  `new-vhosts/`, `node-compile-cache/` would all match the new
+  allowlist AND pass dir validation → would be cleaned automatically
+  in `live` mode.
+- Group B: `pymp-*` dirs match the new `pymp-*` allowlist pattern,
+  pass validation (empty or 0-byte content, all uid 0) → cleaned
+  automatically.
+- `/tmp/httpd_config.conf.bak.1777281372` (mode 0750, root) — matches
+  the new `*.bak.*` allowlist, no longer excluded by world-readable
+  requirement → cleaned.
+- `/tmp/lshttpd/`, `/tmp/.X11-unix`, `/tmp/tmux-0` — explicitly
+  protected by SYSTEM excludelist; never touched.
+
+So the same outcome as our manual sweep, but as a recurring scheduled
+task — which is the entire point of the module.
+
+## v1.6.0 — Posture-audit Phases 2–5 + active /tmp cleanup (2026-05-07)
+
+Closes the bulk of task #122. The v1.5.0 update shipped the posture
+foundation plus 4 reference checks; v1.6.0 fills out Phases 2–4 of the
+plan (13 new checks) and adds the active /tmp cleanup module from
+Part D.
+
+### New posture checks (Phase 2 — generic Linux)
+
+- `tmp_hygiene` (LOW, read-only) — count root-owned, world-readable
+  entries in /tmp older than 7 days. Flags > 5 with a sample list.
+  Stores a coarse over/under-threshold bool so day-to-day count wiggle
+  doesn't trip transitions; only the threshold crossing fires an event.
+  Companion to the active `tmp_cleanup` module — useful even on hosts
+  where active cleanup stays disabled.
+- `sshd_config` (MEDIUM, LOW behind perimeter, HIGH on PermitEmptyPasswords)
+  — reads the effective sshd config via `sshd -T`. Reports
+  PermitRootLogin / PasswordAuthentication / PermitEmptyPasswords /
+  PubkeyAuthentication / Port / ListenAddress. Acceptable PermitRootLogin
+  = no | prohibit-password | forced-commands-only AND
+  PasswordAuthentication = no.
+- `listening_ports` (MEDIUM, LOW behind perimeter) — `ss -lntup`
+  inventory of TCP/UDP listeners. Stored value is the deterministic
+  set of (proto, addr, port) tuples so transitions fire only when
+  the listener set CHANGES (process restarts that keep bindings don't).
+- `suid_baseline` (HIGH on additions, MEDIUM otherwise) — self-baselining
+  SUID/SGID drift detector for /usr/{bin,sbin,libexec}, /bin, /sbin,
+  /usr/local/{bin,sbin}. First run captures baseline silently; later
+  runs flag added or modified entries. /usr/libexec is recursed one
+  level deep (sudo/sesh, openssh/ssh-keysign).
+
+### New posture checks (Phase 3 — multi-tenant + CL)
+
+- `tenant_home_perms` (HIGH, multi-tenant only) — every /home/<tenant>/
+  is 0711 with tenant ownership. Stored bad-paths list so transitions
+  fire when the misconfigured set changes.
+- `public_html_perms` (HIGH, multi-tenant only) — every public_html is
+  0750, owner = tenant uid (verified via pwd lookup), group ∈
+  {apache, www-data, httpd, nobody, nogroup, lsws} OR equals the
+  tenant's own group name (OLS extprocessor case).
+- `cagefs_state` (HIGH, CL only; LOW on lvestats-only outage) — kmodlve
+  loaded, /proc/lve/list present, `cagefsctl --status` enabled,
+  lvestats / cagefs-stats service active.
+- `mod_hostinglimits` (HIGH on missing-runtime, MEDIUM on
+  loaded-but-not-on-disk; CL+Apache+multi-tenant only) — Apache
+  module loaded at runtime AND has a LoadModule directive on disk.
+- `apache_vhost_uid` (HIGH; Apache+multi-tenant only) — every vhost with
+  a tenant DocumentRoot has AssignUserID OR SuexecUserGroup OR
+  User+Group in the block. Catches "ghost vhosts" that would silently
+  serve PHP as the system apache uid. Source files enumerated via
+  `httpd -S`.
+
+### New host-health checks (Phase 4)
+
+- `disk_usage` (HIGH ≥85%, MEDIUM ≥75%) — partition list driven by
+  profile (/, /home, /var, plus /var/log when web_server is set, plus
+  /var/lib/mysql when db_server is set). Same-st_dev partitions deduped.
+  Bucketed stored value so daily wiggle doesn't trip transitions.
+- `mta_queue_depth` (HIGH ≥1000, MEDIUM ≥100; postfix only) —
+  `postqueue -p` summary parse. Bucket-stored.
+- `worker_saturation` (HIGH ≥90%, MEDIUM ≥70%; Apache only — OLS
+  reports as soft WARN-LOW pending implementation) — fetches
+  `http://127.0.0.1/server-status?auto`, derives MaxRequestWorkers from
+  Scoreboard length. Single-sample for now.
+- `db_health` (HIGH any-bad, MEDIUM any-medium; mariadb/mysql only) —
+  connection saturation, slow-query rate (cumulative), InnoDB buffer
+  pool hit rate. Auth probe order: `/root/.my.cnf`,
+  `/etc/mysql/debian.cnf`, then unix_socket.
+- `modsec_volume` (HIGH ≥500MB, MEDIUM ≥100MB; has_modsec only) —
+  audit log size as proxy for rotation health. Standard locations
+  scanned across Apache, Apache/Debian, OLS layouts.
+
+### Active /tmp cleanup module (`modules/tmp_cleanup.py`)
+
+Companion *actor* to the read-only `tmp_hygiene` posture check. Daily
+janitor that removes root-owned, world-readable, allowlisted, stale
+files from /tmp. **Default mode = off** — opt-in only; free single-site
+operators may not want guardian touching /tmp at all.
+
+Modes:
+- `off` — disabled.
+- `dry_run` — scan, log, send Telegram digest. No deletes.
+- `live` — scan + lsof + delete; each deletion logged to
+  `posture_events` (check_id=`tmp_cleanup`) for forensics.
+
+Strict deletion criteria — ALL must match:
+- path strictly under /tmp/ (realpath check, no symlink escape)
+- owner uid 0
+- world-readable (mode bit 0o004)
+- mtime older than `age_days` (default 7)
+- basename matches an allowlist glob pattern
+- file is NOT held open (lsof per-candidate; soft-fails to "treat as
+  open" on lsof error so we never delete a file we couldn't verify)
+
+Operators are expected to leave each new host in `dry_run` for ~14
+days, review the digests, then promote to `live` by editing the
+config. The module deliberately does NOT auto-promote — that human
+review step is the whole point of the staged rollout.
+
+### CLI
+
+- `--tmp-cleanup-status` — print mode, allowlist, last-run summary
+- `--tmp-cleanup-run` — run one cleanup pass now (respects configured
+  mode; refuses if mode=off)
+
+### Config
+
+- New `[tmp_cleanup]` section: `mode`, `age_days`, `interval_seconds`,
+  `allowlist_patterns`.
+
+### Files added
+
+- `posture_checks/check_tmp_hygiene.py`
+- `posture_checks/check_sshd_config.py`
+- `posture_checks/check_listening_ports.py`
+- `posture_checks/check_suid_baseline.py`
+- `posture_checks/check_tenant_home_perms.py`
+- `posture_checks/check_public_html_perms.py`
+- `posture_checks/check_cagefs_state.py`
+- `posture_checks/check_mod_hostinglimits.py`
+- `posture_checks/check_apache_vhost_uid.py`
+- `posture_checks/check_disk_usage.py`
+- `posture_checks/check_mta_queue.py`
+- `posture_checks/check_worker_saturation.py`
+- `posture_checks/check_db_health.py`
+- `posture_checks/check_modsec_volume.py`
+- `modules/tmp_cleanup.py`
+
+### Files modified
+
+- `posture_checks/__init__.py` — `ALL_CHECKS` grew from 4 to 18 entries
+- `wp-guardian.py` — TmpCleanup wired into Guardian + main loop;
+  `--tmp-cleanup-status` / `--tmp-cleanup-run` CLI flags
+- `wp-guardian.conf.example` — new `[tmp_cleanup]` section
+- `VERSION` — 1.5.0 → 1.6.0
+- `install.sh` — interactive prompt for `[tmp_cleanup] mode` on install
+
+### Still pending from #122
+
+- Phase 6 — operational /tmp sweep on srv.dotcom.services (operator
+  task; expected workflow is to deploy v1.6.0 with `mode = dry_run`,
+  review the daily digest for ~14 days, then promote to `live`).
+- Cross-tenant read smoke test (active fork+setuid verification on
+  public_html). Out of scope for this release; the perms+ownership
+  check is functionally equivalent absent ACLs and is much simpler
+  to keep correct.
+- Disk-usage growth-rate tracking (+10%/week alert) — needs a
+  separate historical-sample table; deferred.
+- DB slow-query DELTA rate (vs cumulative). Same reason as above.
+
 ## v1.5.0 — Multi-CMS scaffolding & POST-flood detector (2026-05-03)
 
 > **Updated 2026-05-06 (task #122)**: posture-audit + host-health module

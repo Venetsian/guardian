@@ -12,7 +12,8 @@ WP-Guardian monitors web, SMTP, IMAP/POP3, and SSH logs, automatically blocks at
 - **POST-flood detector (v1.5+)** — generic catch-all for admin/auth POST flooding. Watchlist-only (registered admin paths + universal `/login`, `/signin`, `/phpmyadmin/`, etc.) plus a two-stage gate (rate threshold + behavioral confirmation: zero CSS / off-host Referer / uniform Content-Length) so it doesn't false-positive on offices behind shared NAT. Off by default, opt-in per server.
 - **SSH root brute-force rule (v1.5+)** — `ssh_root` rule fires on the first `Failed password for root` attempt by default. Port-agnostic (works on sshd port 22, 69, or anything else).
 - **Smart detection pipeline** — structural tripwires, known webshells, login isolation (CSS-based bot detection), brute force thresholds, PHP scanning detection, author enumeration, 404 storms
-- **Posture audit + host-health module (v1.5+)** — daily read-only scan for security and operational drift. Current checks: **CVE-2026-31431 ("Copy Fail")** kernel local-priv-esc with cmdline-mitigation awareness, **CVE-2021-4034 (PwnKit)** polkit version, `/proc hidepid` cross-tenant isolation, **SMART drive health with growth detection** (alerts on new reallocated/pending/uncorrectable sectors and SSD endurance thresholds — tells you when to plan or expedite drive replacement). More checks added incrementally — SUID drift, sshd config, listening ports, tenant home perms, mod_hostinglimits / mod_lsapi UID switching, CageFS state, disk usage, worker saturation, DB health, modsec volume, MTA queue. Each check declares its applicability against an auto-detected host profile so a free single-site VPS only runs the generic Linux checks while a multi-tenant CL+Apache box gets the full set. Telegram alerts fire on transitions whose severity meets `[posture] alert_severity_min` (default `high`); recoveries silent by default.
+- **Posture audit + host-health module (v1.5+, expanded v1.6)** — daily read-only scan for security and operational drift. **18 checks shipped in v1.6**: kernel CVEs (`kernel_copy_fail` / `pwnkit`); generic Linux (`/proc hidepid`, sshd config, listening ports, SUID drift, /tmp hygiene); multi-tenant + CloudLinux (tenant home perms 0711, public_html 0750, CageFS/LVE state, mod_hostinglimits, Apache vhost UID mapping); host-health (SMART with growth detection, disk usage, MTA queue, Apache worker saturation, DB connection/slow/buffer-pool, mod_security audit-log volume). Each check declares its applicability against an auto-detected host profile so a free single-site VPS only runs the generic Linux checks while a multi-tenant CL+Apache box gets the full set. Telegram alerts fire on transitions whose severity meets `[posture] alert_severity_min` (default `high`); recoveries silent by default.
+- **Active /tmp cleanup module (v1.6+)** — opt-in daily janitor for stale, root-owned, world-readable, allowlisted files in /tmp. Three modes: `off` (default), `dry_run` (scan + log + Telegram digest), `live` (delete + log to `posture_events`). Strict criteria (realpath under /tmp, owner uid 0, mode o+r, age ≥ 7d, allowlist match, lsof-clean). Recommended rollout: enable as `dry_run` for ~14 days, review the digests, promote to `live`.
 - **Credential compromise detection (v1.4+)** — `DistributedAuthDetector` catches the classic distributed credential-abuse botnet pattern (same mailbox authenticating from many countries/ASNs/IPs in a short window), automatically blocks source IPs, and disables the mailbox in the mail backend
 - **GeoIP enrichment (v1.4+)** — every auth event and block is tagged with country, city, ASN, and ASN organization via MaxMind GeoLite2
 - **Three-tier escalation** — 24h block, 30d block, permanent ban with automatic tier advancement
@@ -366,6 +367,7 @@ All of the above is observable from Telegram once `commands_enabled = true`:
 │   ├── cms_registry.py     # Auto-detected vhost → CMS map (v1.5+)
 │   ├── host_profile.py     # Posture-audit host profile detector (v1.5+)
 │   ├── posture.py          # Posture-audit orchestrator (v1.5+)
+│   ├── tmp_cleanup.py      # Active /tmp janitor (v1.6+, opt-in)
 │   ├── mail_backend.py     # MariaDB mailbox-disable integration
 │   └── migrator.py         # Database migration runner
 ├── posture_checks/         # v1.5+ — one posture/health check per file
@@ -374,7 +376,21 @@ All of the above is observable from Telegram once `commands_enabled = true`:
 │   ├── check_copy_fail.py  # CVE-2026-31431 kernel priv-esc (algif_aead)
 │   ├── check_pwnkit.py     # CVE-2021-4034 polkit version (PwnKit)
 │   ├── check_hidepid.py    # /proc hidepid=invisible
-│   └── check_smart.py      # SMART drive health + growth detection
+│   ├── check_smart.py      # SMART drive health + growth detection
+│   ├── check_tmp_hygiene.py            # /tmp bloat (v1.6+)
+│   ├── check_sshd_config.py            # sshd auth options (v1.6+)
+│   ├── check_listening_ports.py        # listening TCP/UDP inventory (v1.6+)
+│   ├── check_suid_baseline.py          # SUID/SGID drift (v1.6+)
+│   ├── check_tenant_home_perms.py      # /home/<tenant> 0711 (v1.6+)
+│   ├── check_public_html_perms.py      # public_html 0750 (v1.6+)
+│   ├── check_cagefs_state.py           # CL CageFS/LVE active (v1.6+)
+│   ├── check_mod_hostinglimits.py      # Apache+CL mod_hostinglimits (v1.6+)
+│   ├── check_apache_vhost_uid.py       # tenant vhost UID assignment (v1.6+)
+│   ├── check_disk_usage.py             # disk usage on key partitions (v1.6+)
+│   ├── check_mta_queue.py              # postfix queue depth (v1.6+)
+│   ├── check_worker_saturation.py      # Apache BusyWorkers / Max (v1.6+)
+│   ├── check_db_health.py              # DB conn / slow / hit rate (v1.6+)
+│   └── check_modsec_volume.py          # mod_security audit volume (v1.6+)
 ├── backends/
 │   ├── base.py             # Firewall backend interface (ABC)
 │   ├── factory.py          # Backend registry + instantiation

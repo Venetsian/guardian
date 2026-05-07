@@ -688,6 +688,16 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
         echo "  can observe FPs before promoting to immediate via /verbosity."
     fi
 
+    # --- /tmp cleanup (v1.6+) ---
+    echo ""
+    echo -e "${BOLD}  /tmp cleanup module (v1.6+)${NC}"
+    echo "  Daily janitor for stale, root-owned, world-readable, allowlisted"
+    echo "  files in /tmp. Off by default. Recommended rollout: enable as"
+    echo "  dry_run, watch the daily Telegram digest for ~14 days, then"
+    echo "  promote to live by editing [tmp_cleanup] mode in wp-guardian.conf."
+    echo "  Choices: off | dry_run | live"
+    TMP_CLEANUP_MODE=$(ask_choice "  /tmp cleanup mode?" "off" "off" "dry_run" "live")
+
     # --- Mail backend (v1.4+) ---
     echo ""
     echo -e "${BOLD}  Mail Backend Integration (v1.4+)${NC}"
@@ -843,6 +853,11 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
     # v1.5 — POST-flood detector
     if [[ "${POST_FLOOD_ENABLED:-false}" == "true" ]]; then
         sed -i "/^\[post_flood\]/,/^\[/ s|^enabled = .*|enabled = true|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+    fi
+
+    # v1.6 — /tmp cleanup
+    if [[ -n "${TMP_CLEANUP_MODE:-}" && "${TMP_CLEANUP_MODE}" != "off" ]]; then
+        sed -i "/^\[tmp_cleanup\]/,/^\[/ s|^mode = .*|mode = ${TMP_CLEANUP_MODE}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
     fi
 
     # v1.4 — Mail backend
