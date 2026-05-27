@@ -1,5 +1,43 @@
 # WP-Guardian Changelog
 
+## v1.7.3 — Log discovery: catch unprefixed `access.log` filename (2026-05-27)
+
+Patch fix for `discover_access_logs()` in `wp-guardian.py`. The discovery
+patterns only matched `/home/*/logs/*.access_log` and
+`/home/*/logs/*.access.log` — names that include a domain prefix. Hosts
+where the per-vhost access log is named simply `access.log` (no prefix)
+were missed entirely.
+
+### Symptom
+
+On `wp.maiahost.com` (OLS, 187 vhosts) and `web.maiahost.com` (Apache,
+13 vhosts), `--discover-logs-save` populated `logfiles.txt` only with
+the global server log (`/usr/local/lsws/logs/access.log` /
+`/var/log/httpd/access_log` etc.). All 179 + 13 per-vhost access logs
+were silently unmonitored — WordPress brute-force, tripwire, login
+isolation and POST-flood detection were inactive on those hosts since
+the original discovery runs on 2026-05-03 and 2026-05-05.
+
+### Fix
+
+Added `/home/*/logs/access.log` to the patterns list. Re-running
+`--discover-logs-save` followed by a daemon restart now picks up the
+per-vhost logs. Existing entries in `logfiles.txt` are preserved
+(merge, not replace).
+
+### Files changed
+
+* `wp-guardian.py` — `discover_access_logs()` patterns + the help text
+  printed when no logs are found.
+
+### Rollout
+
+```bash
+cd /opt/wp-guardian && git pull && \
+  python3 wp-guardian.py --discover-logs-save && \
+  sudo systemctl restart wp-guardian
+```
+
 ## v1.7.2 — Livepatch detection: use tool-state, not systemd is-active (2026-05-07)
 
 Same-day correctness fix on top of v1.7.1. The detection added in

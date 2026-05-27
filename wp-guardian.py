@@ -186,6 +186,7 @@ def discover_access_logs():
     patterns = [
         '/home/*/logs/*.access_log',
         '/home/*/logs/*.access.log',
+        '/home/*/logs/access.log',
         '/var/log/httpd/*access*',
         '/var/log/apache2/*access*',
         '/var/log/nginx/*access*',
@@ -1319,6 +1320,8 @@ def main():
             print("No access logs found on this system.")
             print("Searched patterns:")
             print("  /home/*/logs/*.access_log")
+            print("  /home/*/logs/*.access.log")
+            print("  /home/*/logs/access.log")
             print("  /var/log/httpd/*access*")
             print("  /var/log/apache2/*access*")
             print("  /var/log/nginx/*access*")
