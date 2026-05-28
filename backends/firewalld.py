@@ -3,39 +3,46 @@ WP-Guardian firewalld Backend
 Blocking via firewalld (firewall-cmd) — the default firewall on modern
 RHEL/AlmaLinux/CentOS/Fedora systems and CyberPanel 2.4+.
 
-Uses rich rules for IP-level blocking with per-tier timeouts via
-runtime rules (permanent rules would survive reboots but can't have
-timeouts). Instead, we use --permanent rich rules and reload, relying on
-the database for TTL tracking and periodic cleanup.
+Strategy (v1.7.4+):
+  - Two firewalld-managed ipsets:
+      * wp_guardian_blocked  (hash:ip)  — individual IPs across all tiers
+      * wp_guardian_cidr     (hash:net) — /24 aggregations
+  - One drop rich rule per ipset in the configured zone — every blocked
+    packet matches a single set lookup instead of walking thousands of
+    per-IP rich rules.
+  - Block/unblock = one ``firewall-cmd --ipset --add-entry`` (runtime)
+    plus the same call with ``--permanent`` for reboot persistence.
+    No ``--reload`` on the hot path.
+  - Tier TTLs remain owned by the WP-Guardian database. The daemon's
+    cleanup loop calls ``unblock()`` when an entry expires. We do NOT
+    use per-entry ipset timeouts so behavior matches the other backends.
 
-Strategy:
-  - Tier 1 & 2: Added to an ipset for fast matching + a rich rule to drop
-  - Tier 3:     Same ipset approach, permanent entries
-  - Cleanup:    Daemon periodically removes expired blocks (based on DB tier expiry)
-
-Alternatively (and simpler): use rich rules directly. firewalld handles
-thousands of rules efficiently via nftables backend.
+Operators upgrading from the pre-v1.7.4 rich-rule implementation should
+run ``python3 tools/migrate_firewalld_to_ipset.py`` once after the
+update to fold any existing per-IP rich rules into the new ipsets.
 """
 
 import subprocess
 import logging
-import time
-import os
 
 from backends.base import FirewallBackend
 from modules.config import parse_duration
 
 logger = logging.getLogger('wp-guardian.firewalld')
 
+# ipset names — single source of truth, also used by the migration tool
+IPSET_BLOCKED = 'wp_guardian_blocked'
+IPSET_CIDR = 'wp_guardian_cidr'
+
 
 class FirewalldBackend(FirewallBackend):
-    """Firewall backend using firewalld (firewall-cmd)."""
+    """Firewall backend using firewalld (firewall-cmd) ipsets."""
 
     supports_cidr = True
     supports_friendly_list = False  # No built-in friendly list; use whitelist.conf
 
     def __init__(self, config):
-        # Parse tier durations
+        # Parse tier durations (kept for logging / future use; TTLs owned by DB)
         self.tier1_duration_str = config.get('escalation', 'tier1_duration', fallback='24h')
         self.tier2_duration_str = config.get('escalation', 'tier2_duration', fallback='30d')
         self.tier1_seconds = parse_duration(self.tier1_duration_str)
@@ -102,113 +109,250 @@ class FirewalldBackend(FirewallBackend):
         logger.error(f"firewalld check failed: {stderr}")
         return False
 
-    def _rich_rule(self, ip, action='drop'):
-        """Build a rich rule string for an IP or CIDR."""
-        family = 'ipv4'
-        return (f'rule family="{family}" source address="{ip}" {action}')
+    # ------------------------------------------------------------------
+    # Idempotent treatment of "already exists" / "not found" stderr
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_already_set(out, err):
+        combined = (out + ' ' + err).lower()
+        return (
+            'already' in combined
+            or 'already_enabled' in combined
+            or 'already enabled' in combined
+        )
+
+    @staticmethod
+    def _is_not_set(out, err):
+        combined = (out + ' ' + err).lower()
+        return (
+            'not_enabled' in combined
+            or 'not enabled' in combined
+            or 'not found' in combined
+            or 'no such' in combined
+        )
+
+    # ------------------------------------------------------------------
+    # block / unblock — hot path. No --reload, no --permanent on the
+    # runtime call (we issue --permanent as a separate persistence call).
+    # ------------------------------------------------------------------
+    def _add_entry(self, ipset, entry):
+        """Add an entry to an ipset at runtime + persist via --permanent.
+
+        Returns True if the runtime entry is in place (the daemon's DB
+        is the source of truth for what should be blocked, so a failed
+        --permanent leg is logged but does not poison the runtime
+        success).
+        """
+        # Runtime — immediate effect
+        rt_ok, rt_out, rt_err = self._run_cmd([
+            '--ipset={}'.format(ipset), '--add-entry={}'.format(entry)
+        ])
+        runtime_ok = rt_ok or self._is_already_set(rt_out, rt_err)
+        if not runtime_ok:
+            logger.error(
+                "firewalld ipset add (runtime) failed for {} -> {}: {}".format(
+                    entry, ipset, rt_err
+                )
+            )
+            return False
+
+        # Persistence — survives reboot. Not atomic with the runtime
+        # call; the daemon would re-issue on startup anyway via the DB
+        # if a reboot dropped us.
+        pm_ok, pm_out, pm_err = self._run_cmd([
+            '--permanent', '--ipset={}'.format(ipset), '--add-entry={}'.format(entry)
+        ])
+        if not (pm_ok or self._is_already_set(pm_out, pm_err)):
+            logger.warning(
+                "firewalld ipset add (permanent) failed for {} -> {}: {} "
+                "(runtime entry is in place; reboot may drop it)".format(
+                    entry, ipset, pm_err
+                )
+            )
+
+        return True
+
+    def _remove_entry(self, ipset, entry):
+        """Remove an entry from an ipset at runtime + permanent."""
+        rt_ok, rt_out, rt_err = self._run_cmd([
+            '--ipset={}'.format(ipset), '--remove-entry={}'.format(entry)
+        ])
+        runtime_ok = rt_ok or self._is_not_set(rt_out, rt_err)
+        if not runtime_ok:
+            logger.error(
+                "firewalld ipset remove (runtime) failed for {} from {}: {}".format(
+                    entry, ipset, rt_err
+                )
+            )
+            return False
+
+        pm_ok, pm_out, pm_err = self._run_cmd([
+            '--permanent', '--ipset={}'.format(ipset), '--remove-entry={}'.format(entry)
+        ])
+        if not (pm_ok or self._is_not_set(pm_out, pm_err)):
+            logger.warning(
+                "firewalld ipset remove (permanent) failed for {} from {}: {} "
+                "(runtime entry removed; reboot will resurrect it)".format(
+                    entry, ipset, pm_err
+                )
+            )
+
+        return True
+
+    def _query_entry(self, ipset, entry):
+        """Return True if entry is in ipset (runtime view)."""
+        success, _, _ = self._run_cmd([
+            '--ipset={}'.format(ipset), '--query-entry={}'.format(entry)
+        ])
+        return success
 
     def block(self, ip, tier, reason, service='web'):
-        """Block an IP via firewalld rich rule."""
-        rule = self._rich_rule(ip)
-
-        # Add as permanent rule (survives firewall-cmd --reload)
-        success, stdout, stderr = self._run_cmd([
-            '--permanent', '--zone={}'.format(self.zone),
-            '--add-rich-rule={}'.format(rule)
-        ])
-
-        if not success:
-            combined = (stdout + stderr).lower()
-            if 'already' in combined:
-                logger.debug(f"firewalld: {ip} already blocked")
-                return True
-            logger.error(f"firewalld block failed for {ip}: {stderr}")
-            return False
-
-        # Apply immediately (reload)
-        self._run_cmd(['--reload'])
-
-        logger.info(f"firewalld BLOCKED {ip} tier={tier} reason={reason}")
-        return True
+        """Block an IP by adding it to the wp_guardian_blocked ipset."""
+        ok = self._add_entry(IPSET_BLOCKED, ip)
+        if ok:
+            logger.info(f"firewalld BLOCKED {ip} tier={tier} reason={reason}")
+        return ok
 
     def unblock(self, ip):
-        """Remove an IP from firewalld rich rules."""
-        rule = self._rich_rule(ip)
-
-        success, stdout, stderr = self._run_cmd([
-            '--permanent', '--zone={}'.format(self.zone),
-            '--remove-rich-rule={}'.format(rule)
-        ])
-
-        if success:
-            self._run_cmd(['--reload'])
+        """Remove an IP from the wp_guardian_blocked ipset."""
+        ok = self._remove_entry(IPSET_BLOCKED, ip)
+        if ok:
             logger.info(f"firewalld UNBLOCKED {ip}")
-            return True
-
-        combined = (stdout + stderr).lower()
-        if 'not enabled' in combined or 'not found' in combined:
-            logger.debug(f"firewalld: {ip} was not blocked")
-            return True
-
-        logger.error(f"firewalld unblock failed for {ip}: {stderr}")
-        return False
+        return ok
 
     def is_blocked(self, ip):
-        """Check if IP has a drop rich rule."""
-        rule = self._rich_rule(ip)
-        success, stdout, stderr = self._run_cmd([
-            '--permanent', '--zone={}'.format(self.zone),
-            '--query-rich-rule={}'.format(rule)
-        ])
-        return success
+        """Check whether IP is in wp_guardian_blocked."""
+        return self._query_entry(IPSET_BLOCKED, ip)
 
     def block_cidr(self, subnet, reason, service='web', duration='30d'):
-        """Block a CIDR subnet via firewalld rich rule."""
-        rule = self._rich_rule(subnet)
-
-        success, stdout, stderr = self._run_cmd([
-            '--permanent', '--zone={}'.format(self.zone),
-            '--add-rich-rule={}'.format(rule)
-        ])
-
-        if not success:
-            combined = (stdout + stderr).lower()
-            if 'already' in combined:
-                logger.debug(f"firewalld: {subnet} already blocked")
-                return True
-            logger.error(f"firewalld CIDR block failed for {subnet}: {stderr}")
-            return False
-
-        self._run_cmd(['--reload'])
-        logger.info(f"firewalld CIDR BLOCKED {subnet} reason={reason}")
-        return True
+        """Block a CIDR subnet by adding it to wp_guardian_cidr."""
+        ok = self._add_entry(IPSET_CIDR, subnet)
+        if ok:
+            logger.info(f"firewalld CIDR BLOCKED {subnet} reason={reason}")
+        return ok
 
     def is_cidr_blocked(self, subnet):
-        """Check if a CIDR subnet has a drop rich rule."""
-        rule = self._rich_rule(subnet)
-        success, stdout, stderr = self._run_cmd([
-            '--permanent', '--zone={}'.format(self.zone),
-            '--query-rich-rule={}'.format(rule)
-        ])
-        return success
+        """Check whether subnet is in wp_guardian_cidr."""
+        return self._query_entry(IPSET_CIDR, subnet)
 
     def get_block_counts(self):
-        """Count current rich rules (all counted together since firewalld has no tiers)."""
-        counts = {'total': 0}
+        """Count entries in the two ipsets."""
+        counts = {'ips': 0, 'cidr': 0, 'total': 0}
 
-        success, stdout, stderr = self._run_cmd([
-            '--permanent', '--zone={}'.format(self.zone),
-            '--list-rich-rules'
-        ])
+        for label, ipset in (('ips', IPSET_BLOCKED), ('cidr', IPSET_CIDR)):
+            success, stdout, _ = self._run_cmd([
+                '--ipset={}'.format(ipset), '--get-entries'
+            ])
+            if success and stdout:
+                counts[label] = sum(1 for line in stdout.splitlines() if line.strip())
 
-        if success and stdout:
-            for line in stdout.split('\n'):
-                line = line.strip()
-                if line and 'drop' in line:
-                    counts['total'] += 1
-
+        counts['total'] = counts['ips'] + counts['cidr']
         return counts
 
+    # ------------------------------------------------------------------
+    # ensure_firewall_rules — idempotent startup setup
+    # ------------------------------------------------------------------
+    def _permanent_ipsets(self):
+        """Return the list of ipset names defined permanently."""
+        success, stdout, _ = self._run_cmd(['--permanent', '--get-ipsets'])
+        if not success or not stdout:
+            return []
+        return stdout.split()
+
+    def _permanent_rich_rules(self):
+        """Return the list of permanent rich rules in self.zone."""
+        success, stdout, _ = self._run_cmd([
+            '--permanent', '--zone={}'.format(self.zone), '--list-rich-rules'
+        ])
+        if not success or not stdout:
+            return []
+        return [line.strip() for line in stdout.splitlines() if line.strip()]
+
+    def _ensure_ipset(self, name, ipset_type):
+        """Create a permanent ipset of the given type if it does not exist.
+
+        Returns True if anything was created (so caller knows a reload
+        is needed).
+        """
+        if name in self._permanent_ipsets():
+            return False
+
+        ok, _, err = self._run_cmd([
+            '--permanent',
+            '--new-ipset={}'.format(name),
+            '--type={}'.format(ipset_type),
+            '--option=family=inet',
+            '--option=hashsize=4096',
+            '--option=maxelem=131072',
+        ])
+        if not ok:
+            logger.error(
+                "Failed to create firewalld ipset {} (type={}): {}".format(
+                    name, ipset_type, err
+                )
+            )
+            return False
+
+        logger.info("Created firewalld ipset {} type={}".format(name, ipset_type))
+        return True
+
+    def _ensure_drop_rule(self, ipset):
+        """Ensure a permanent drop rich rule referencing the given ipset.
+
+        Returns True if a rule was added (caller should reload).
+        """
+        rule = 'rule source ipset="{}" drop'.format(ipset)
+
+        # --query-rich-rule returns 0 when present, 1 otherwise.
+        present, _, _ = self._run_cmd([
+            '--permanent', '--zone={}'.format(self.zone),
+            '--query-rich-rule={}'.format(rule),
+        ])
+        if present:
+            return False
+
+        ok, _, err = self._run_cmd([
+            '--permanent', '--zone={}'.format(self.zone),
+            '--add-rich-rule={}'.format(rule),
+        ])
+        if not ok:
+            logger.error(
+                "Failed to add drop rich rule for ipset {} in zone {}: {}".format(
+                    ipset, self.zone, err
+                )
+            )
+            return False
+
+        logger.info("Added drop rich rule for ipset {} in zone {}".format(ipset, self.zone))
+        return True
+
     def ensure_firewall_rules(self):
-        """firewalld manages rules via zones — nothing extra to set up."""
-        logger.info(f"firewalld backend using zone: {self.zone}")
+        """Create the two ipsets and the two drop rich rules if missing.
+
+        Reloads firewalld once at the end *only if* anything was
+        actually changed. A healthy steady-state startup performs four
+        idempotent queries and no reload.
+        """
+        changed = False
+        changed |= self._ensure_ipset(IPSET_BLOCKED, 'hash:ip')
+        changed |= self._ensure_ipset(IPSET_CIDR, 'hash:net')
+        # Rich rules can only reference ipsets that already exist in the
+        # runtime config — reload now if we created any.
+        if changed:
+            ok, _, err = self._run_cmd(['--reload'])
+            if not ok:
+                logger.error("firewall-cmd --reload failed after ipset creation: {}".format(err))
+
+        rule_changed = False
+        rule_changed |= self._ensure_drop_rule(IPSET_BLOCKED)
+        rule_changed |= self._ensure_drop_rule(IPSET_CIDR)
+        if rule_changed:
+            ok, _, err = self._run_cmd(['--reload'])
+            if not ok:
+                logger.error("firewall-cmd --reload failed after rich-rule add: {}".format(err))
+
+        logger.info(
+            "firewalld backend ready: zone={} ipsets={},{}".format(
+                self.zone, IPSET_BLOCKED, IPSET_CIDR
+            )
+        )

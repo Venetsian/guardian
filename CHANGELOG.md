@@ -1,5 +1,86 @@
 # WP-Guardian Changelog
 
+## v1.7.4 — firewalld backend: native ipsets, no `--reload` on hot path (2026-05-28)
+
+The firewalld backend used to add one permanent `rule family="ipv4"
+source address="<ip>" drop` per blocked IP and then run
+`firewall-cmd --reload` on every single block. On `wp.maiahost.com` that
+list had grown to **1,097 rich rules**, every dropped packet walked the
+entire `ip saddr` comparison chain in nftables, and each new block cost
+a full firewalld reload (D-Bus churn + a momentary packet-filter
+flush).
+
+### Refactor
+
+The backend now mirrors the design already in place in
+`backends/nftables.py`:
+
+* Two firewalld-managed ipsets:
+  * `wp_guardian_blocked` — `hash:ip`, family `inet`, individual IPs
+    (tier 1 / 2 / 3).
+  * `wp_guardian_cidr` — `hash:net`, family `inet`, /24 aggregations.
+* One drop rich rule per ipset in the configured zone — every blocked
+  packet matches a single set lookup.
+* `block()` / `unblock()` / `is_blocked()` / `block_cidr()` /
+  `is_cidr_blocked()` are now single `firewall-cmd --ipset` calls
+  (runtime + `--permanent` for reboot persistence). **No `--reload` on
+  the hot path.**
+* `ensure_firewall_rules()` is idempotent: a healthy steady-state
+  startup does four queries and no reload at all. Reloads only happen
+  when something was actually created.
+* `get_block_counts()` returns `{ips, cidr, total}` from
+  `--get-entries` instead of walking the rich-rule list.
+
+### Migration tool
+
+```bash
+sudo python3 /opt/wp-guardian/tools/migrate_firewalld_to_ipset.py --dry-run
+sudo python3 /opt/wp-guardian/tools/migrate_firewalld_to_ipset.py
+```
+
+Folds existing legacy rich rules into the new ipsets. Stops the
+daemon, ensures the ipsets and ipset-referencing rich rules exist,
+imports each legacy `rule family="ipv4" source address="<addr>" drop`
+into `wp_guardian_blocked` (or `wp_guardian_cidr` if `<addr>` carries
+a prefix), removes the legacy rule, performs a single
+`firewall-cmd --reload`, and restarts the daemon. Idempotent — safe to
+re-run.
+
+### Behaviour preserved
+
+* Tier TTLs remain owned by the WP-Guardian database / cleanup loop.
+  We deliberately do NOT use ipset per-entry timeouts; the other
+  backends behave the same way and the daemon already knows how to
+  expire blocks.
+* `FirewalldBackend` public method signatures, `supports_cidr = True`,
+  and `supports_friendly_list = False` are unchanged — `factory.py`
+  and the Blocker module need no changes.
+* No config changes required. `[firewalld] zone` still controls which
+  zone the drop rich rules are added to.
+* IPv4-only, same as before.
+
+### Files changed
+
+* `backends/firewalld.py` — full rewrite.
+* `tools/migrate_firewalld_to_ipset.py` — new one-shot migration tool.
+* `VERSION` — bumped to 1.7.4.
+
+### Rollout
+
+```bash
+cd /opt/wp-guardian && git pull && sudo bash update.sh
+sudo python3 tools/migrate_firewalld_to_ipset.py --dry-run
+sudo python3 tools/migrate_firewalld_to_ipset.py
+```
+
+Verify on the host:
+
+```bash
+firewall-cmd --permanent --get-ipsets        # wp_guardian_blocked wp_guardian_cidr
+firewall-cmd --zone=public --list-rich-rules # 2 lines, both ipset-referencing
+nft list ruleset | wc -l                     # collapsed from ~1,595 to ~500
+```
+
 ## v1.7.3 — Log discovery: catch unprefixed `access.log` filename (2026-05-27)
 
 Patch fix for `discover_access_logs()` in `wp-guardian.py`. The discovery
