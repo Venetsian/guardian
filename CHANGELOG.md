@@ -1,5 +1,58 @@
 # WP-Guardian Changelog
 
+## v1.7.5 — update.sh preflight: check the full requirements.txt (2026-05-28)
+
+Hardens the `update.sh` Python-dependency preflight after a real-world
+incident on `srv.dotcom.services`: a post-reinstall server had been
+running for 21 days with `geoip2` (and several other modules) missing,
+because the pre-v1.7.5 preflight only checked dependencies for features
+*currently enabled* in `wp-guardian.conf`. With `[geoip] enabled = false`
+in the live config, `geoip2` was never imported by the preflight and
+the gap stayed invisible — until the operator flipped the switch.
+
+### What changed
+
+`update.sh`'s "Checking Python dependencies" step now:
+
+* Parses the full `requirements.txt` (strips version specs, markers,
+  extras) and maps PyPI package names to import names via a
+  `PKG_TO_MODULE` table (e.g. `PyMySQL` → `pymysql`).
+* Tries to import every entry, regardless of which features are
+  currently toggled on.
+* For each missing module, surfaces a `feature label — consequence`
+  line via a `CONSEQUENCES` map so the operator knows what they lose
+  if they decline to install. New entries in `requirements.txt` should
+  add a `CONSEQUENCES` row at the same time.
+* The post-install re-check uses the same full-requirements-txt
+  approach (no more feature-gated re-verify that would falsely report
+  "OK" if the new dep was for a disabled feature).
+
+### Caveats / out of scope
+
+* This only catches the gap when `update.sh` actually runs. Operators
+  who do `git pull && systemctl restart wp-guardian` directly still
+  bypass the preflight. A follow-up could move an equivalent check to
+  daemon startup, but that's a wp-guardian.py change and lives outside
+  this patch.
+* The `CONSEQUENCES` map in `update.sh` must be kept in sync with
+  `requirements.txt`. If you add a new dependency without updating
+  `CONSEQUENCES`, the preflight still flags it as missing, just with a
+  generic "feature using this module will fail at runtime" message.
+
+### Files changed
+
+* `update.sh` — preflight rewrite (full requirements.txt scan + recheck).
+* `VERSION` — bumped to 1.7.5.
+
+### Rollout
+
+```bash
+cd /opt/wp-guardian && git pull && sudo bash update.sh
+```
+
+No config changes required. No daemon restart required (this is a
+build-tooling fix).
+
 ## v1.7.4 — firewalld backend: native ipsets, no `--reload` on hot path (2026-05-28)
 
 The firewalld backend used to add one permanent `rule family="ipv4"

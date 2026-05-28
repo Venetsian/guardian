@@ -337,7 +337,7 @@ if [[ "$CURRENT_VERSION" == "$NEW_VERSION" ]]; then
 fi
 
 # ===========================================================================
-# Preflight: Check optional Python dependencies for enabled features
+# Preflight: Check Python dependencies from requirements.txt
 # ===========================================================================
 # Runs BEFORE any backup/file copy/migration, so if deps are missing and the
 # operator aborts, the install is untouched. If the operator accepts and
@@ -345,46 +345,67 @@ fi
 # half-working updates where a feature is enabled in config but its
 # Python dep is missing (e.g. geoip2 → DistributedAuthDetector country rules
 # never fire because GeoIPResolver fails safe to None).
-print_step "Checking optional Python dependencies..."
+#
+# v1.7.5+: check the FULL requirements.txt regardless of which features are
+# currently enabled in wp-guardian.conf. The previous feature-gated approach
+# missed deps for disabled-but-still-installable features — flipping
+# `[geoip] enabled = true` after the fact would surface the missing module as
+# a runtime warning long after update.sh had passed. Checking everything
+# unconditionally catches the dep gap at update time, no matter which
+# features are toggled on later.
+print_step "Checking Python dependencies (requirements.txt)..."
+
+REQ_FILE="${SOURCE_DIR}/requirements.txt"
+if [[ ! -f "$REQ_FILE" ]]; then
+    REQ_FILE="${INSTALL_DIR}/requirements.txt"
+fi
 
 DEP_CHECK=""
-if [[ -f "${INSTALL_DIR}/wp-guardian.conf" ]]; then
+if [[ -f "$REQ_FILE" ]]; then
     DEP_CHECK=$(python3 -c "
-import sys, os
-sys.path.insert(0, '${INSTALL_DIR}')
+import sys, re, importlib
+
+# PyPI package name -> Python import module name (when they differ).
+# Used so 'PyMySQL>=1.0.0' in requirements.txt gets checked via 'import pymysql'.
+PKG_TO_MODULE = {
+    'pymysql': 'pymysql',
+    'requests': 'requests',
+    'geoip2': 'geoip2',
+}
+
+# Map import module -> (feature label, user-visible consequence if missing)
+# When a NEW dependency is added to requirements.txt, add an entry here so
+# the operator gets a meaningful 'why does this matter' line.
+CONSEQUENCES = {
+    'requests': ('Telegram alerts + pfSense backend', 'no alerts, no /verbosity commands, pfSense backend unusable'),
+    'geoip2':   ('GeoIP (compromise detection)',      'country/ASN detection silently disabled; DistributedAuthDetector rules will never fire'),
+    'pymysql':  ('Mail backend (mailbox disable)',    'mailbox disable/enable will fail when CompromiseAction tries to act'),
+}
+
+req_path = '${REQ_FILE}'
+missing = []
 try:
-    from modules.config import load_config
-    config = load_config('${INSTALL_DIR}/wp-guardian.conf')
+    with open(req_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            # Strip version specs / markers / extras: 'PyMySQL>=1.0.0; py' -> 'pymysql'
+            pkg_name = re.split(r'[<>=!~;\\[\\s]', line, 1)[0].strip().lower()
+            if not pkg_name:
+                continue
+            module_name = PKG_TO_MODULE.get(pkg_name, pkg_name)
+            try:
+                importlib.import_module(module_name)
+            except ImportError:
+                feature, why = CONSEQUENCES.get(module_name, (pkg_name, 'feature using this module will fail at runtime'))
+                missing.append('{m}|{f} — {w}'.format(m=module_name, f=feature, w=why))
 except Exception as e:
-    print('ERROR:config load failed: {e}'.format(e=e))
+    print('ERROR:could not read requirements: {e}'.format(e=e))
     sys.exit(0)
 
-warnings = []
-
-# PyMySQL — required for [mail_backend] type != none
-mb_type = config.get('mail_backend', 'type', fallback='none').strip().lower()
-if mb_type and mb_type != 'none':
-    try:
-        import pymysql  # noqa: F401
-    except ImportError:
-        warnings.append('PyMySQL|[mail_backend] type={t} — mailbox disable/enable will fail'.format(t=mb_type))
-
-# geoip2 — required for [geoip] enabled=true
-if config.get('geoip', 'enabled', fallback='false').strip().lower() == 'true':
-    try:
-        import geoip2  # noqa: F401
-    except ImportError:
-        warnings.append('geoip2|[geoip] enabled=true — country/ASN detection silently disabled; DistributedAuthDetector rules will never fire')
-
-# requests — required for [telegram] enabled=true
-if config.get('telegram', 'enabled', fallback='false').strip().lower() == 'true':
-    try:
-        import requests  # noqa: F401
-    except ImportError:
-        warnings.append('requests|[telegram] enabled=true — no alerts, no /verbosity commands')
-
-if warnings:
-    print('MISSING:' + '\n'.join(warnings))
+if missing:
+    print('MISSING:' + '\n'.join(missing))
 else:
     print('OK')
 " 2>/dev/null || echo "ERROR:python check crashed")
@@ -402,12 +423,13 @@ elif [[ -z "$DEP_CHECK" || ( "$DEP_CHECK" != "OK" && "$DEP_CHECK" != MISSING:* )
 elif [[ "$DEP_CHECK" == MISSING:* ]]; then
     echo ""
     echo -e "${RED}${BOLD}============================================${NC}"
-    echo -e "${RED}${BOLD}  MISSING REQUIRED DEPENDENCIES${NC}"
+    echo -e "${RED}${BOLD}  MISSING PYTHON DEPENDENCIES${NC}"
     echo -e "${RED}${BOLD}============================================${NC}"
     echo ""
-    echo "  The live config has features enabled that need Python modules"
-    echo "  which are not installed. Continuing as-is would leave those"
-    echo "  features silently broken:"
+    echo "  Python modules listed in requirements.txt are not installed."
+    echo "  These cover both currently-enabled and future-enableable features"
+    echo "  — installing them now avoids silent breakage the moment a feature"
+    echo "  is toggled on:"
     echo ""
     DEPS_LIST="${DEP_CHECK#MISSING:}"
     while IFS='|' read -r pkg reason; do
@@ -421,14 +443,9 @@ elif [[ "$DEP_CHECK" == MISSING:* ]]; then
     # fail visibly than to let an automated caller skip silently.
     if [[ ! -t 0 ]]; then
         print_err "Non-interactive run with missing dependencies — aborting."
-        echo "    Install with: pip3 install -r ${SOURCE_DIR}/requirements.txt --break-system-packages"
-        echo "    Or set features to disabled in ${INSTALL_DIR}/wp-guardian.conf."
+        echo "    Install with: pip3 install -r ${REQ_FILE} --break-system-packages"
+        echo "    Or remove the package from requirements.txt if you do not need it."
         exit 1
-    fi
-
-    REQ_FILE="${SOURCE_DIR}/requirements.txt"
-    if [[ ! -f "$REQ_FILE" ]]; then
-        REQ_FILE="${INSTALL_DIR}/requirements.txt"
     fi
 
     if [[ -f "$REQ_FILE" ]] && ask_yn "  Install missing dependencies now (pip3 install -r requirements.txt)?" "y"; then
@@ -444,21 +461,22 @@ elif [[ "$DEP_CHECK" == MISSING:* ]]; then
                 echo ""
                 print_ok "Dependencies installed — re-checking..."
                 RECHECK=$(python3 -c "
-import sys
-sys.path.insert(0, '${INSTALL_DIR}')
-from modules.config import load_config
-config = load_config('${INSTALL_DIR}/wp-guardian.conf')
+import re, importlib
+PKG_TO_MODULE = {'pymysql': 'pymysql', 'requests': 'requests', 'geoip2': 'geoip2'}
 still_missing = []
-mb_type = config.get('mail_backend', 'type', fallback='none').strip().lower()
-if mb_type and mb_type != 'none':
-    try: import pymysql
-    except ImportError: still_missing.append('PyMySQL')
-if config.get('geoip', 'enabled', fallback='false').strip().lower() == 'true':
-    try: import geoip2
-    except ImportError: still_missing.append('geoip2')
-if config.get('telegram', 'enabled', fallback='false').strip().lower() == 'true':
-    try: import requests
-    except ImportError: still_missing.append('requests')
+with open('${REQ_FILE}', 'r') as f:
+    for line in f:
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        pkg = re.split(r'[<>=!~;\\[\\s]', line, 1)[0].strip().lower()
+        if not pkg:
+            continue
+        mod = PKG_TO_MODULE.get(pkg, pkg)
+        try:
+            importlib.import_module(mod)
+        except ImportError:
+            still_missing.append(mod)
 print('|'.join(still_missing) if still_missing else 'OK')
 " 2>/dev/null)
                 if [[ "$RECHECK" == "OK" ]]; then
