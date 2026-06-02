@@ -392,7 +392,7 @@ All of the above is observable from Telegram once `commands_enabled = true`:
 │   ├── check_public_html_perms.py      # public_html 0750 (v1.6+)
 │   ├── check_cagefs_state.py           # CL CageFS/LVE active (v1.6+)
 │   ├── check_mod_hostinglimits.py      # Apache+CL mod_hostinglimits (v1.6+)
-│   ├── check_apache_vhost_uid.py       # tenant vhost UID assignment (v1.6+)
+│   ├── check_apache_vhost_uid.py       # tenant vhost PHP uid: Apache directive / per-user FPM / suEXEC (v1.6+, FPM-aware v1.7.6)
 │   ├── check_disk_usage.py             # disk usage on key partitions (v1.6+)
 │   ├── check_mta_queue.py              # postfix queue depth (v1.6+)
 │   ├── check_worker_saturation.py      # Apache BusyWorkers / Max (v1.6+)

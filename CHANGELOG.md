@@ -1,5 +1,76 @@
 # WP-Guardian Changelog
 
+## v1.7.6 — apache_vhost_uid: recognize per-user PHP-FPM / suEXEC isolation (2026-06-02)
+
+The `apache_vhost_uid` posture check previously recognized only the three
+Apache-*native* per-tenant uid directives — `AssignUserID` (mod_ruid2 /
+mod_hostinglimits), `SuexecUserGroup` (mod_suexec), and `User`+`Group`
+(mpm_itk). On a host that pins the tenant uid in the **PHP-FPM pool** (or
+via **mod_lsapi / suEXEC CGI**) rather than in the vhost, none of those
+directives appear — so the check failed *every* tenant vhost and reported
+"would run PHP as system apache". Real example: `web.maiahost.com`
+(Apache + CloudLinux alt-php-fpm) raised a HIGH posture-drift alert for
+**186 of 186** vhosts even though all of them route PHP to per-user FPM
+sockets. A 100%-of-vhosts failure was the signature of an architecture
+mismatch, not 186 misconfigurations.
+
+### What changed
+
+`posture_checks/check_apache_vhost_uid.py` now resolves each tenant
+vhost's actual **PHP-execution identity** instead of looking only for the
+three Apache directives. A vhost counts as correctly isolated if it uses
+ANY of:
+
+* an Apache-native uid directive (as before), OR
+* a **per-user PHP-FPM** handler — `SetHandler "proxy:unix:/…/<user>.sock|fcgi://…"`
+  or `ProxyPassMatch … unix:/…/<user>.sock` — whose socket resolves to a
+  real, non-shared local user, OR
+* a **mod_lsapi / suEXEC CGI** handler (`application/x-httpd-php<NN>-cgi`,
+  `lsphp`, `lsapi`, `fcgid`), which runs as the file owner, OR
+* `SetHandler none` (PHP disabled for that vhost).
+
+It now FAILs (HIGH) only the genuinely dangerous cases — PHP wired to a
+**shared pool**: a TCP `fcgi://host:port`, a shared socket (`www.sock`),
+a socket that resolves to `apache`/`nobody`, or plain mod_php
+(`application/x-httpd-php` with no per-user suffix).
+
+A vhost with **no detectable PHP wiring at all** (it would fall through to
+a server-global handler the vhost can't reveal) is now a softer **WARN**
+(MEDIUM), and only when the host otherwise uses per-vhost handlers — so a
+single copy-pasted "ghost vhost" still stands out, while hosts that pin
+the uid globally (e.g. global mod_ruid2) stay quiet instead of getting a
+false HIGH on every site.
+
+Evaluation is now **per source file** (one tenant site per `*.conf` on
+the common stacks), so a site's `:80` redirect stub no longer masks the
+`:443` block's per-user handler.
+
+Verified against live `httpd -S` on `web.maiahost.com`: the same 186
+vhost blocks now resolve to 93 tenant sites (90 per-user FPM, 2
+suEXEC/lsapi, 1 php-disabled) → **0 risk / 0 unwired → PASS**.
+
+### Behavior change
+
+* The check's `value` payload changed shape (`tenant_site_count`,
+  `mechanisms`, `risk_sites`, `unwired_sites` replace the old
+  `ghost_vhosts`). The first run after upgrade records one posture-state
+  re-baseline transition; no action needed.
+* Hosts with a genuine shared-apache vhost still FAIL HIGH as before.
+
+### Files changed
+
+* `posture_checks/check_apache_vhost_uid.py` — FPM/lsapi-aware rewrite.
+* `VERSION` — bumped to 1.7.6.
+
+### Rollout
+
+```bash
+cd /opt/wp-guardian && git pull && sudo bash update.sh
+```
+
+No config changes required. The check re-evaluates on the next posture
+audit cycle (restart the daemon to re-run immediately).
+
 ## v1.7.5 — update.sh preflight: check the full requirements.txt (2026-05-28)
 
 Hardens the `update.sh` Python-dependency preflight after a real-world
