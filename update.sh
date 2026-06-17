@@ -535,6 +535,165 @@ else
 fi
 
 # ===========================================================================
+# Preflight: System (OS-package) dependencies (v1.7.7+)
+# ---------------------------------------------------------------------------
+# Mirrors the Python/pip check above, but for OS packages — binaries installed
+# via dnf/yum/apt rather than pip. The SYSTEM_DEPS table inside the Python
+# snippet is the single source of truth: each entry declares the binary to look
+# for, its package name per manager, whether it's required (fatal) or optional,
+# the config condition under which it applies, and the consequence if missing.
+# Add a future system dep there — no bash changes needed.
+#
+# First entry: conntrack (conntrack-tools). firewalld accepts already-established
+# connections before our drop rule, so without it a block only stops NEW
+# connections; keep-alive floods keep flowing until they close. Non-fatal.
+# ===========================================================================
+print_step "Checking system dependencies (OS packages)..."
+
+# Detect the package manager once — passed to the Python check so it can name
+# the right package, and used to build the install command.
+PKG_MGR=""; PKG_INSTALL=""
+if command -v dnf &>/dev/null; then
+    PKG_MGR="dnf"; PKG_INSTALL="dnf install -y"
+elif command -v yum &>/dev/null; then
+    PKG_MGR="yum"; PKG_INSTALL="yum install -y"
+elif command -v apt-get &>/dev/null; then
+    PKG_MGR="apt"; PKG_INSTALL="apt-get install -y"
+fi
+
+SYS_CHECK=$(CONF_FILE="${INSTALL_DIR}/wp-guardian.conf" PKG_MGR="$PKG_MGR" python3 - <<'PYEOF' 2>/dev/null || echo "ERROR:python check crashed"
+import os, shutil, configparser
+
+conf_file = os.environ.get('CONF_FILE', '')
+pkg_mgr = os.environ.get('PKG_MGR', '')
+
+cp = configparser.ConfigParser(strict=False, interpolation=None)
+try:
+    if conf_file:
+        cp.read(conf_file)
+except Exception:
+    pass
+
+def backend():
+    return cp.get('firewall', 'backend', fallback='csf').strip().lower()
+
+def getbool(section, option, default):
+    try:
+        return cp.getboolean(section, option, fallback=default)
+    except Exception:
+        return default
+
+# ---- SYSTEM_DEPS: add future OS-package dependencies here ------------------
+# binary   : command to look for on PATH (via shutil.which)
+# packages : package name per manager; 'default' used if the manager is unknown
+# fatal    : True  -> missing aborts the update (like a missing pip dep)
+#            False -> missing only warns; the update continues
+# feature  : short label of what it powers
+# why      : user-visible consequence if it is missing
+# applies  : callable -> True when this dep is needed given the live config
+SYSTEM_DEPS = [
+    {
+        'binary':   'conntrack',
+        'packages': {'dnf': 'conntrack-tools', 'yum': 'conntrack-tools',
+                     'apt': 'conntrack', 'default': 'conntrack-tools'},
+        'fatal':    False,
+        'feature':  'Live-connection teardown on block (firewalld/nftables)',
+        'why':      ('blocks only stop NEW connections; an attacker on HTTP '
+                     'keep-alive keeps flooding until its connections close'),
+        'applies':  lambda: backend() in ('firewalld', 'nftables')
+                            and getbool('firewall', 'flush_conntrack', True),
+    },
+]
+# ---------------------------------------------------------------------------
+
+missing = []
+for dep in SYSTEM_DEPS:
+    try:
+        if not dep['applies']():
+            continue
+    except Exception:
+        continue
+    if shutil.which(dep['binary']):
+        continue
+    pkg = dep['packages'].get(pkg_mgr) or dep['packages'].get('default') or dep['binary']
+    missing.append('{b}|{p}|{fatal}|{f} — {w}'.format(
+        b=dep['binary'], p=pkg,
+        fatal='1' if dep['fatal'] else '0',
+        f=dep['feature'], w=dep['why']))
+
+print('MISSING:' + '\n'.join(missing) if missing else 'OK')
+PYEOF
+)
+
+if [[ "$SYS_CHECK" == ERROR:* ]]; then
+    print_warn "Could not verify system dependencies: ${SYS_CHECK#ERROR:}"
+    echo "    Continuing — these are checked again on your next update."
+    echo ""
+elif [[ -z "$SYS_CHECK" || ( "$SYS_CHECK" != "OK" && "$SYS_CHECK" != MISSING:* ) ]]; then
+    print_warn "System-dep check returned unexpected output — skipping gate."
+    echo ""
+elif [[ "$SYS_CHECK" == MISSING:* ]]; then
+    SYS_LIST="${SYS_CHECK#MISSING:}"
+    SYS_PKGS=""; SYS_HAS_FATAL=0
+    echo ""
+    echo -e "${YELLOW}${BOLD}  MISSING SYSTEM PACKAGES${NC}"
+    echo ""
+    while IFS='|' read -r s_bin s_pkg s_fatal s_desc; do
+        [[ -z "$s_bin" ]] && continue
+        if [[ "$s_fatal" == "1" ]]; then
+            echo -e "    ${RED}•${NC} ${BOLD}${s_bin}${NC} → ${s_pkg}  ${RED}(required)${NC}"
+            SYS_HAS_FATAL=1
+        else
+            echo -e "    ${YELLOW}•${NC} ${BOLD}${s_bin}${NC} → ${s_pkg}"
+        fi
+        echo "      ${s_desc}"
+        SYS_PKGS="${SYS_PKGS} ${s_pkg}"
+    done <<< "$SYS_LIST"
+    SYS_PKGS="$(echo "$SYS_PKGS" | xargs)"  # collapse/trim whitespace
+    echo ""
+
+    if [[ ! -t 0 ]]; then
+        # Non-interactive: abort only when a REQUIRED package is missing.
+        if [[ "$SYS_HAS_FATAL" == "1" ]]; then
+            print_err "Non-interactive run missing REQUIRED system packages — aborting."
+            [[ -n "$PKG_INSTALL" ]] && echo "    Install with: ${PKG_INSTALL} ${SYS_PKGS}"
+            exit 1
+        fi
+        print_warn "Continuing (non-interactive). Install later: ${PKG_INSTALL:-<pkg manager>} ${SYS_PKGS}"
+        echo ""
+    elif [[ -n "$PKG_INSTALL" ]] && ask_yn "  Install missing system packages now (${PKG_INSTALL} ${SYS_PKGS})?" "y"; then
+        print_step "Running: ${PKG_INSTALL} ${SYS_PKGS}"
+        # Word-split intended: PKG_INSTALL is a command, SYS_PKGS a token list.
+        if $PKG_INSTALL $SYS_PKGS; then
+            print_ok "System packages installed"
+        else
+            print_warn "Install failed — run manually later: ${PKG_INSTALL} ${SYS_PKGS}"
+            if [[ "$SYS_HAS_FATAL" == "1" ]] && ! ask_yn "  Continue update with REQUIRED packages missing?" "n"; then
+                print_err "Update aborted. Nothing has been changed."
+                exit 1
+            fi
+        fi
+        echo ""
+    else
+        # Declined, or no supported package manager detected.
+        [[ -z "$PKG_INSTALL" ]] && print_warn "No supported package manager detected — install manually: ${SYS_PKGS}"
+        if [[ "$SYS_HAS_FATAL" == "1" ]]; then
+            if ! ask_yn "  Continue update with REQUIRED packages missing?" "n"; then
+                print_err "Update aborted. Nothing has been changed."
+                exit 1
+            fi
+            print_warn "Proceeding with required packages missing."
+        else
+            print_warn "Skipped — features needing these stay degraded until installed."
+        fi
+        echo ""
+    fi
+else
+    print_ok "System dependencies present"
+    echo ""
+fi
+
+# ===========================================================================
 # Step 1: Create backup
 # ===========================================================================
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)

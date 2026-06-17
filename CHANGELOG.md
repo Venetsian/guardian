@@ -1,5 +1,158 @@
 # WP-Guardian Changelog
 
+## v1.7.8 — manual block command (`/block` + `--block`) (2026-06-17)
+
+Adds an operator-initiated block to complement the existing `--unblock` / `/unblock`.
+Until now, blocking was only ever triggered automatically by the detectors —
+there was no way to say "block this IP/range right now" without editing a config
+or waiting for the bot to trip a threshold.
+
+### What's new
+
+**Telegram:** `/block <ip|cidr> [duration]`
+```
+/block 192.0.2.50            # permanent (default)
+/block 192.0.2.50 24h        # 24 hours
+/block 192.0.2.0/24          # block the whole /24, permanent
+/block 192.0.2.0/24 30d      # 30 days
+```
+
+**CLI:** `--block` (mirror of `--unblock`)
+```
+python3 wp-guardian.py --block 192.0.2.50
+python3 wp-guardian.py --block 192.0.2.50 --duration 24h
+python3 wp-guardian.py --block 192.0.2.0/24 --duration 30d
+```
+
+### Semantics
+
+- **Default duration is permanent (tier 3).** A manual block is a deliberate
+  decision, so it sticks until you `/unblock` it. Pass a duration to make it
+  temporary.
+- **Duration → tier (single IPs).** The per-IP TTL is owned by the firewall
+  backend via the escalation tiers, so a duration maps to the nearest tier that
+  *covers* it: `≤ tier1_duration` → tier 1, `≤ tier2_duration` → tier 2, else
+  tier 3 (permanent). The reply always states the effective tier/duration, so a
+  `7d` request that lands on the 30d tier is shown as such — no hidden mismatch.
+  `perm`/`permanent`/`forever` → tier 3.
+- **CIDR durations pass straight through** to the backend (`block_cidr`), so an
+  arbitrary `7d` on a range is honored exactly. Works on every backend (all five
+  set `supports_cidr = True`).
+- **Safety guards.** A manual block refuses to touch a whitelisted IP, a CIDR
+  that overlaps any whitelisted/friendly address, or a range wider than `/16`
+  (collateral-damage guard). `WhitelistManager.overlaps_cidr()` is the new
+  arbitrary-prefix whitelist check behind this.
+- **Re-asserts stale blocks.** If the IP is already marked blocked, the manual
+  block clears the firewall entry first and re-pushes at the requested tier —
+  which also re-applies a block whose firewall TTL has expired while the DB still
+  reads "blocked" (the stale-tier case).
+- **No extra Telegram noise.** Manual blocks are logged to `blocked.log` /
+  `guardian.log` but do not emit a separate Telegram alert — the `/block` reply
+  (or CLI output) is the confirmation, exactly like `/unblock`.
+
+### Files changed
+
+- `modules/blocker.py` — `block_manual()` + `_block_ip_manual` / `_block_cidr_manual`
+  helpers; `block()` gains `force_tier=` and `notify=` kwargs (both backward-compatible).
+- `modules/whitelist.py` — new `overlaps_cidr()` (arbitrary-prefix overlap check).
+- `actions/telegram_commands.py` — `/block` command + `/help` entry.
+- `wp-guardian.py` — `--block` / `--duration` CLI args + handler.
+- `README.md`, `CLAUDE.md`, `VERSION` — docs + version bump.
+
+No new config options; the feature reuses the existing `[escalation]` tier durations.
+
+## v1.7.7 — blocks tear down already-established connections (conntrack flush) (2026-06-07)
+
+A distributed XML-RPC flood (POST `/xmlrpc.php` across ~150 WordPress sites) on
+`wp.maiahost.com` exposed an enforcement gap in the **firewalld** backend:
+detection and blocking fired correctly, but blocked IPs kept hammering the
+server for *minutes* after being blocked. One offender (`192.0.2.35`) logged
+**48,000+ requests after** its block timestamp.
+
+### Root cause
+
+firewalld's `filter_INPUT` chain starts with `ct state {established, related}
+accept`. Our drop rule (rich rule → `filter_IN_public_deny`) lives **downstream
+of that accept, inside the same base chain**, where `accept` is terminal. So
+once an attacker has an established TCP connection — and HTTP keep-alive means
+every subsequent POST rides the *same* connection — the early accept matches
+first and the drop is never reached. Adding an IP to the set therefore only
+stopped *new* connections; existing floods ran until they closed on their own.
+
+This is **firewalld-specific**. The direct `nftables` backend installs its drop
+in its *own* base chain, and in nftables a `drop` verdict is terminal across all
+base chains on a hook (an earlier chain's `accept` can't save the packet), so it
+already dropped established connections.
+
+### What changed
+
+New `[firewall] flush_conntrack = true` (default on). After adding an IP/CIDR to
+the drop set, the firewalld and nftables backends run `conntrack -D -s <ip>` to
+destroy its live connection-tracking entries. The next packet on each keep-alive
+connection is then re-evaluated as `ct state new`, bypasses the established-accept,
+and hits the drop — block becomes effective in under a second. (This is the same
+technique fail2ban uses on ban, and it holds even with
+`nf_conntrack_tcp_loose=1`: the packet that re-creates the entry is seen as
+`new`, gets dropped, and never confirms.)
+
+The block log now reports how many live connections were torn down, e.g.
+`firewalld BLOCKED 192.0.2.35 tier=1 reason=... (tore down 312 live conns)`.
+
+### Dependency: the `conntrack` CLI
+
+The flush requires the `conntrack` binary (package `conntrack-tools` on
+RHEL/AlmaLinux/CyberPanel, `conntrack` on Debian/Ubuntu). If it is missing the
+flush is a **safe no-op** — new-connection blocking is unaffected — and Guardian
+warns loudly:
+
+* at **startup** (firewalld backend logs a WARNING in `guardian.log`),
+* during **`install.sh`** (offers to install it when you pick firewalld/nftables),
+* during **`update.sh`** preflight (offers to install it if the live config uses
+  firewalld/nftables and `conntrack` is absent — non-fatal, never aborts).
+
+**New: table-driven OS-package preflight.** `update.sh` previously validated only
+Python/pip dependencies (`requirements.txt`), which is why a missing
+`conntrack-tools` was never flagged on past updates — it's an OS package, not a
+pip module. v1.7.7 adds a second preflight, right after the pip one, driven by a
+`SYSTEM_DEPS` table (the single source of truth): each entry declares the binary,
+its package name per manager (`dnf`/`yum`/`apt`), whether it's fatal, the config
+condition under which it applies, and the consequence if missing. conntrack is
+the first entry; adding a future OS-package dependency is a one-line table edit.
+
+**Action for existing firewalld/nftables hosts:** install conntrack-tools to arm
+the fix —
+
+```bash
+dnf install -y conntrack-tools     # RHEL / AlmaLinux / CyberPanel
+sudo systemctl restart wp-guardian
+```
+
+### Why not reorder the firewall rules
+
+The other obvious fix — putting our drop *before* the established-accept — can't
+be done cleanly in firewalld: the accept is in firewalld's built-in base chain,
+ahead of the zone jump where rich rules live, so no rich-rule priority beats it.
+Fighting that with a foreign base chain referencing firewalld's set is fragile
+and gets clobbered on `firewall-cmd --reload`. conntrack flush is the
+low-risk, surgical fix and only ever touches IPs we are already blocking.
+
+### Files changed
+
+* `modules/conntrack.py` — **new.** `ConntrackFlusher` (detect binary, flush a
+  source IP/CIDR, report deleted-flow count).
+* `backends/firewalld.py` — construct the flusher from `[firewall]
+  flush_conntrack`; flush after `block()`/`block_cidr()`; startup arm-check
+  warning when the binary is missing.
+* `backends/nftables.py` — same flush wiring for parity / faster teardown.
+* `update.sh` — **new table-driven `SYSTEM_DEPS` preflight** for OS-package
+  binaries (first entry: conntrack); detects the package manager, offers to
+  install, honors a per-dep `fatal` flag. Extensible for future OS deps.
+* `wp-guardian.conf.example`, `wp-guardian.conf` — new `[firewall]
+  flush_conntrack` option (documented, default `true`).
+* `install.sh` — `install_conntrack_tools()` helper, invoked for the
+  firewalld/nftables backends.
+* `README.md`, `CLAUDE.md`, `VERSION` (→ 1.7.7).
+
 ## v1.7.6 — apache_vhost_uid: recognize per-user PHP-FPM / suEXEC isolation (2026-06-02)
 
 The `apache_vhost_uid` posture check previously recognized only the three

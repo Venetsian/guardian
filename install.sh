@@ -42,6 +42,39 @@ print_err() {
     echo -e "${RED}[✗]${NC} $1"
 }
 
+install_conntrack_tools() {
+    # conntrack arms [firewall] flush_conntrack: after blocking an IP, Guardian
+    # runs `conntrack -D -s <ip>` so already-established (HTTP keep-alive)
+    # connections are torn down instead of flooding until they close. Only the
+    # firewalld/nftables backends use it. Safe to skip — Guardian no-ops and
+    # warns at startup if it is missing.
+    if command -v conntrack &>/dev/null; then
+        print_ok "conntrack found (blocks will tear down live connections)"
+        return
+    fi
+    print_warn "conntrack not found — blocks would only stop NEW connections;"
+    print_warn "  an attacker on HTTP keep-alive keeps flooding until its connections close."
+    local pkg="" cmd=""
+    if command -v dnf &>/dev/null; then
+        pkg="conntrack-tools"; cmd="dnf install -y conntrack-tools"
+    elif command -v yum &>/dev/null; then
+        pkg="conntrack-tools"; cmd="yum install -y conntrack-tools"
+    elif command -v apt-get &>/dev/null; then
+        pkg="conntrack"; cmd="apt-get install -y conntrack"
+    fi
+    if [[ -n "$cmd" ]] && ask_yn "  Install ${pkg} now?" "y"; then
+        if eval "$cmd"; then
+            print_ok "Installed ${pkg}"
+        else
+            print_warn "Install failed — run manually later: ${cmd}"
+        fi
+    elif [[ -n "$cmd" ]]; then
+        print_warn "  Install later with: ${cmd}"
+    else
+        print_warn "  Install conntrack-tools (RHEL/AlmaLinux) or conntrack (Debian/Ubuntu) manually."
+    fi
+}
+
 ask() {
     # $1 = prompt, $2 = default
     local prompt="$1"
@@ -472,6 +505,7 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
             else
                 print_ok "firewalld is running"
             fi
+            install_conntrack_tools
             ;;
         3)
             FIREWALL_BACKEND="nftables"
@@ -481,6 +515,7 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
             else
                 print_ok "nftables found"
             fi
+            install_conntrack_tools
             ;;
         4)
             FIREWALL_BACKEND="mikrotik"

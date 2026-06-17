@@ -20,6 +20,7 @@ import time
 
 from backends.base import FirewallBackend
 from modules.config import parse_duration
+from modules.conntrack import ConntrackFlusher
 
 logger = logging.getLogger('wp-guardian.nftables')
 
@@ -49,6 +50,16 @@ class NftablesBackend(FirewallBackend):
 
         # Priority (lower = earlier in chain)
         self.priority = config.getint('nftables', 'priority', fallback=-10)
+
+        # Our drop lives in our own base chain, so a `drop` verdict already
+        # beats any other chain's established-accept (drop is terminal across
+        # base chains on a hook). Flushing conntrack on block is therefore
+        # belt-and-suspenders here — it just tears the live connection down
+        # immediately instead of waiting for the next dropped packet. Kept for
+        # parity with the firewalld backend and honoring the same config knob.
+        self.conntrack = ConntrackFlusher(
+            enabled=config.getboolean('firewall', 'flush_conntrack', fallback=True)
+        )
 
         if not self.test_connection():
             raise RuntimeError(
@@ -156,7 +167,9 @@ class NftablesBackend(FirewallBackend):
             logger.error(f"nftables block failed for {ip}: {stderr}")
             return False
 
-        logger.info(f"nftables BLOCKED {ip} tier={tier} reason={reason}")
+        torn = self.conntrack.flush_source(ip)
+        torn_note = f" (tore down {torn} live conns)" if torn else ""
+        logger.info(f"nftables BLOCKED {ip} tier={tier} reason={reason}{torn_note}")
         return True
 
     def unblock(self, ip):
@@ -207,7 +220,9 @@ class NftablesBackend(FirewallBackend):
             logger.error(f"nftables CIDR block failed for {subnet}: {stderr}")
             return False
 
-        logger.info(f"nftables CIDR BLOCKED {subnet} reason={reason}")
+        torn = self.conntrack.flush_source(subnet)
+        torn_note = f" (tore down {torn} live conns)" if torn else ""
+        logger.info(f"nftables CIDR BLOCKED {subnet} reason={reason}{torn_note}")
         return True
 
     def is_cidr_blocked(self, subnet):

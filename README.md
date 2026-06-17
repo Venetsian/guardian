@@ -20,7 +20,7 @@ WP-Guardian monitors web, SMTP, IMAP/POP3, and SSH logs, automatically blocks at
 - **CIDR /24 aggregation** — auto-blocks entire subnets when coordinated scanning is detected
 - **Authenticated user protection** — any successful login (WordPress, IMAP, POP3, SMTP, SSH) grants the IP a 24h grace period across all detectors, so a mail client with a wrong outgoing password can't get its working IMAP connection cut off
 - **Telegram alerts** — real-time notifications for every block, with per-rule routing (v1.4.1+): mute noisy rules like `php_scan` / `general_404` / `author_enum`, digest others hourly, keep auth and compromise rules loud. Tune live via `/verbosity <rule> <level>` from chat — `compromise`, `cidr`, and `block_failed` are always-immediate and cannot be muted by accident
-- **Telegram commands** — manage blocks, whitelists, and compromise events remotely via Telegram chat (`/status`, `/unblock`, `/whitelist`, `/history`, `/authmap`, `/suspects`, `/disable`, `/enable`, `/compromises`, `/resolve`)
+- **Telegram commands** — manage blocks, whitelists, and compromise events remotely via Telegram chat (`/status`, `/block`, `/unblock`, `/whitelist`, `/history`, `/authmap`, `/suspects`, `/disable`, `/enable`, `/compromises`, `/resolve`)
 - **Per-account auth map (v1.4+)** — `--auth-map`, `--auth-suspects`, `--hunt-compromises` for investigating account activity and surfacing pre-existing compromises
 - **Automated tripwire discovery** — learns attack patterns from your access logs
 - **Auto log discovery** — finds and monitors new access logs automatically
@@ -109,8 +109,12 @@ python3 wp-guardian.py --posture-run             # Run all applicable checks now
 python3 wp-guardian.py --posture-status          # Current state of every check
 python3 wp-guardian.py --posture-events          # Recent transitions
 
-# Unblock
-python3 wp-guardian.py --unblock 1.2.3.4
+# Block / unblock
+python3 wp-guardian.py --block 1.2.3.4               # block an IP permanently
+python3 wp-guardian.py --block 1.2.3.4 --duration 24h  # block for 24h (tier 1)
+python3 wp-guardian.py --block 1.2.3.0/24            # block a whole /24 (permanent)
+python3 wp-guardian.py --block 1.2.3.0/24 --duration 30d
+python3 wp-guardian.py --unblock 1.2.3.4            # remove block + reset tier
 
 # Update
 cd /opt/wp-guardian && git pull && sudo bash update.sh
@@ -129,6 +133,7 @@ When `commands_enabled = true` in your `[telegram]` config, WP-Guardian polls fo
 
 ```
 /status                      — block counts, IPs tracked, auth sessions, tripwires
+/block <ip|cidr> [duration]  — manually block (default: permanent; e.g. 24h, 30d)
 /unblock <ip>                — remove block and reset tier
 /whitelist <ip>              — add permanently
 /whitelist <ip> <duration>   — add temporarily (24h, 7d, 30d)
@@ -251,6 +256,7 @@ WP-Guardian supports pluggable firewall backends. Choose one in `wp-guardian.con
 ```ini
 [firewall]
 backend = csf       # or: firewalld, nftables, mikrotik, pfsense, opnsense
+flush_conntrack = true   # firewalld/nftables: tear down live connections on block
 ```
 
 | Backend | Blocks At | Best For |
@@ -262,6 +268,15 @@ backend = csf       # or: firewalld, nftables, mikrotik, pfsense, opnsense
 | pfSense / OPNsense | Network edge (appliance) | Networks with pfSense/OPNsense firewalls |
 
 See [backends/README.md](backends/README.md) for creating custom backends.
+
+> **firewalld/nftables — install `conntrack` (recommended).** Stateful firewalls
+> accept already-established connections before the block rule runs, so without
+> conntrack a block only stops *new* connections — an attacker on HTTP keep-alive
+> keeps flooding until the connection closes. With `[firewall] flush_conntrack =
+> true` (default), Guardian runs `conntrack -D -s <ip>` after each block so live
+> connections drop in under a second. Install the CLI:
+> `dnf install -y conntrack-tools` (RHEL/AlmaLinux) or `apt install -y conntrack`
+> (Debian/Ubuntu). Missing it is a safe no-op; Guardian warns at startup.
 
 ## v1.5 Configuration
 
@@ -376,6 +391,7 @@ All of the above is observable from Telegram once `commands_enabled = true`:
 │   ├── posture.py          # Posture-audit orchestrator (v1.5+)
 │   ├── tmp_cleanup.py      # Active /tmp janitor (v1.6+, opt-in)
 │   ├── mail_backend.py     # MariaDB mailbox-disable integration
+│   ├── conntrack.py        # Flush live connections on block (v1.7.7+)
 │   └── migrator.py         # Database migration runner
 ├── posture_checks/         # v1.5+ — one posture/health check per file
 │   ├── base.py             # Check ABC, CheckResult, Severity/Status enums
@@ -406,8 +422,8 @@ All of the above is observable from Telegram once `commands_enabled = true`:
 │   ├── base.py             # Firewall backend interface (ABC)
 │   ├── factory.py          # Backend registry + instantiation
 │   ├── csf.py              # CSF backend
-│   ├── firewalld.py        # firewalld backend
-│   ├── nftables.py         # nftables backend
+│   ├── firewalld.py        # firewalld backend (conntrack flush v1.7.7+)
+│   ├── nftables.py         # nftables backend (conntrack flush v1.7.7+)
 │   ├── mikrotik.py         # MikroTik backend
 │   ├── pfsense.py          # pfSense / OPNsense backend
 │   └── README.md           # Backend developer guide

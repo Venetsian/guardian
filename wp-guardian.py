@@ -1160,6 +1160,10 @@ def main():
     parser.add_argument('--whitelist-remove', metavar='IP', help='Remove IP from whitelist')
     parser.add_argument('--whitelist-list', action='store_true', help='List all whitelist entries')
     parser.add_argument('--unblock', metavar='IP', help='Unblock an IP from all systems')
+    parser.add_argument('--block', metavar='TARGET',
+                        help='Manually block an IP or CIDR (use --duration to set length; default permanent)')
+    parser.add_argument('--duration', metavar='DUR', default=None,
+                        help='Duration for --block (e.g. 24h, 7d, 30d, perm). Default: permanent')
     parser.add_argument('--history', metavar='IP', help='Show block history for an IP')
     parser.add_argument('--flush', nargs='?', const='all', metavar='TABLE',
                         help='Flush data. Options: all, tripwires, blocks, auth, isolation (default: all)')
@@ -1493,6 +1497,16 @@ def main():
     if args.unblock:
         guardian.blocker.unblock(args.unblock)
         print(f"Unblocked {args.unblock}")
+        return
+
+    if args.block:
+        ok, msg = guardian.blocker.block_manual(
+            args.block,
+            duration=args.duration,
+            reason=(args.reason or 'manual block via CLI'),
+            actor='cli',
+        )
+        print(msg)
         return
 
     if args.flush:

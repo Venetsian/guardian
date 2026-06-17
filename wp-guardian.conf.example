@@ -95,6 +95,17 @@ duration = 30d
 # See backends/README.md for adding custom backends
 backend = csf
 
+# flush_conntrack: for the firewalld and nftables backends only.
+# firewalld accepts already-established connections before the block rule is
+# evaluated, so blocking an IP only stops NEW connections — an attacker holding
+# HTTP keep-alive connections open keeps flooding until they close. When true,
+# Guardian runs `conntrack -D -s <ip>` right after blocking, tearing down the
+# live connections so the block takes effect in under a second.
+# Requires the conntrack CLI:  dnf install conntrack-tools  (RHEL/AlmaLinux)
+# or  apt install conntrack  (Debian/Ubuntu). Safe no-op if not installed
+# (Guardian warns at startup). Ignored by csf/mikrotik/pfsense backends.
+flush_conntrack = true
+
 [mikrotik]
 # Only used when [firewall] backend = mikrotik
 host = 192.168.2.1

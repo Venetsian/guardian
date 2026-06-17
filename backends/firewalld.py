@@ -27,6 +27,7 @@ import logging
 
 from backends.base import FirewallBackend
 from modules.config import parse_duration
+from modules.conntrack import ConntrackFlusher
 
 logger = logging.getLogger('wp-guardian.firewalld')
 
@@ -54,6 +55,14 @@ class FirewalldBackend(FirewallBackend):
 
         # Zone to add rules to (default: public)
         self.zone = config.get('firewalld', 'zone', fallback='public')
+
+        # Tear down a blocked source's already-established connections after
+        # adding it to the set. Without this, firewalld's early
+        # `ct state established,related accept` lets keep-alive floods keep
+        # flowing until they close on their own. See modules/conntrack.py.
+        self.conntrack = ConntrackFlusher(
+            enabled=config.getboolean('firewall', 'flush_conntrack', fallback=True)
+        )
 
         if not self.test_connection():
             raise RuntimeError(
@@ -210,7 +219,10 @@ class FirewalldBackend(FirewallBackend):
         """Block an IP by adding it to the wp_guardian_blocked ipset."""
         ok = self._add_entry(IPSET_BLOCKED, ip)
         if ok:
-            logger.info(f"firewalld BLOCKED {ip} tier={tier} reason={reason}")
+            # Flush AFTER the set add so the re-evaluated NEW packet is dropped.
+            torn = self.conntrack.flush_source(ip)
+            torn_note = f" (tore down {torn} live conns)" if torn else ""
+            logger.info(f"firewalld BLOCKED {ip} tier={tier} reason={reason}{torn_note}")
         return ok
 
     def unblock(self, ip):
@@ -228,7 +240,9 @@ class FirewalldBackend(FirewallBackend):
         """Block a CIDR subnet by adding it to wp_guardian_cidr."""
         ok = self._add_entry(IPSET_CIDR, subnet)
         if ok:
-            logger.info(f"firewalld CIDR BLOCKED {subnet} reason={reason}")
+            torn = self.conntrack.flush_source(subnet)
+            torn_note = f" (tore down {torn} live conns)" if torn else ""
+            logger.info(f"firewalld CIDR BLOCKED {subnet} reason={reason}{torn_note}")
         return ok
 
     def is_cidr_blocked(self, subnet):
@@ -356,3 +370,17 @@ class FirewalldBackend(FirewallBackend):
                 self.zone, IPSET_BLOCKED, IPSET_CIDR
             )
         )
+
+        # Arm-check the conntrack teardown. firewalld accepts established
+        # connections before our drop rule, so without conntrack a block only
+        # stops NEW connections — existing keep-alive floods keep flowing.
+        if self.conntrack.enabled and not self.conntrack.usable:
+            logger.warning(
+                "[firewall] flush_conntrack is enabled but the 'conntrack' command "
+                "is NOT installed — blocks will only stop new connections; an "
+                "attacker on HTTP keep-alive keeps flooding until its connections "
+                "close. Install it:  dnf install -y conntrack-tools  (RHEL/AlmaLinux) "
+                "or  apt install -y conntrack  (Debian/Ubuntu)."
+            )
+        elif self.conntrack.usable:
+            logger.info("conntrack teardown armed — blocks will drop live connections too")

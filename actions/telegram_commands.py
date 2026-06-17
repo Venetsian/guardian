@@ -214,6 +214,7 @@ class TelegramCommander:
         handlers = {
             '/status': self._cmd_status,
             '/unblock': self._cmd_unblock,
+            '/block': self._cmd_block,
             '/whitelist': self._cmd_whitelist,
             '/history': self._cmd_history,
             '/tripwires': self._cmd_tripwires,
@@ -312,6 +313,31 @@ class TelegramCommander:
                     ip=ip, err=str(e)
                 )
             )
+
+    def _cmd_block(self, args):
+        """Handle /block <ip|cidr> [duration] — manual operator block."""
+        if not args:
+            self._reply(
+                "Usage: /block &lt;ip|cidr&gt; [duration]\n"
+                "\n"
+                "Examples:\n"
+                "/block 192.0.2.50 — permanent\n"
+                "/block 192.0.2.50 24h — for 24 hours\n"
+                "/block 192.0.2.0/24 — block the whole /24 (permanent)\n"
+                "/block 192.0.2.0/24 30d — for 30 days\n"
+                "\n"
+                "Duration: 24h / 7d / 30d / perm (default: permanent).\n"
+                "Reverse with /unblock &lt;ip&gt;."
+            )
+            return
+
+        target = args[0]
+        duration = args[1] if len(args) > 1 else None
+        ok, msg = self.blocker.block_manual(
+            target, duration=duration,
+            actor='telegram:{cid}'.format(cid=self.chat_id),
+        )
+        self._reply(("✅ " if ok else "⚠️ ") + msg)
 
     def _cmd_whitelist(self, args):
         """Handle /whitelist [add|remove|list] commands."""
@@ -1164,6 +1190,7 @@ class TelegramCommander:
             "<b>WP-Guardian Commands</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
             "/status — current block counts and stats\n"
+            "/block &lt;ip|cidr&gt; [duration] — manually block (default: permanent)\n"
             "/unblock &lt;ip&gt; — remove block and reset tier\n"
             "/whitelist &lt;ip&gt; [duration] — add to whitelist\n"
             "/whitelist remove &lt;ip&gt; — remove from whitelist\n"

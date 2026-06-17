@@ -95,6 +95,50 @@ class WhitelistManager:
 
         return False
 
+    def overlaps_cidr(self, cidr):
+        """Check whether any whitelisted IP or range falls within / overlaps an
+        arbitrary CIDR (any prefix length). Used before a manual CIDR block so
+        we never blackhole a range that contains a whitelisted address.
+        Returns True if there is any overlap, False otherwise."""
+        try:
+            target = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            return False
+
+        # File exact IPs
+        for ip in self._file_exact:
+            try:
+                if ipaddress.ip_address(ip) in target:
+                    return True
+            except ValueError:
+                pass
+
+        # File CIDR ranges
+        for network in self._file_networks:
+            if network.overlaps(target):
+                return True
+
+        # DB whitelist entries
+        try:
+            for row in self.db.get_whitelist():
+                wl_ip = row['ip']
+                if '/' in wl_ip:
+                    try:
+                        if ipaddress.ip_network(wl_ip, strict=False).overlaps(target):
+                            return True
+                    except ValueError:
+                        pass
+                else:
+                    try:
+                        if ipaddress.ip_address(wl_ip) in target:
+                            return True
+                    except ValueError:
+                        pass
+        except Exception:
+            pass
+
+        return False
+
     def is_whitelisted(self, ip):
         """Check if IP is whitelisted from any source."""
         # 1. Check file-based exact match
