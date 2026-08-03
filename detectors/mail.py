@@ -6,7 +6,7 @@ v1.5: extracted from wp-guardian.py with no behavior change.
 import re
 import logging
 
-from .base import HitTracker
+from .base import HitTracker, is_guardian_disabled_client
 
 
 class MailDetector:
@@ -76,6 +76,13 @@ class MailDetector:
                         )
                         self.blocker.alert_trusted_skip(ip, 'smtp', count, self.time_window, username)
                         return
+                    # Postfix rarely logs sasl_username on failure, so this only
+                    # catches the cases where it does. Dovecot below is reliable.
+                    if is_guardian_disabled_client(self.db, ip, username, 'smtp',
+                                                   'wp-guardian.mail'):
+                        self.blocker.alert_guardian_disabled_skip(
+                            ip, 'smtp', username, count, self.time_window)
+                        return
                     self.blocker.block(ip, f"SMTP auth brute force ({count} in {self.time_window}s)",
                                       service='smtp', username=username, rule='smtp_fail')
             return
@@ -111,6 +118,11 @@ class MailDetector:
                             f"Authenticated IP {ip} hit {service.upper()} fail threshold ({count} in {self.time_window}s) — not blocking (likely misconfigured mail client)"
                         )
                         self.blocker.alert_trusted_skip(ip, service, count, self.time_window, username)
+                        return
+                    if is_guardian_disabled_client(self.db, ip, username, service,
+                                                   'wp-guardian.mail'):
+                        self.blocker.alert_guardian_disabled_skip(
+                            ip, service, username, count, self.time_window)
                         return
                     rule = 'imap_fail' if service == 'imap' else 'pop3_fail'
                     self.blocker.block(ip, f"{service.upper()} auth brute force ({count} in {self.time_window}s)",

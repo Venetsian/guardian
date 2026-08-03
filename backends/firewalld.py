@@ -13,9 +13,13 @@ Strategy (v1.7.4+):
   - Block/unblock = one ``firewall-cmd --ipset --add-entry`` (runtime)
     plus the same call with ``--permanent`` for reboot persistence.
     No ``--reload`` on the hot path.
-  - Tier TTLs remain owned by the WP-Guardian database. The daemon's
-    cleanup loop calls ``unblock()`` when an entry expires. We do NOT
-    use per-entry ipset timeouts so behavior matches the other backends.
+  - Tier TTLs remain owned by the WP-Guardian database: we do NOT use
+    per-entry ipset timeouts, so behavior matches the other backends.
+    Expiry is enforced by ``Blocker.reap_expired_blocks()`` on the
+    daemon's hourly cleanup tick (v1.7.9+). Before that reaper existed
+    this contract was documented here but never implemented, which made
+    every "24h" block on firewalld permanent — if you disable
+    ``[escalation] reap_enabled``, that is the behavior you get back.
 
 Operators upgrading from the pre-v1.7.4 rich-rule implementation should
 run ``python3 tools/migrate_firewalld_to_ipset.py`` once after the

@@ -554,6 +554,20 @@ class Guardian:
                     if removed > 0:
                         self.logger.debug(f"Cleaned {removed} expired login isolation entries")
 
+                    # Retire blocks whose tier duration elapsed (v1.7.9).
+                    # Batched — a backlog of thousands would otherwise fire
+                    # thousands of firewall calls in one tick.
+                    if self.blocker.reap_enabled:
+                        try:
+                            result = self.blocker.reap_expired_blocks()
+                            if result['remaining'] > 0:
+                                self.logger.info(
+                                    f"Block reaper: {result['remaining']} expired blocks "
+                                    f"still queued, next batch in {cleanup_interval}s"
+                                )
+                        except Exception as e:
+                            self.logger.error(f"Block reaper error: {e}")
+
                     last_cleanup = now
 
                 # Daily summary
@@ -1165,6 +1179,12 @@ def main():
     parser.add_argument('--duration', metavar='DUR', default=None,
                         help='Duration for --block (e.g. 24h, 7d, 30d, perm). Default: permanent')
     parser.add_argument('--history', metavar='IP', help='Show block history for an IP')
+    parser.add_argument('--reap-blocks', action='store_true',
+                        help='Expire tier-1/tier-2 blocks past their duration now '
+                             '(combine with --dry-run to preview)')
+    parser.add_argument('--reap-limit', type=int, default=None, metavar='N',
+                        help='Max blocks to expire in this --reap-blocks run '
+                             '(default: [escalation] reap_batch_limit)')
     parser.add_argument('--flush', nargs='?', const='all', metavar='TABLE',
                         help='Flush data. Options: all, tripwires, blocks, auth, isolation (default: all)')
     parser.add_argument('--discover-logs', action='store_true',
@@ -1497,6 +1517,40 @@ def main():
     if args.unblock:
         guardian.blocker.unblock(args.unblock)
         print(f"Unblocked {args.unblock}")
+        return
+
+    if args.reap_blocks:
+        blocker = guardian.blocker
+        pending = guardian.db.count_expired_blocks(
+            blocker.tier1_seconds, blocker.tier2_seconds
+        )
+        limit = args.reap_limit if args.reap_limit is not None else blocker.reap_batch_limit
+        print("")
+        print(f"Block reaper — {pending} block(s) past their tier duration")
+        print(f"  tier1_duration : {blocker.tier1_duration}")
+        print(f"  tier2_duration : {blocker.tier2_duration}")
+        print(f"  batch limit    : {limit}")
+        if args.dry_run:
+            print("  mode           : DRY-RUN (nothing will be unblocked)")
+        print("")
+
+        if pending == 0:
+            print("Nothing to expire.")
+            print("")
+            return
+
+        result = blocker.reap_expired_blocks(limit=limit, dry_run=args.dry_run)
+        verb = 'would expire' if args.dry_run else 'expired'
+        print(f"  {verb:<14s} : {result['expired']}")
+        if result['failed']:
+            print(f"  failed         : {result['failed']} (firewall calls did not "
+                  f"succeed — tiers left set, will retry)")
+        print(f"  still pending  : {result['remaining']}")
+        if result['remaining'] and not args.dry_run:
+            print("")
+            print(f"  Re-run to continue, or let the hourly sweep drain it "
+                  f"({limit}/hour).")
+        print("")
         return
 
     if args.block:

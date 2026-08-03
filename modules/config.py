@@ -31,6 +31,61 @@ def parse_duration(value):
     return amount * multipliers[unit]
 
 
+def parse_asn_list(raw):
+    """Parse a comma/newline separated list of integer ASNs into a set.
+
+    Shared by DistributedAuthDetector (detection-side filtering) and
+    Blocker (enforcement-side exemption) so both read the same
+    [compromise_detection] trusted_asns value the same way.
+
+    Ignores blank entries, '#' comments (whole-line or inline) and
+    non-positive values. Invalid tokens are warned about, not fatal.
+    """
+    asns = set()
+    if not raw:
+        return asns
+
+    for token in str(raw).replace('\n', ',').split(','):
+        token = token.strip()
+        if not token or token.startswith('#'):
+            continue
+        if '#' in token:
+            token = token[:token.index('#')].strip()
+        if not token:
+            continue
+        try:
+            value = int(token)
+        except ValueError:
+            logger.warning(f"Invalid trusted_asns entry '{token}' — must be an integer ASN")
+            continue
+        if value > 0:
+            asns.add(value)
+
+    return asns
+
+
+def parse_service_list(raw):
+    """Parse a comma/newline separated list of service names into a set.
+
+    Lowercased and stripped. Used for [compromise_detection]
+    trusted_asn_services.
+    """
+    services = set()
+    if not raw:
+        return services
+
+    for token in str(raw).replace('\n', ',').split(','):
+        token = token.strip()
+        if not token or token.startswith('#'):
+            continue
+        if '#' in token:
+            token = token[:token.index('#')].strip()
+        if token:
+            services.add(token.lower())
+
+    return services
+
+
 def load_config(config_path=None):
     """Load configuration from INI file."""
     # Try multiple locations: explicit path, script dir, default

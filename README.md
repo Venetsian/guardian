@@ -16,7 +16,9 @@ WP-Guardian monitors web, SMTP, IMAP/POP3, and SSH logs, automatically blocks at
 - **Active /tmp cleanup module (v1.6+)** — opt-in daily janitor for stale, root-owned, world-readable, allowlisted files in /tmp. Three modes: `off` (default), `dry_run` (scan + log + Telegram digest), `live` (delete + log to `posture_events`). Strict criteria (realpath under /tmp, owner uid 0, mode o+r, age ≥ 7d, allowlist match, lsof-clean). Recommended rollout: enable as `dry_run` for ~14 days, review the digests, promote to `live`.
 - **Credential compromise detection (v1.4+)** — `DistributedAuthDetector` catches the classic distributed credential-abuse botnet pattern (same mailbox authenticating from many countries/ASNs/IPs in a short window), automatically blocks source IPs, and disables the mailbox in the mail backend
 - **GeoIP enrichment (v1.4+)** — every auth event and block is tagged with country, city, ASN, and ASN organization via MaxMind GeoLite2
-- **Three-tier escalation** — 24h block, 30d block, permanent ban with automatic tier advancement
+- **Three-tier escalation** — 24h block, 30d block, permanent ban with automatic tier advancement. An hourly reaper (v1.7.9+) actually enforces those durations: tier-1/tier-2 blocks are released when they expire and the tier is reset so repeat offenders still escalate, while tier 3 stays permanent. Clearing a false positive with `--unblock` resets the escalation ladder rather than arming the next rung
+- **Cloud mail relay protection (v1.7.9+)** — IPs in a trusted ASN (Microsoft 365, Google Workspace, iCloud) are never firewall-dropped for mail rules or compromise handling. New Outlook syncs IMAP through Microsoft's cloud, so blocking a relay cuts off the legitimate client and stops no attacker — and per-IP whitelisting doesn't hold because those relays rotate. Scoped to mail services, so an Azure VM in the same ASN scanning `wp-login.php` is still blocked
+- **No self-inflicted lockouts (v1.7.9+)** — when Guardian disables a mailbox after a compromise event, the owner's mail client turns into a failed-auth generator on every retry. Those failures no longer feed the brute-force ladder, provided the IP is a known client of that account
 - **CIDR /24 aggregation** — auto-blocks entire subnets when coordinated scanning is detected
 - **Authenticated user protection** — any successful login (WordPress, IMAP, POP3, SMTP, SSH) grants the IP a 24h grace period across all detectors, so a mail client with a wrong outgoing password can't get its working IMAP connection cut off
 - **Telegram alerts** — real-time notifications for every block, with per-rule routing (v1.4.1+): mute noisy rules like `php_scan` / `general_404` / `author_enum`, digest others hourly, keep auth and compromise rules loud. Tune live via `/verbosity <rule> <level>` from chat — `compromise`, `cidr`, and `block_failed` are always-immediate and cannot be muted by accident
@@ -114,7 +116,12 @@ python3 wp-guardian.py --block 1.2.3.4               # block an IP permanently
 python3 wp-guardian.py --block 1.2.3.4 --duration 24h  # block for 24h (tier 1)
 python3 wp-guardian.py --block 1.2.3.0/24            # block a whole /24 (permanent)
 python3 wp-guardian.py --block 1.2.3.0/24 --duration 30d
-python3 wp-guardian.py --unblock 1.2.3.4            # remove block + reset tier
+python3 wp-guardian.py --unblock 1.2.3.4            # remove block + reset escalation
+
+# Block expiry (v1.7.9+) — normally automatic on the hourly loop
+python3 wp-guardian.py --reap-blocks --dry-run       # preview what's overdue
+python3 wp-guardian.py --reap-blocks                 # drain one batch now
+python3 wp-guardian.py --reap-blocks --reap-limit 2000
 
 # Update
 cd /opt/wp-guardian && git pull && sudo bash update.sh
@@ -437,7 +444,7 @@ All of the above is observable from Telegram once `commands_enabled = true`:
 │   ├── backfill_ip_history.py   # Geo-enrich ip_history rows (v1.4.2+ repair)
 │   └── config-upgrade.py        # Detect & merge new config options on upgrade
 ├── migrations/
-│   └── *.sql               # Database migrations (v1.5: 007_cms_sites.sql, 008_posture_audit.sql)
+│   └── *.sql               # Database migrations (007_cms_sites, 008_posture_audit, 009_block_cleared_at)
 ├── state/
 │   └── guardian.db          # SQLite database
 └── logs/

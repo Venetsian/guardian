@@ -181,7 +181,8 @@ class GuardianDB:
                 reason      TEXT NOT NULL,
                 service     TEXT NOT NULL,
                 blocker     TEXT NOT NULL,
-                duration    TEXT NOT NULL
+                duration    TEXT NOT NULL,
+                cleared_at  INTEGER DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS idx_block_ip ON block_log(ip);
@@ -334,13 +335,34 @@ class GuardianDB:
         return cursor.fetchall()
 
     def get_recent_block(self, ip, lookback_seconds):
-        """Check if IP was blocked within the lookback period."""
+        """Check if IP was blocked within the lookback period.
+
+        Rows an operator explicitly cleared (cleared_at > 0) are ignored —
+        unblocking a false positive must reset the escalation ladder, not
+        arm the next rung. Blocks retired by the reaper keep cleared_at = 0
+        and still escalate on return, which is the point of the tier design.
+        """
         cutoff = int(time.time()) - lookback_seconds
         cursor = self.conn.execute(
-            "SELECT * FROM block_log WHERE ip = ? AND timestamp > ? ORDER BY timestamp DESC LIMIT 1",
+            "SELECT * FROM block_log WHERE ip = ? AND timestamp > ? AND cleared_at = 0 "
+            "ORDER BY timestamp DESC LIMIT 1",
             (ip, cutoff)
         )
         return cursor.fetchone()
+
+    def clear_block_history(self, ip):
+        """Mark every uncleared block_log row for an IP as operator-cleared.
+
+        Called by Blocker.unblock() so the next block for this IP starts at
+        tier 1 again. Returns the number of rows cleared.
+        """
+        now = int(time.time())
+        result = self.conn.execute(
+            "UPDATE block_log SET cleared_at = ? WHERE ip = ? AND cleared_at = 0",
+            (now, ip)
+        )
+        self.conn.commit()
+        return result.rowcount
 
     def determine_tier(self, ip, tier2_lookback_seconds):
         """Determine what tier to assign based on block history."""
@@ -366,6 +388,62 @@ class GuardianDB:
                 return 2  # Was tier 1, now tier 2 (30 days)
 
         return 1  # First offense or long time since last block
+
+    # ------------------------------------------------------------------
+    # Block expiry (v1.7.9)
+    # ------------------------------------------------------------------
+    def get_expired_blocks(self, tier1_seconds, tier2_seconds, limit=500):
+        """IPs whose tier-1 / tier-2 block has outlived its configured duration.
+
+        Expiry is derived from ip_history.tier_changed_at rather than a stored
+        expires_at column: tier_changed_at is already written by record_block()
+        on every block, so this works on databases that predate the reaper with
+        no backfill. Tier 3 is permanent and never returned.
+
+        Ordered oldest-first so a capped sweep drains the longest-standing
+        blocks before the recent ones.
+        """
+        now = int(time.time())
+        cursor = self.conn.execute(
+            "SELECT ip, current_tier, tier_changed_at, last_block_reason, last_block_service "
+            "FROM ip_history "
+            "WHERE (current_tier = 1 AND tier_changed_at < ?) "
+            "   OR (current_tier = 2 AND tier_changed_at < ?) "
+            "ORDER BY tier_changed_at ASC LIMIT ?",
+            (now - int(tier1_seconds), now - int(tier2_seconds), int(limit))
+        )
+        return [
+            {
+                'ip': row['ip'],
+                'tier': row['current_tier'],
+                'blocked_at': row['tier_changed_at'],
+                'reason': row['last_block_reason'] or '',
+                'service': row['last_block_service'] or '',
+            }
+            for row in cursor.fetchall()
+        ]
+
+    def count_expired_blocks(self, tier1_seconds, tier2_seconds):
+        """Total blocks eligible for expiry — used for reaper progress logging."""
+        now = int(time.time())
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM ip_history "
+            "WHERE (current_tier = 1 AND tier_changed_at < ?) "
+            "   OR (current_tier = 2 AND tier_changed_at < ?)",
+            (now - int(tier1_seconds), now - int(tier2_seconds))
+        ).fetchone()
+        return row[0] if row else 0
+
+    def expire_block_tier(self, ip):
+        """Reset an IP's tier to 0 after its block duration elapsed.
+
+        Deliberately does NOT touch block_log — those rows drive escalation,
+        so a returning attacker gets tier 2 as designed.
+        """
+        self.conn.execute(
+            "UPDATE ip_history SET current_tier = 0 WHERE ip = ?", (ip,)
+        )
+        self.conn.commit()
 
     # ------------------------------------------------------------------
     # Authenticated Sessions
@@ -427,6 +505,49 @@ class GuardianDB:
             (ip, cutoff)
         )
         return cursor.fetchone() is not None
+
+    def has_auth_history(self, ip, username, lookback_seconds):
+        """Has this IP ever successfully authenticated as this username?
+
+        Narrower than is_ip_authenticated(): that one asks "is this IP a known
+        human anywhere", this one asks "is this IP a known client OF THIS
+        ACCOUNT". Used to suppress escalation for a mailbox Guardian itself
+        disabled, without handing an attacker a free pass to hammer a known
+        disabled account from anywhere.
+        """
+        if not ip or not username:
+            return False
+        cutoff = int(time.time()) - int(lookback_seconds)
+        cursor = self.conn.execute(
+            "SELECT 1 FROM auth_sessions "
+            "WHERE ip = ? AND username = ? AND timestamp > ? LIMIT 1",
+            (ip, username, cutoff)
+        )
+        return cursor.fetchone() is not None
+
+    def last_known_asn(self, ip):
+        """Best-effort ASN for an IP from data we already recorded.
+
+        Fallback for the enforcement-side trusted-ASN guard when a live GeoIP
+        lookup returns nothing (resolver down, database missing an entry).
+        Prefers ip_history, falls back to the most recent auth_sessions row.
+        Returns 0 when unknown.
+        """
+        row = self.conn.execute(
+            "SELECT geoip_asn FROM ip_history WHERE ip = ? AND geoip_asn > 0", (ip,)
+        ).fetchone()
+        if row and row['geoip_asn']:
+            return int(row['geoip_asn'])
+
+        row = self.conn.execute(
+            "SELECT geoip_asn FROM auth_sessions "
+            "WHERE ip = ? AND geoip_asn > 0 ORDER BY timestamp DESC LIMIT 1",
+            (ip,)
+        ).fetchone()
+        if row and row['geoip_asn']:
+            return int(row['geoip_asn'])
+
+        return 0
 
     def get_account_locations(self, username, service):
         """Get all known locations for an account."""
@@ -873,6 +994,29 @@ class GuardianDB:
         )
         return [row['ip'] for row in cursor.fetchall()]
 
+    def recent_auth_ips_with_asn(self, username, window_seconds, limit=1000):
+        """Distinct IPs that authenticated as this user, each with its ASN.
+
+        Enforcement counterpart to distinct_auth_counts(). CompromiseAction
+        uses the ASN to skip firewall-dropping cloud mail relays: a trusted
+        ASN is excluded from the *evidence* by distinct_auth_counts(), so
+        dropping it as an *attacker* is never justified — you cannot stop an
+        attacker that way, you only cut off the legitimate cloud client.
+
+        Returns [{'ip': str, 'asn': int}], newest activity first.
+        """
+        cutoff = int(time.time()) - int(window_seconds)
+        cursor = self.conn.execute(
+            "SELECT ip, MAX(geoip_asn) AS asn, MAX(timestamp) AS last_seen "
+            "FROM auth_sessions WHERE username = ? AND timestamp >= ? "
+            "GROUP BY ip ORDER BY last_seen DESC LIMIT ?",
+            (username, cutoff, limit)
+        )
+        return [
+            {'ip': row['ip'], 'asn': int(row['asn'] or 0)}
+            for row in cursor.fetchall()
+        ]
+
     def recent_auth_countries(self, username, window_seconds):
         """Return distinct countries for this user in the window."""
         cutoff = int(time.time()) - int(window_seconds)
@@ -1080,6 +1224,44 @@ class GuardianDB:
              original_password_hash)
         )
         self.conn.commit()
+
+    # Actions that take a mailbox out of service, and the ones that restore it.
+    _MAILBOX_DISABLE_ACTIONS = ('disable', 'password_reset_disable')
+    _MAILBOX_ENABLE_ACTIONS = ('enable', 'password_restore_enable')
+
+    def is_mailbox_disabled_by_guardian(self, username):
+        """Is this mailbox currently out of service because Guardian disabled it?
+
+        True when the latest successful disable action for the account is newer
+        than the latest successful enable. Guardian-disabled mailboxes generate
+        auth failures from the owner's own client on every retry — those
+        failures are Guardian's own doing and must not feed the brute-force
+        escalation ladder.
+
+        Only successful actions count: a disable that errored left the mailbox
+        working, so its failures are real evidence.
+        """
+        if not username:
+            return False
+
+        disable_placeholders = ','.join(['?'] * len(self._MAILBOX_DISABLE_ACTIONS))
+        enable_placeholders = ','.join(['?'] * len(self._MAILBOX_ENABLE_ACTIONS))
+
+        row = self.conn.execute(
+            "SELECT "
+            "  (SELECT MAX(id) FROM mailbox_actions "
+            "   WHERE username = ? AND success = 1 AND action IN ({d})) AS last_disable, "
+            "  (SELECT MAX(id) FROM mailbox_actions "
+            "   WHERE username = ? AND success = 1 AND action IN ({e})) AS last_enable".format(
+                d=disable_placeholders, e=enable_placeholders
+            ),
+            (username,) + self._MAILBOX_DISABLE_ACTIONS
+            + (username,) + self._MAILBOX_ENABLE_ACTIONS
+        ).fetchone()
+
+        if not row or not row['last_disable']:
+            return False
+        return row['last_disable'] > (row['last_enable'] or 0)
 
     def get_original_password_hash(self, email):
         """Get the stored original password hash from the most recent

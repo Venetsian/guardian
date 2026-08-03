@@ -13,6 +13,8 @@ import re
 import time
 import logging
 
+from modules.config import parse_asn_list
+
 
 class DistributedAuthDetector:
     """Watches successful authentications across services and flags accounts
@@ -48,20 +50,13 @@ class DistributedAuthDetector:
         # Cloud mail providers (Microsoft 365, Google Workspace, iCloud) relay
         # the same user through DCs in many countries; without this filter
         # legitimate users repeatedly trip threshold_distinct_countries.
-        trusted_raw = config.get(
-            'compromise_detection', 'trusted_asns', fallback='8075, 15169, 714'
+        # Parsed via the shared helper so the enforcement side (Blocker,
+        # CompromiseAction) reads exactly the same list — the split between
+        # "not evidence" and "still blockable" was the Outlook bug.
+        self.trusted_asns = parse_asn_list(
+            config.get('compromise_detection', 'trusted_asns',
+                       fallback='8075, 15169, 714')
         )
-        self.trusted_asns = set()
-        for token in trusted_raw.replace('\n', ',').split(','):
-            token = token.strip()
-            if not token or token.startswith('#'):
-                continue
-            try:
-                self.trusted_asns.add(int(token))
-            except ValueError:
-                logging.getLogger('wp-guardian.compromise-detector').warning(
-                    "Invalid trusted_asns entry '{t}' — must be an integer ASN".format(t=token)
-                )
 
         # Exclude regex list (one pattern per line in config)
         excl_raw = config.get('compromise_detection', 'exclude_usernames', fallback='')

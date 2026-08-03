@@ -8,7 +8,7 @@ v1.5: extracted from wp-guardian.py with no behavior change.
 import re
 import logging
 
-from .base import HitTracker
+from .base import HitTracker, is_guardian_disabled_client
 
 
 class RoundcubeDetector:
@@ -51,6 +51,11 @@ class RoundcubeDetector:
                     )
                 )
                 self.blocker.alert_trusted_skip(ip, 'roundcube', count, self.time_window, username)
+                return
+            if is_guardian_disabled_client(self.db, ip, username, 'roundcube',
+                                           'wp-guardian.roundcube'):
+                self.blocker.alert_guardian_disabled_skip(
+                    ip, 'roundcube', username, count, self.time_window)
                 return
             self.blocker.block(
                 ip,

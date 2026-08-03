@@ -1,5 +1,155 @@
 # WP-Guardian Changelog
 
+## v1.7.9 — false positives are no longer permanent (2026-08-03)
+
+Four bugs that compounded into a multi-day mail outage for a client on
+Microsoft 365. Each one was survivable alone; together they turned a single
+heuristic trip into a permanent ban that no automatic process could undo.
+
+### 1. Trusted ASNs were exempt from detection but not from enforcement
+
+`DistributedAuthDetector` excludes `trusted_asns` (Microsoft, Google, Apple)
+from the country and ASN counts, because cloud mail providers relay one
+legitimate user through DCs in many countries. But every enforcement path
+ignored that list:
+
+- `recent_auth_ips()` was a bare `SELECT DISTINCT ip` with no ASN filter, and
+  `CompromiseAction` fed its output straight to `_block_ips()`.
+- The SMTP / IMAP / POP3 / Roundcube brute-force rules never consulted it at all.
+
+So Microsoft's ASN was too trusted to count as *evidence*, then got
+firewall-dropped as the *attacker*. Since new Outlook syncs IMAP through
+Microsoft's cloud rather than from the PC, that silently killed the client's
+mail — presenting as "Waiting for your email provider" forever.
+
+**Fixed** in two layers:
+
+- `Blocker.block()` refuses to block an IP in a trusted ASN for the services
+  in the new `trusted_asn_services` list (default `smtp, imap, pop3, roundcube`),
+  plus any `rule='compromise'` block. Scoped by service on purpose — AS8075 is
+  Office 365 *and* Azure, and an Azure VM scanning `wp-login.php` is still a
+  legitimate block. Manual operator blocks (`force_tier`) override the guard.
+- `CompromiseAction` partitions the window's IPs by ASN before blocking. The
+  compromise event still records **every** IP in `sample_ips` for forensics;
+  only untrusted ones are eligible for the firewall.
+
+Per-IP whitelisting was never a fix here — Microsoft rotates these relays
+(`40.97.x`, `40.104.x`, `52.96.x`). The ASN is the durable key. When GeoIP is
+down or has no answer, the guard falls back to `db.last_known_asn()`, so a
+relay that has authenticated here before stays protected.
+
+### 2. Guardian's own remediation manufactured the next punishment
+
+When a mailbox is auto-disabled after a compromise event, Dovecot's
+`password_query` filters on `AND enabled = 1` — so the owner's own mail client
+becomes a failed-auth generator on every retry. `mail_trust_duration` did not
+cover this: trust requires a *successful* auth, and a disabled mailbox can
+never produce one. After 24h the trust lapsed and the victim's own IP was
+blocked, then escalated.
+
+**Fixed:** the mail and Roundcube detectors now suppress blocking when both
+hold — Guardian currently has that mailbox disabled, *and* the failing IP has
+successfully authenticated as that username before. Both conditions are
+required: without the second, knowing the name of a disabled mailbox would buy
+an attacker unlimited free attempts. Fires a `HIGH` Telegram heads-up so the
+account doesn't stay silently out of service.
+
+Coverage note: Dovecot logs `user=<...>` on failure reliably, so IMAP/POP3 is
+fully covered. Postfix rarely logs `sasl_username` on failure, so SMTP is
+best-effort.
+
+### 3. Unblocking a false positive armed the next escalation
+
+`unblock()` reset `ip_history.current_tier` but left `block_log` untouched —
+and `determine_tier()` escalates off `block_log`. So rescuing a client made
+things *worse*: unblock → client retries → re-blocked at tier 2 → unblock →
+tier 3 permanent. Observed live as a 1 → 2 → 3 climb in four minutes, which is
+an operator at a keyboard, not a bot.
+
+**Fixed:** migration 009 adds `block_log.cleared_at`. `unblock()` marks the
+IP's history cleared and `get_recent_block()` ignores cleared rows, so a manual
+unblock resets the ladder. Blocks retired by the reaper are **not** marked
+cleared — those should still escalate on return, which is the point of the
+three-tier design.
+
+### 4. Block durations were never enforced
+
+`tier1_duration = 24h` was written to `block_log`, the log line and the Telegram
+alert, but nothing ever expired it. There was no reaper and no systemd timer,
+and `Blocker.unblock()` was reachable only from the CLI and Telegram handlers.
+The `firewalld` backend even documents *"the daemon's cleanup loop calls
+unblock() when an entry expires"* — that call never existed.
+
+The failure mode differed by backend:
+
+| Backend | Actual behavior before v1.7.9 |
+|---|---|
+| firewalld | ipsets carry no TTL → **every block was permanent** |
+| mikrotik / nftables / csf | firewall expired the entry on its own TTL, but `current_tier` stayed set → `block()` short-circuited on "already blocked" and **a returning attacker was never re-pushed** |
+
+**Fixed:** `Blocker.reap_expired_blocks()` runs on the hourly cleanup tick.
+Expiry is derived from `ip_history.tier_changed_at` against the configured tier
+durations — no schema change and no backfill, since `tier_changed_at` has always
+been written by `record_block()`. `unblock()` is idempotent, so one sweep fixes
+both failure modes. Tier 3 is never expired. If a firewall call fails the tier is
+left set and the next sweep retries, so a backend outage can't silently drop
+blocks from the database.
+
+Batched at `reap_batch_limit` (default 500/hour) because the first sweep on an
+established install may face thousands of stale blocks, each costing a firewall
+call — two on firewalld (runtime + permanent).
+
+### New
+
+**CLI:** `--reap-blocks`, optionally with `--dry-run` and `--reap-limit N`
+```
+python3 wp-guardian.py --reap-blocks --dry-run     # preview the backlog
+python3 wp-guardian.py --reap-blocks               # drain one batch now
+python3 wp-guardian.py --reap-blocks --reap-limit 2000
+```
+
+**Config** — `[escalation]`
+```ini
+reap_enabled = true       # hourly block-expiry sweep
+reap_batch_limit = 500    # max expiries per sweep
+```
+
+**Config** — `[compromise_detection]`
+```ini
+trusted_asn_services = smtp, imap, pop3, roundcube
+```
+
+### Upgrade notes
+
+- **Run `--reap-blocks --dry-run` first.** On a long-running install the first
+  sweep will retire a large backlog of blocks that expired months ago. That is
+  correct — they should never have outlived their duration — but it is a real
+  change in posture, so look at the number before letting the daemon do it.
+- Migration 009 is additive (`ALTER TABLE ... ADD COLUMN`) and idempotent.
+- Raising `threshold_distinct_asns` above the default `5` is worth considering
+  if you have users who roam between carriers; five distinct non-trusted ASNs
+  in an hour is reachable by a legitimate travelling user with a phone and a
+  laptop.
+
+### Files changed
+
+- `modules/blocker.py` — trusted-ASN enforcement guard, `reap_expired_blocks()`,
+  `unblock()` clears escalation history, `alert_guardian_disabled_skip()`
+- `modules/compromise.py` — partition attacker IPs by trusted ASN
+- `modules/database.py` — `cleared_at` column, `clear_block_history()`,
+  `get_expired_blocks()`, `count_expired_blocks()`, `expire_block_tier()`,
+  `recent_auth_ips_with_asn()`, `is_mailbox_disabled_by_guardian()`,
+  `has_auth_history()`, `last_known_asn()`, `get_recent_block()` filter
+- `modules/config.py` — `parse_asn_list()`, `parse_service_list()`
+- `modules/migrator.py` — `CURRENT_SCHEMA_VERSION` 8 → 9
+- `migrations/009_block_cleared_at.sql` — new
+- `detectors/base.py` — `is_guardian_disabled_client()`
+- `detectors/mail.py`, `detectors/roundcube.py` — disabled-mailbox suppression
+- `detectors/distributed_auth.py` — use the shared ASN parser
+- `wp-guardian.py` — reaper in the hourly loop, `--reap-blocks` / `--reap-limit`
+- `install.sh`, `wp-guardian.conf`, `wp-guardian.conf.example`, `README.md`,
+  `CLAUDE.md`, `VERSION`
+
 ## v1.7.8 — manual block command (`/block` + `--block`) (2026-06-17)
 
 Adds an operator-initiated block to complement the existing `--unblock` / `/unblock`.

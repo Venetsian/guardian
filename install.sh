@@ -708,6 +708,28 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
         fi
     fi
 
+    # --- Block expiry reaper (v1.7.9+) ---
+    echo ""
+    echo -e "${BOLD}  Block expiry reaper (v1.7.9+)${NC}"
+    echo "  Hourly sweep that unblocks tier-1/tier-2 IPs once their duration"
+    echo "  has elapsed and resets their tier so repeat offenders still"
+    echo "  escalate. Tier 3 (permanent) is never expired."
+    echo ""
+    echo "  Without it, 'tier1_duration = 24h' is not actually enforced:"
+    echo "  on firewalld every block is permanent, and on mikrotik/nftables/csf"
+    echo "  the firewall entry expires but the stale tier blocks re-blocking."
+    echo "  Leave this on unless you deliberately want blocks to be forever."
+    REAP_ENABLED="true"
+    if ! ask_yn "  Enable the block expiry reaper?" "y"; then
+        REAP_ENABLED="false"
+    fi
+    REAP_BATCH_LIMIT="500"
+    if [[ "$REAP_ENABLED" == "true" ]]; then
+        echo "  Each expiry is a firewall call, so a large existing backlog is"
+        echo "  drained in batches rather than all at once."
+        REAP_BATCH_LIMIT=$(ask_int "  Max blocks to expire per hourly sweep?" "500" 1 100000)
+    fi
+
     # --- POST-flood detector (v1.5+) ---
     echo ""
     echo -e "${BOLD}  POST-flood detector (v1.5+)${NC}"
@@ -883,6 +905,14 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
     # v1.4 — Compromise detection
     if [[ "${COMPROMISE_ENABLED:-false}" == "true" ]]; then
         sed -i "/^\[compromise_detection\]/,/^\[/ s|^enabled = .*|enabled = true|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+    fi
+
+    # v1.7.9 — Block expiry reaper
+    if [[ "${REAP_ENABLED:-true}" == "false" ]]; then
+        sed -i "/^\[escalation\]/,/^\[/ s|^reap_enabled = .*|reap_enabled = false|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+    fi
+    if [[ -n "${REAP_BATCH_LIMIT:-}" && "${REAP_BATCH_LIMIT}" != "500" ]]; then
+        sed -i "/^\[escalation\]/,/^\[/ s|^reap_batch_limit = .*|reap_batch_limit = ${REAP_BATCH_LIMIT}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
     fi
 
     # v1.5 — POST-flood detector

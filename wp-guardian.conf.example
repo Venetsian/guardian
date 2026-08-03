@@ -76,6 +76,22 @@ tier2_lookback = 7d
 # Tier 3: persistent threat
 tier3_permanent = true
 
+# Block expiry reaper (v1.7.9+)
+# Nothing enforced the durations above before this. Every hour the daemon
+# unblocks tier-1/tier-2 IPs whose duration has elapsed and resets their tier
+# so a returning attacker escalates normally. Tier 3 is never expired.
+#
+# Turning this off restores the old behavior, which differed by backend:
+#   firewalld            — blocks were permanent (ipsets carry no TTL)
+#   mikrotik/nftables/csf — the firewall dropped the entry on its own TTL, but
+#                           the stale tier stopped the IP being re-blocked
+reap_enabled = true
+
+# Max IPs to unblock per hourly sweep. Each one is a firewall call (two on
+# firewalld: runtime + permanent), so a large backlog is drained gradually
+# rather than in one burst. 500/hour = 12,000/day.
+reap_batch_limit = 500
+
 [cidr]
 # CIDR /24 aggregation — auto-block entire subnet when enough IPs are blocked
 enabled = true
@@ -326,6 +342,20 @@ exclude_usernames =
 #   15169  = Google (Gmail / Workspace)
 #   714    = Apple (iCloud Mail)
 trusted_asns = 8075, 15169, 714
+
+# Services for which trusted_asns ALSO exempts from blocking, not just from
+# counting as evidence (v1.7.9+).
+#
+# Before this existed the two halves disagreed: a Microsoft relay was too
+# trusted to count as proof of compromise, then got firewall-dropped as the
+# attacker anyway. Since new Outlook syncs IMAP through Microsoft's cloud
+# rather than from the PC, that silently killed the client's mail — and
+# whitelisting the IP is whack-a-mole because Microsoft rotates them.
+#
+# Scoped to mail services on purpose. AS8075 is Office 365 *and* Azure, and
+# an Azure VM scanning wp-login.php should still be blocked — leave web and
+# ssh off this list. Set empty to disable the exemption entirely.
+trusted_asn_services = smtp, imap, pop3, roundcube
 
 # ---------------------------------------------------------------------------
 # v1.5 — CMS auto-detect & POST-flood

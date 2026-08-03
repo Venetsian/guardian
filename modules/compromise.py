@@ -16,6 +16,8 @@ Valid action modes:
 
 import logging
 
+from modules.config import parse_asn_list
+
 logger = logging.getLogger('wp-guardian.compromise')
 
 
@@ -39,6 +41,13 @@ class CompromiseAction:
             )
             self.action = 'alert_only'
 
+        # Same list DistributedAuthDetector excludes from the evidence.
+        # An ASN we refuse to count as proof cannot be the attacker we block.
+        self.trusted_asns = parse_asn_list(
+            config.get('compromise_detection', 'trusted_asns',
+                       fallback='8075, 15169, 714')
+        )
+
     def handle(self, username, service, trigger_rule, counts,
                window_seconds, actor='auto:DistributedAuthDetector'):
         """Main entry point called by the detector.
@@ -46,8 +55,22 @@ class CompromiseAction:
         Returns the compromise_events row id.
         """
         try:
-            attacker_ips = self.db.recent_auth_ips(username, window_seconds)
+            # Every IP seen in the window — the full set is recorded on the
+            # event for forensics, but only the untrusted ones are eligible
+            # for blocking (see _partition_by_trust).
+            observed = self.db.recent_auth_ips_with_asn(username, window_seconds)
+            attacker_ips, relay_ips = self._partition_by_trust(observed)
+            sample_ips = [row['ip'] for row in observed]
             sample_countries = self.db.recent_auth_countries(username, window_seconds)
+
+            if relay_ips:
+                logger.info(
+                    "Compromise {u}: {n} IP(s) held back from blocking — trusted "
+                    "cloud mail relay ASNs {a}".format(
+                        u=username, n=len(relay_ips),
+                        a=sorted({r['asn'] for r in relay_ips})
+                    )
+                )
 
             event_id = self.db.insert_compromise_event(
                 username=username,
@@ -55,7 +78,7 @@ class CompromiseAction:
                 trigger_rule=trigger_rule,
                 counts=counts,
                 window_seconds=window_seconds,
-                sample_ips=attacker_ips[:20],
+                sample_ips=sample_ips[:20],
                 sample_countries=sample_countries,
                 action_taken='pending',
             )
@@ -125,6 +148,28 @@ class CompromiseAction:
         )
 
         return event_id
+
+    def _partition_by_trust(self, observed):
+        """Split observed auth IPs into (blockable, trusted-relay).
+
+        Microsoft 365 syncs a mailbox through its own cloud rather than from
+        the user's PC, so the relay IP appears in the account's auth history
+        and rotates constantly (40.97.x, 40.104.x, 52.96.x ...). Blocking one
+        is both useless — it stops no attacker who has the password — and
+        actively harmful: it silently drops the legitimate client, which
+        surfaces to the user as "Waiting for your email provider" forever.
+        """
+        if not self.trusted_asns:
+            return ([row['ip'] for row in observed], [])
+
+        blockable = []
+        relays = []
+        for row in observed:
+            if row.get('asn') and row['asn'] in self.trusted_asns:
+                relays.append(row)
+            else:
+                blockable.append(row['ip'])
+        return (blockable, relays)
 
     def _block_ips(self, ips, username, service, event_id):
         """Block each attacker IP via the blocker. Returns count blocked."""

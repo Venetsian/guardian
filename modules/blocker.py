@@ -7,7 +7,7 @@ Determines tier, checks whitelist, executes block via the configured firewall ba
 import ipaddress
 import logging
 import time
-from modules.config import parse_duration
+from modules.config import parse_asn_list, parse_duration, parse_service_list
 
 logger = logging.getLogger('wp-guardian.blocker')
 block_logger = logging.getLogger('wp-guardian.blocks')
@@ -40,6 +40,26 @@ class Blocker:
         except (ValueError, TypeError):
             self.tier2_seconds = 2592000
 
+        # Block reaper settings (v1.7.9). Tier durations above are what the
+        # reaper measures against; these control the sweep itself.
+        self.reap_enabled = config.getboolean('escalation', 'reap_enabled', fallback=True)
+        self.reap_batch_limit = config.getint('escalation', 'reap_batch_limit', fallback=500)
+
+        # Trusted-ASN enforcement exemption (v1.7.9).
+        # Same list the DistributedAuthDetector excludes from evidence — an
+        # ASN we refuse to count as proof of compromise must not be firewall-
+        # dropped as the attacker either. Scoped to mail services on purpose:
+        # ASN 8075 is Microsoft 365 *and* Azure, and an Azure VM scanning
+        # wp-login.php is a legitimate block.
+        self.trusted_asns = parse_asn_list(
+            config.get('compromise_detection', 'trusted_asns',
+                       fallback='8075, 15169, 714')
+        )
+        self.trusted_asn_services = parse_service_list(
+            config.get('compromise_detection', 'trusted_asn_services',
+                       fallback='smtp, imap, pop3, roundcube')
+        )
+
         # CIDR aggregation settings
         self.cidr_enabled = config.getboolean('cidr', 'enabled', fallback=True)
         self.cidr_threshold = config.getint('cidr', 'threshold', fallback=5)
@@ -62,6 +82,9 @@ class Blocker:
         # keeps retrying — one heads-up per IP+service per day is enough.
         self._trusted_skip_alerts = {}
         self._trusted_skip_cooldown = 86400  # 24h
+
+        # Same dedupe for trusted-ASN enforcement skips: (ip, service).
+        self._trusted_asn_alerts = {}
 
     def set_digest_buffer(self, digest_buffer):
         """Wire in the digest buffer for alert routing."""
@@ -113,6 +136,11 @@ class Blocker:
 
         # Make sure IP is tracked in DB
         self.db.track_ip(ip, service, country=country, city=city, geo=geo)
+
+        # Safety: never firewall-drop a cloud mail relay. A manual block
+        # (force_tier set) is a deliberate operator decision and overrides this.
+        if force_tier is None and self._is_trusted_mail_asn(ip, service, rule, geo):
+            return False
 
         # Already blocked — don't waste a firewall call.
         # A manual block (force_tier set) deliberately bypasses this so the
@@ -199,6 +227,100 @@ class Blocker:
             )
 
         return blocked
+
+    def _is_trusted_mail_asn(self, ip, service, rule, geo):
+        """Refuse to block an IP that belongs to a trusted cloud mail relay.
+
+        Closes the asymmetry that broke Outlook for a client: the
+        DistributedAuthDetector excludes trusted ASNs from the *evidence*
+        (they relay one legitimate user through many DCs), but every
+        enforcement path — compromise IP-blocking, SMTP/IMAP/POP3/Roundcube
+        brute force — would still firewall-drop them. Microsoft rotates those
+        relay IPs, so per-IP whitelisting is whack-a-mole; the ASN is the
+        durable key.
+
+        Scoped by service so this cannot be abused as a blanket bypass:
+        ASN 8075 is Office 365 *and* Azure, and an Azure VM scanning
+        wp-login.php should still be blocked.
+        """
+        if not self.trusted_asns:
+            return False
+
+        service_key = (service or '').lower()
+        # Compromise handling inherits the exemption regardless of which
+        # service the auth arrived on — it blocks by account, not by protocol.
+        if service_key not in self.trusted_asn_services and rule != 'compromise':
+            return False
+
+        asn = 0
+        if geo:
+            try:
+                asn = int(geo.get('asn', 0) or 0)
+            except (TypeError, ValueError):
+                asn = 0
+        if asn <= 0:
+            # GeoIP disabled or no answer — fall back to whatever ASN we
+            # recorded for this IP previously. A relay that has authenticated
+            # here before is exactly the case we must not break.
+            try:
+                asn = self.db.last_known_asn(ip)
+            except Exception as e:
+                logger.debug(f"last_known_asn lookup failed for {ip}: {e}")
+                asn = 0
+
+        if asn <= 0 or asn not in self.trusted_asns:
+            return False
+
+        logger.warning(
+            f"TRUSTED-ASN SKIP ip={ip} asn={asn} service={service} rule={rule} "
+            f"— cloud mail relay, not blocking"
+        )
+        block_logger.info(
+            f"TRUSTED-ASN-SKIP ip={ip} asn={asn} service={service} rule={rule}"
+        )
+        self._alert_trusted_asn_skip(ip, asn, service, geo)
+        return True
+
+    def _alert_trusted_asn_skip(self, ip, asn, service, geo):
+        """One Telegram heads-up per (ip, service) per day for an ASN skip.
+
+        Routed through the same 'trusted_skip' verbosity rule as the
+        authenticated-IP heads-up — same operator meaning, same mute switch.
+        """
+        level = self._route('trusted_skip', tier=0, severity='medium')
+        if level == 'silent':
+            return
+
+        key = (ip, service)
+        now = time.time()
+        if now - self._trusted_asn_alerts.get(key, 0) < self._trusted_skip_cooldown:
+            return
+        self._trusted_asn_alerts[key] = now
+
+        org = ''
+        if geo:
+            org = geo.get('asn_org', '') or ''
+        org_line = f" ({org})" if org else ""
+
+        try:
+            if level == 'digest' and self.digest_buffer:
+                self.digest_buffer.queue(
+                    'trusted_skip', 'medium',
+                    f"trusted-ASN skip {service} {ip} (AS{asn})",
+                    payload={'ip': ip, 'asn': asn, 'asn_org': org,
+                             'service': service, 'rule': 'trusted_skip'}
+                )
+            else:
+                self.telegram.send(
+                    f"ℹ️ <b>WP-Guardian — trusted-ASN skip</b>\n"
+                    f"IP: <code>{ip}</code> is in AS{asn}{org_line},"
+                    f" a trusted cloud mail relay, so it was NOT blocked"
+                    f" despite tripping a {service.upper()} rule.\n"
+                    f"Blocking a relay only cuts off legitimate clients.",
+                    priority='MEDIUM'
+                )
+        except Exception as e:
+            logger.debug(f"trusted-ASN skip alert failed: {e}")
 
     def _check_cidr_aggregation(self, ip, service):
         """After blocking an IP, check if its /24 subnet should be blocked too."""
@@ -319,8 +441,53 @@ class Blocker:
         except Exception as e:
             logger.debug(f"alert_trusted_skip send failed: {e}")
 
+    def alert_guardian_disabled_skip(self, ip, service, username, count, window):
+        """Heads-up when we suppress a block because WE disabled the mailbox.
+
+        Operator-actionable in a way the other skips are not: the account is
+        still out of service, and the owner is sitting there watching their
+        mail client fail. Deduped per (ip, service) per 24h like the others.
+        """
+        level = self._route('trusted_skip', tier=0, severity='medium')
+        if level == 'silent':
+            return
+
+        key = (ip, service, 'guardian-disabled')
+        now = time.time()
+        if now - self._trusted_skip_alerts.get(key, 0) < self._trusted_skip_cooldown:
+            return
+        self._trusted_skip_alerts[key] = now
+
+        try:
+            if level == 'digest' and self.digest_buffer:
+                self.digest_buffer.queue(
+                    'trusted_skip', 'medium',
+                    f"guardian-disabled skip {service} {ip} ({username})",
+                    payload={'ip': ip, 'service': service, 'username': username,
+                             'rule': 'trusted_skip', 'count': count, 'window': window}
+                )
+            else:
+                self.telegram.send(
+                    f"⚠️ <b>WP-Guardian — disabled mailbox still in use</b>\n"
+                    f"Account: <code>{username}</code>\n"
+                    f"IP: <code>{ip}</code> (a known client of this account)\n"
+                    f"Failed {service.upper()} auth {count}x in {window}s — <b>not blocked</b>,"
+                    f" because Guardian disabled this mailbox and those failures are ours.\n"
+                    f"Re-enable it or tell the user, or they'll keep retrying forever.",
+                    priority='HIGH'
+                )
+        except Exception as e:
+            logger.debug(f"guardian-disabled skip alert failed: {e}")
+
     def unblock(self, ip):
-        """Manually unblock an IP from the firewall."""
+        """Manually unblock an IP from the firewall.
+
+        Also clears the IP's block history so the next block starts at tier 1.
+        Without that, unblocking a false positive armed the next escalation:
+        the client retried, got re-blocked, and determine_tier() read the
+        block_log row we had just overridden — so every rescue attempt
+        promoted the victim one tier, 1 -> 2 -> 3 (permanent).
+        """
         self.firewall.unblock(ip)
 
         # Reset tier in database
@@ -328,10 +495,104 @@ class Blocker:
             "UPDATE ip_history SET current_tier = 0 WHERE ip = ?", (ip,)
         )
         self.db.conn.commit()
-        logger.info(f"UNBLOCKED {ip}")
-        block_logger.info(f"UNBLOCKED ip={ip}")
+
+        cleared = self.db.clear_block_history(ip)
+
+        logger.info(f"UNBLOCKED {ip} (escalation history cleared: {cleared} rows)")
+        block_logger.info(f"UNBLOCKED ip={ip} cleared_blocks={cleared}")
 
         return True
+
+    # ------------------------------------------------------------------
+    # Block expiry reaper (v1.7.9)
+    # ------------------------------------------------------------------
+    def reap_expired_blocks(self, limit=None, dry_run=False):
+        """Retire tier-1 / tier-2 blocks whose configured duration has elapsed.
+
+        Nothing enforced block durations before this. Depending on the backend
+        that failed in one of two opposite directions:
+
+          * firewalld — the backend documents "the daemon's cleanup loop calls
+            unblock() when an entry expires", but no such call existed, and the
+            ipsets carry no per-entry timeout. Every "24h" block was permanent.
+          * mikrotik / nftables / csf — the firewall expired the entry on its
+            own TTL, but ip_history.current_tier stayed >0 forever, so block()
+            short-circuited on "already blocked" and a returning attacker was
+            never re-pushed.
+
+        One sweep fixes both: unblock() is idempotent, so calling it on an
+        already-expired entry is a no-op that still clears the stale tier.
+
+        Returns {'expired': int, 'failed': int, 'remaining': int}.
+        """
+        if self.firewall is None:
+            return {'expired': 0, 'failed': 0, 'remaining': 0}
+
+        # Global dry-run must not issue real unblocks either.
+        dry_run = dry_run or self.dry_run
+
+        batch = self.reap_batch_limit if limit is None else int(limit)
+        if batch <= 0:
+            return {'expired': 0, 'failed': 0, 'remaining': 0}
+
+        try:
+            candidates = self.db.get_expired_blocks(
+                self.tier1_seconds, self.tier2_seconds, limit=batch
+            )
+            total = self.db.count_expired_blocks(self.tier1_seconds, self.tier2_seconds)
+        except Exception as e:
+            logger.error(f"Block reaper query failed: {e}")
+            return {'expired': 0, 'failed': 0, 'remaining': 0}
+
+        if not candidates:
+            return {'expired': 0, 'failed': 0, 'remaining': 0}
+
+        expired = 0
+        failed = 0
+        now = time.time()
+
+        for entry in candidates:
+            ip = entry['ip']
+            age_h = int((now - entry['blocked_at']) / 3600)
+
+            if dry_run:
+                logger.info(
+                    f"[DRY-RUN] Would expire tier-{entry['tier']} block on {ip} "
+                    f"(blocked {age_h}h ago, service={entry['service']})"
+                )
+                expired += 1
+                continue
+
+            try:
+                ok = self.firewall.unblock(ip)
+            except Exception as e:
+                logger.error(f"Reaper unblock failed for {ip}: {e}")
+                ok = False
+
+            if not ok:
+                # Leave the tier set so the next sweep retries it. A backend
+                # that is down must not silently drop blocks from the DB.
+                failed += 1
+                continue
+
+            # block_log is left untouched on purpose — those rows are the
+            # escalation evidence, so a bot that comes back gets tier 2.
+            self.db.expire_block_tier(ip)
+            expired += 1
+            block_logger.info(
+                f"EXPIRED ip={ip} tier={entry['tier']} age={age_h}h "
+                f"service={entry['service']}"
+            )
+
+        remaining = max(0, total - expired)
+        if expired or failed:
+            logger.info(
+                f"Block reaper: expired {expired}, failed {failed}, "
+                f"{remaining} still pending"
+                + (" [DRY-RUN]" if dry_run else "")
+            )
+
+        return {'expired': expired, 'failed': failed, 'remaining': remaining}
 
     # ------------------------------------------------------------------
     # Manual (operator-initiated) blocking — Telegram /block and CLI --block
