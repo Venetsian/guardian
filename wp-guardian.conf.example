@@ -87,9 +87,15 @@ tier3_permanent = true
 #                           the stale tier stopped the IP being re-blocked
 reap_enabled = true
 
-# Max IPs to unblock per hourly sweep. Each one is a firewall call (two on
-# firewalld: runtime + permanent), so a large backlog is drained gradually
-# rather than in one burst. 500/hour = 12,000/day.
+# Max IPs to expire per hourly sweep. 500/hour = 12,000/day.
+#
+# Only really matters on firewalld and pfSense, where every expiry is a
+# firewall call (two on firewalld: runtime + permanent), so a large backlog is
+# drained gradually rather than in one burst.
+#
+# On mikrotik, nftables and csf the firewall expires entries on its own TTL,
+# so the sweep just clears the stale tier in the database and issues no
+# firewall calls at all — raise this freely there.
 reap_batch_limit = 500
 
 [cidr]

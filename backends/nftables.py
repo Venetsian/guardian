@@ -36,6 +36,8 @@ class NftablesBackend(FirewallBackend):
 
     supports_cidr = True
     supports_friendly_list = False  # Use whitelist.conf
+    # Set elements are added with a per-element `timeout` for tiers 1 and 2.
+    expires_own_entries = True
 
     def __init__(self, config):
         # Parse tier durations

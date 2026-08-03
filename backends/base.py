@@ -20,6 +20,25 @@ class FirewallBackend(ABC):
     # Override in subclass if the backend maintains a "friendly" / never-block list
     supports_friendly_list = False
 
+    # Override to True if the backend applies its own per-entry TTL for tier 1
+    # and tier 2, so entries disappear without anyone asking (v1.7.9+).
+    #
+    # This is what the block reaper checks. When True it skips the unblock()
+    # call entirely and only clears the stale tier in the database — the
+    # firewall has already forgotten the IP, so the call would be a guaranteed
+    # no-op. On MikroTik that no-op costs three SSH round-trips per IP.
+    #
+    # Set it True ONLY if block() attaches a real expiry for tiers 1 and 2:
+    #   mikrotik  timeout=24h / 30d on the address-list entry
+    #   nftables  per-element `timeout` in the set
+    #   csf       `csf -td <ip> <seconds>` temporary deny
+    # Leave it False if entries persist until explicitly removed:
+    #   firewalld ipset entries carry no TTL
+    #   pfsense   flat alias, tier is ignored
+    # False is the safe default: a wrong True leaves entries blocked at the
+    # firewall that the database no longer knows about.
+    expires_own_entries = False
+
     @abstractmethod
     def block(self, ip, tier, reason, service='web'):
         """

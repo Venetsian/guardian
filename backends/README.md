@@ -165,6 +165,42 @@ tier1_dur = config.get('escalation', 'tier1_duration', fallback='24h')
 tier2_dur = config.get('escalation', 'tier2_duration', fallback='30d')
 ```
 
+### Who enforces the duration — `expires_own_entries` (v1.7.9+)
+
+There are two valid ways to honor a tier duration, and your backend must
+declare which one it uses:
+
+```python
+expires_own_entries = True   # the firewall drops the entry on its own TTL
+expires_own_entries = False  # entries persist until unblock() removes them
+```
+
+| Backend | Value | Mechanism |
+|---------|-------|-----------|
+| mikrotik | `True` | `timeout=24h` / `30d` on the address-list entry |
+| nftables | `True` | per-element `timeout` in the set |
+| csf | `True` | `csf -td <ip> <seconds>` temporary deny |
+| firewalld | `False` | ipset entries carry no TTL |
+| pfsense | `False` | flat alias, tier ignored |
+
+`Blocker.reap_expired_blocks()` reads this flag on the hourly sweep:
+
+- **`True`** — skip `unblock()` and only clear the stale tier in `ip_history`.
+  The firewall already forgot the IP, so the call would be a guaranteed no-op.
+  On MikroTik that no-op costs three SSH round-trips per IP.
+- **`False`** — call `unblock()`, and only clear the tier if it returns True,
+  so a backend outage can't silently drop blocks from the database.
+
+**The tier reset happens either way, and it is the part that matters.** Without
+it, `block()` short-circuits on "already blocked at tier N" and a returning
+attacker is never re-pushed — even on a self-expiring backend that dropped the
+entry hours ago.
+
+Default is `False`. A wrong `True` leaves entries blocked at the firewall that
+the database no longer tracks — the worst failure direction — so only set it if
+`block()` genuinely attaches an expiry for **both** tier 1 and tier 2. Tier 3 is
+permanent and the reaper never touches it.
+
 ## Python 3.6 Compatibility
 
 WP-Guardian targets Python 3.6.8. Do NOT use:

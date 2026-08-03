@@ -551,6 +551,13 @@ class Blocker:
         failed = 0
         now = time.time()
 
+        # Backends that attach their own per-entry TTL (mikrotik, nftables,
+        # csf) have already dropped these entries. There the reaper's whole
+        # job is clearing the stale tier — without it, block() short-circuits
+        # on "already blocked at tier N" and a returning attacker is never
+        # re-pushed, even though the firewall forgot them long ago.
+        self_expiring = getattr(self.firewall, 'expires_own_entries', False)
+
         for entry in candidates:
             ip = entry['ip']
             age_h = int((now - entry['blocked_at']) / 3600)
@@ -563,11 +570,19 @@ class Blocker:
                 expired += 1
                 continue
 
-            try:
-                ok = self.firewall.unblock(ip)
-            except Exception as e:
-                logger.error(f"Reaper unblock failed for {ip}: {e}")
-                ok = False
+            if self_expiring:
+                # The firewall already dropped this entry on its own TTL, so
+                # calling unblock() would be a guaranteed no-op — and on
+                # MikroTik a no-op costs three SSH round-trips. All that's
+                # left to fix is the stale tier in our own table, which is
+                # what was silently breaking re-blocking on these backends.
+                ok = True
+            else:
+                try:
+                    ok = self.firewall.unblock(ip)
+                except Exception as e:
+                    logger.error(f"Reaper unblock failed for {ip}: {e}")
+                    ok = False
 
             if not ok:
                 # Leave the tier set so the next sweep retries it. A backend
@@ -586,8 +601,10 @@ class Blocker:
 
         remaining = max(0, total - expired)
         if expired or failed:
+            how = 'tier reset only, firewall self-expires' if self_expiring \
+                else f'unblocked via {self._backend_name}'
             logger.info(
-                f"Block reaper: expired {expired}, failed {failed}, "
+                f"Block reaper: expired {expired} ({how}), failed {failed}, "
                 f"{remaining} still pending"
                 + (" [DRY-RUN]" if dry_run else "")
             )

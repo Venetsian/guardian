@@ -21,6 +21,9 @@ class CSFBackend(FirewallBackend):
 
     supports_cidr = True
     supports_friendly_list = True
+    # Tiers 1 and 2 go in via `csf -td <ip> <seconds>`, which CSF expires
+    # itself. Tier 3 uses `csf -d` (permanent) and the reaper never touches it.
+    expires_own_entries = True
 
     def __init__(self, config):
         # Parse tier durations for temp blocks

@@ -45,6 +45,9 @@ class FirewalldBackend(FirewallBackend):
 
     supports_cidr = True
     supports_friendly_list = False  # No built-in friendly list; use whitelist.conf
+    # ipset entries deliberately carry no TTL (see module docstring), so the
+    # reaper MUST call unblock() here — nothing else ever removes them.
+    expires_own_entries = False
 
     def __init__(self, config):
         # Parse tier durations (kept for logging / future use; TTLs owned by DB)

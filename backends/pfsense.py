@@ -40,6 +40,9 @@ class PfSenseBackend(FirewallBackend):
 
     supports_cidr = True
     supports_friendly_list = False  # Managed via aliases on the device
+    # block() ignores tier — one flat alias with no expiry, so entries persist
+    # until unblock() removes them. The reaper must call through.
+    expires_own_entries = False
 
     def __init__(self, config):
         # API connection settings

@@ -95,9 +95,24 @@ both failure modes. Tier 3 is never expired. If a firewall call fails the tier i
 left set and the next sweep retries, so a backend outage can't silently drop
 blocks from the database.
 
-Batched at `reap_batch_limit` (default 500/hour) because the first sweep on an
-established install may face thousands of stale blocks, each costing a firewall
-call — two on firewalld (runtime + permanent).
+**The firewall call is skipped where it would be a no-op.** Backends declare a
+new `expires_own_entries` capability (default `False`):
+
+| Backend | Flag | Reaper does |
+|---|---|---|
+| mikrotik, nftables, csf | `True` | tier reset only — the entry already expired on the firewall's own TTL |
+| firewalld, pfsense | `False` | `unblock()` then tier reset — nothing else removes these |
+
+On MikroTik that turns a 500-IP sweep from 1,500 SSH round-trips into pure
+SQLite. The tier reset is the half that matters everywhere: without it,
+`block()` short-circuits on "already blocked" and the returning attacker is
+never re-pushed, even though RouterOS dropped the entry hours ago. Default
+`False` is the safe direction — a wrong `True` would leave entries blocked at
+the firewall that the database no longer tracks.
+
+Batched at `reap_batch_limit` (default 500/hour), which now only really binds
+on firewalld and pfSense; on the self-expiring backends a sweep issues no
+firewall calls at all.
 
 ### New
 
@@ -135,6 +150,9 @@ trusted_asn_services = smtp, imap, pop3, roundcube
 
 - `modules/blocker.py` — trusted-ASN enforcement guard, `reap_expired_blocks()`,
   `unblock()` clears escalation history, `alert_guardian_disabled_skip()`
+- `backends/base.py` — `expires_own_entries` capability flag (default `False`)
+- `backends/mikrotik.py`, `backends/nftables.py`, `backends/csf.py` — declare `True`
+- `backends/pfsense.py` — declare `False`; `backends/README.md` — document the flag
 - `modules/compromise.py` — partition attacker IPs by trusted ASN
 - `modules/database.py` — `cleared_at` column, `clear_block_history()`,
   `get_expired_blocks()`, `count_expired_blocks()`, `expire_block_tier()`,

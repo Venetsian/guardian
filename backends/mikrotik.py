@@ -18,6 +18,9 @@ class MikroTikBackend(FirewallBackend):
 
     supports_cidr = True
     supports_friendly_list = True
+    # Address-list entries carry timeout=tier1_duration / tier2_duration, so
+    # RouterOS drops them on its own. The reaper only clears the stale tier.
+    expires_own_entries = True
 
     def __init__(self, config):
         self.host = config.get('mikrotik', 'host', fallback='192.168.2.1')
