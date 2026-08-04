@@ -29,6 +29,26 @@ author_enum_threshold = 8
 php_404_threshold = 20
 general_404_threshold = 50
 
+# Suspicious PHP scanning — random/gibberish .php filenames (v1.7.10+)
+# How many pattern hits within time_window before blocking.
+suspicious_threshold = 3
+# Which response statuses count as scanning evidence.
+#   404 = "no such file"          — the classic enumeration signature
+#   403 = "forbidden"             — deny-heavy installs (Apache/nginx `deny`,
+#                                   ModSecurity, CyberPanel) answer scans with
+#                                   403 instead of 404. On one Apache host in
+#                                   our fleet 403 outnumbers 404 on these paths
+#                                   by ~100:1, so dropping it removes almost
+#                                   all detections.
+#   401 = "auth required"         — server-level auth challenge on a probed path
+#
+# NARROW THIS TO '404' if the host serves a customer-facing PHP endpoint whose
+# name is 6+ lowercase letters (/billing.php, /account.php) and which returns
+# application-level 403s to logged-in users. Also add that endpoint to
+# [whitelist] legit_php_paths. Authenticated IPs are already exempt from this
+# rule, so this is a second line of defense for pre-login 403s.
+suspicious_statuses = 404, 401, 403
+
 # Login isolation — bots that ONLY hit wp-login.php without loading CSS
 # Threshold: how many wp-login.php requests with zero CSS loads = block
 login_isolation_threshold = 3
@@ -179,6 +199,14 @@ alias_cidr = wp_guardian_cidr
 [whitelist]
 # Path to whitelist file (one IP or CIDR per line, # for comments)
 file = /opt/wp-guardian/whitelist.conf
+
+# Legitimate PHP endpoints, exempt from the "suspicious PHP scanning" rule
+# (v1.7.10+). That rule matches ANY lowercase .php filename of 6+ letters, so
+# an ordinary application endpoint — /billing.php, /account.php, /support.php,
+# /profile.php — otherwise counts as a scan. Comma-separated, leading slash,
+# lowercase. Added to the built-in set (/api.php, /ajax.php, /public.php,
+# /cron.php, /rss.php, /feed.php, /client.php, /index.php), never replaces it.
+# legit_php_paths = /billing.php, /account.php
 
 [geoip]
 # MaxMind GeoLite2 databases (v1.4+)

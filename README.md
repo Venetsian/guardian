@@ -182,7 +182,7 @@ Each web access log line goes through these checks in order (first match wins):
 5. Skip safe paths (`/wp-admin/`, `/wp-includes/`)
 6. PHP in `/wp-content/uploads/` — instant block
 7. Known webshells (alfa.php, c99.php, etc.) — instant block
-8. Suspicious PHP patterns (random filenames) — block after 3 hits
+8. Suspicious PHP patterns (random filenames) — block after 3 hits (authenticated IPs exempt since v1.7.10; tunable via `suspicious_threshold` / `suspicious_statuses` / `legit_php_paths`)
 9. Tripwire paths from log analysis — instant block on 404/401/403
 10. Login isolation — wp-login.php without CSS = bot — block after 3 hits
 11. wp-login.php brute force — block after 10 failed POSTs
@@ -350,6 +350,23 @@ ssh_root_fail_threshold = 1       # v1.5+ — root attempts (1 = instant block)
 
 If you legitimately SSH as root from automation, whitelist its IP first or set `ssh_root_fail_threshold = 0`.
 
+### Suspicious PHP scanning (v1.7.10+)
+
+The `suspicious` rule matches **any** lowercase `.php` filename of 6+ letters, so your own application endpoints can trip it. Since v1.7.10 an IP that has authenticated on any service within `wp_trust_duration` is exempt, the same as every other tripwire rule — but three knobs are available for the pre-login case:
+
+```ini
+[thresholds]
+suspicious_threshold = 3               # pattern hits within time_window before blocking
+suspicious_statuses = 404, 401, 403    # which statuses count as scanning evidence
+
+[whitelist]
+legit_php_paths = /billing.php, /account.php
+```
+
+Built-in exemptions: `/api.php`, `/ajax.php`, `/public.php`, `/cron.php`, `/rss.php`, `/feed.php`, `/client.php`, `/index.php`. `legit_php_paths` adds to that set, it does not replace it.
+
+**On `suspicious_statuses`:** 404 is the classic enumeration signature, but deny-heavy installs (Apache/nginx `deny`, ModSecurity, CyberPanel) answer scans with **403** instead — on one Apache host in our fleet 403 outnumbers 404 on these paths by roughly 100:1, so the default counts all three. Narrow it to `404` only if this server fronts a customer portal whose PHP endpoints return application-level 403s to logged-in users.
+
 ### Remote troubleshooting
 
 All of the above is observable from Telegram once `commands_enabled = true`:
@@ -443,6 +460,8 @@ All of the above is observable from Telegram once `commands_enabled = true`:
 │   ├── backfill_maillog.py      # Seed auth_sessions from maillog history
 │   ├── backfill_ip_history.py   # Geo-enrich ip_history rows (v1.4.2+ repair)
 │   └── config-upgrade.py        # Detect & merge new config options on upgrade
+├── tests/
+│   └── test_web_suspicious.py   # Regression tests for the suspicious rule (v1.7.10+)
 ├── migrations/
 │   └── *.sql               # Database migrations (007_cms_sites, 008_posture_audit, 009_block_cleared_at)
 ├── state/

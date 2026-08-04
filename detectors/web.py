@@ -13,6 +13,7 @@ import logging
 
 from .base import HitTracker
 from .log_formats import parse_line
+from modules.config import parse_csv_set
 
 
 class WebDetector:
@@ -55,11 +56,23 @@ class WebDetector:
             (re.compile(r'/(alfa|c99|r57|wso|b374k|eval-stdin)\.php', re.IGNORECASE), 'Known webshell'),
         ]
 
-        # Short PHP filenames that are legitimate (not suspicious)
+        # PHP endpoints that are legitimate application entry points, not scans.
+        # The suspicious_patterns below deliberately over-match ordinary
+        # endpoint names (any lowercase 6+ letter .php), so this allowlist is
+        # what keeps a customer-facing endpoint from becoming a landmine.
+        # /index.php is listed explicitly — it was previously safe only by the
+        # accident of being 5 characters, missing both length regexes.
         self.legit_short_php = {
             '/api.php', '/ajax.php', '/public.php',
             '/cron.php', '/rss.php', '/feed.php',
+            '/client.php', '/index.php',
         }
+        # Per-install additions — [whitelist] legit_php_paths. An operator
+        # cannot be expected to patch the set above for their own app's
+        # /billing.php or /account.php.
+        self.legit_short_php |= parse_csv_set(
+            config.get('whitelist', 'legit_php_paths', fallback='')
+        )
 
         # Paths that should NEVER be tripwires (legitimate WordPress/app paths)
         self.safe_path_patterns = [
@@ -77,7 +90,17 @@ class WebDetector:
         ]
 
         self.hits_suspicious = HitTracker(self.time_window)
-        self.suspicious_threshold = 3
+        self.suspicious_threshold = config.getint('thresholds', 'suspicious_threshold', fallback=3)
+
+        # Which response statuses count as scanning evidence for the rule above.
+        # Default is every status the rule has always counted — deny-heavy
+        # installs answer scans with 403 (or 401), not 404, and on the Apache
+        # host in this fleet 403 outnumbers 404 on these paths by ~100:1.
+        # Hosts that instead serve a customer-facing PHP endpoint returning
+        # application-level 403s should narrow this to '404'.
+        self.suspicious_statuses = parse_csv_set(
+            config.get('thresholds', 'suspicious_statuses', fallback='404, 401, 403')
+        )
 
         # Login isolation detection
         self.login_isolation_threshold = config.getint('thresholds', 'login_isolation_threshold', fallback=3)
@@ -154,10 +177,20 @@ class WebDetector:
                     return
 
         # Check suspicious patterns (threshold-based)
-        if clean_path.endswith('.php') and status in ('404', '401', '403'):
+        if clean_path.endswith('.php') and status in self.suspicious_statuses:
             if clean_path not in self.legit_short_php:
                 for pattern in self.suspicious_patterns:
                     if pattern.search(clean_path):
+                        # Trust a recently-authenticated IP, same as every
+                        # other tripwire branch above. These patterns match
+                        # ordinary endpoint names, so a logged-in user hitting
+                        # a permission-denied response three times must not be
+                        # mistaken for a scanner.
+                        if self.db.is_ip_authenticated(ip, self.trust_duration):
+                            logging.getLogger('wp-guardian.web').warning(
+                                f"Authenticated IP {ip} hit suspicious pattern: {clean_path}"
+                            )
+                            return
                         count = self.hits_suspicious.add(ip)
                         if count >= self.suspicious_threshold:
                             self.blocker.block(ip, f"Suspicious PHP scanning ({count} pattern hits in {self.time_window}s)", service='web', site=site, rule='suspicious')

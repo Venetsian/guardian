@@ -730,6 +730,32 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
         REAP_BATCH_LIMIT=$(ask_int "  Max blocks to expire per hourly sweep?" "500" 1 100000)
     fi
 
+    # --- Suspicious PHP scanning rule (v1.7.10+) ---
+    echo ""
+    echo -e "${BOLD}  Suspicious PHP scanning — customer-facing endpoints (v1.7.10+)${NC}"
+    echo "  This rule blocks an IP after 3 hits on random/gibberish .php names."
+    echo "  It matches ANY lowercase .php filename of 6+ letters, so your own"
+    echo "  app endpoints (/billing.php, /account.php, /support.php) can trip it"
+    echo "  if they return 403/404 to a user. Already exempt: /api.php, /ajax.php,"
+    echo "  /public.php, /cron.php, /rss.php, /feed.php, /client.php, /index.php,"
+    echo "  plus any IP that logged in on any service in the last 24h."
+    echo ""
+    echo "  Leave blank unless this server hosts an app with its own PHP endpoints."
+    LEGIT_PHP_PATHS=$(ask "  Extra legitimate .php endpoints (comma-separated, e.g. /billing.php)" "")
+
+    echo ""
+    echo "  Which HTTP statuses count as scanning evidence?"
+    echo "    404,401,403 = default. Deny-heavy installs (Apache/nginx deny,"
+    echo "                  ModSecurity) answer scans with 403, not 404 —"
+    echo "                  dropping 403 there removes almost all detections."
+    echo "    404         = strictest against false positives. Choose this if"
+    echo "                  the server fronts a customer portal whose PHP"
+    echo "                  endpoints return 403 to logged-in users."
+    SUSPICIOUS_STATUSES="404, 401, 403"
+    if ask_yn "  Count only 404s (portal-style host)?" "n"; then
+        SUSPICIOUS_STATUSES="404"
+    fi
+
     # --- POST-flood detector (v1.5+) ---
     echo ""
     echo -e "${BOLD}  POST-flood detector (v1.5+)${NC}"
@@ -913,6 +939,15 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
     fi
     if [[ -n "${REAP_BATCH_LIMIT:-}" && "${REAP_BATCH_LIMIT}" != "500" ]]; then
         sed -i "/^\[escalation\]/,/^\[/ s|^reap_batch_limit = .*|reap_batch_limit = ${REAP_BATCH_LIMIT}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+    fi
+
+    # v1.7.10 — Suspicious PHP scanning tuning
+    if [[ -n "${SUSPICIOUS_STATUSES:-}" && "${SUSPICIOUS_STATUSES}" != "404, 401, 403" ]]; then
+        sed -i "/^\[thresholds\]/,/^\[/ s|^suspicious_statuses = .*|suspicious_statuses = ${SUSPICIOUS_STATUSES}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+    fi
+    if [[ -n "${LEGIT_PHP_PATHS:-}" ]]; then
+        # Shipped commented-out in the example — uncomment it with the value.
+        sed -i "/^\[whitelist\]/,/^\[/ s|^# *legit_php_paths = .*|legit_php_paths = ${LEGIT_PHP_PATHS}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
     fi
 
     # v1.5 — POST-flood detector

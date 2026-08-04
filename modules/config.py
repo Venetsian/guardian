@@ -64,15 +64,16 @@ def parse_asn_list(raw):
     return asns
 
 
-def parse_service_list(raw):
-    """Parse a comma/newline separated list of service names into a set.
+def parse_csv_set(raw, lower=True):
+    """Parse a comma/newline separated config value into a set of strings.
 
-    Lowercased and stripped. Used for [compromise_detection]
-    trusted_asn_services.
+    Ignores blank entries and '#' comments (whole-line or inline), the same
+    way parse_asn_list() does. Single source of truth for every plain-list
+    config option so they can't drift apart in how they're read.
     """
-    services = set()
+    items = set()
     if not raw:
-        return services
+        return items
 
     for token in str(raw).replace('\n', ',').split(','):
         token = token.strip()
@@ -81,9 +82,18 @@ def parse_service_list(raw):
         if '#' in token:
             token = token[:token.index('#')].strip()
         if token:
-            services.add(token.lower())
+            items.add(token.lower() if lower else token)
 
-    return services
+    return items
+
+
+def parse_service_list(raw):
+    """Parse a comma/newline separated list of service names into a set.
+
+    Lowercased and stripped. Used for [compromise_detection]
+    trusted_asn_services.
+    """
+    return parse_csv_set(raw)
 
 
 def load_config(config_path=None):

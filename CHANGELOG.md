@@ -1,5 +1,120 @@
 # WP-Guardian Changelog
 
+## v1.7.10 — the `suspicious` rule stops blocking logged-in customers (2026-08-04)
+
+Two paying customers were blocked at the firewall in two days on
+`mail.maiahost.com`, both while holding live, heavily-authenticated sessions.
+Neither was doing anything unusual — they were clicking around a customer
+portal.
+
+### The bug
+
+`detectors/web.py` runs six tripwire branches in order. Five of them consult
+`is_ip_authenticated()` before blocking. The threshold-based `suspicious`
+branch — the one whose own source comment reads *"suspicious but could be a
+mistake"* — was the only one that did not. It was therefore **stricter than
+the branch for known webshells**, which is documented as "no legitimate use
+ever".
+
+That inversion mattered because of what the rule matches. The pattern
+`^/[a-z]{6,}\.php$` matches essentially any lowercase application endpoint of
+six or more letters: `/client.php`, `/account.php`, `/billing.php`,
+`/profile.php`, `/support.php`. The mitigating allowlist was a hardcoded
+six-entry set that an operator could not extend without editing code — and had
+already been patched reactively, which is why `/public.php` was exempt and
+`/client.php` was not. `/index.php` survived only by the accident of being five
+characters, missing both length regexes.
+
+Three permission-denied responses within 300 seconds was all it took:
+
+```
+13:08:24  POST /client.php  200
+13:08:29  POST /client.php  403   <- hit 1
+13:08:34  POST /client.php  403   <- hit 2
+13:08:40  POST /client.php  200
+13:08:46  POST /client.php  403   <- hit 3 -> BLOCKED
+```
+
+Twenty-two seconds, with 200s interleaved proving the session was live
+throughout. Those 403s were the application's own `AuthorizationException` —
+a logged-in user touching a feature outside their permissions. The IP had 203
+successful authentications in the preceding 24 hours.
+
+Present since `fae423c` (2026-05-03), so roughly three months in the fleet.
+
+### 1. Authenticated IPs are exempt (the fix that matters)
+
+The `suspicious` branch now consults `is_ip_authenticated()` and logs a warning
+instead of blocking, identical to the five branches around it. Requires no
+configuration and no per-install knowledge of which endpoints an app exposes.
+Verified against both incidents: neither IP would have been blocked.
+
+This widens what a recently-authenticated IP may do before tripping *this*
+rule. That tradeoff is already accepted for webshell and tripwire hits, which
+are strictly higher-signal, and the `instant` / `structural` branches still run
+*before* this one — so a known webshell blocks an authenticated IP as before.
+Real credential theft remains covered by `DistributedAuthDetector`, which
+watches the same username across countries/ASNs regardless of trust state.
+
+### 2. `suspicious_statuses` — which statuses count as scanning evidence
+
+New `[thresholds] suspicious_statuses`, **default `404, 401, 403` — unchanged
+behavior.**
+
+The bug report that prompted this release recommended defaulting to `404`
+alone, reasoning that 404 means "no such resource" (enumeration) while 401/403
+mean the app made a deliberate auth decision. On `mail.maiahost.com` that is
+exactly right: of 9 total 403s on matching paths, 6 were the two false
+positives and the other 3 were single hits from three different scanner IPs on
+three different days — never enough to reach a threshold of 3. 401 had never
+occurred at all.
+
+It does not generalize, and the report flagged that risk itself. Measuring the
+rest of the fleet before choosing the default:
+
+| Host | 404 | 403 | 401 |
+|---|---|---|---|
+| mail (nginx, portal) | 4,223 | 9 | 0 |
+| web (Apache) | 212 | **22,631** | 0 |
+| srv.dotcom.services (OLS, 147 vhosts) | 348,054 | 28,297 | 8,706 |
+
+Deny-heavy installs answer scans with 403, not 404. On the Apache host 403
+outnumbers 404 on these paths by roughly 100:1, and the top offenders are
+unambiguous — `/phpinfo.php`, `/x.php`, `/config.php`, `/1.php`,
+`/classwithtostring.php`. A 404-only default would have removed **almost every
+detection on that host**, and roughly 10% on `srv`. So the default preserves
+current behavior and the knob exists for portal-style hosts to narrow it.
+
+### 3. `legit_php_paths` — a per-install allowlist
+
+New `[whitelist] legit_php_paths`, comma-separated, added to (never replacing)
+the built-in set. `/client.php` and `/index.php` join the built-ins —
+`/index.php` explicitly, so it no longer depends on a filename-length accident.
+
+### 4. `suspicious_threshold` is configurable
+
+Was hardcoded to 3 while every neighbouring threshold was configurable. Default
+unchanged.
+
+### Fleet blast radius
+
+Across all four hosts: **12,223** `suspicious` blocks total, **2** false
+positives — both on mail, both already released. The rule is doing real work;
+it just had no floor under it. The audit query is in `docs/` and reproduced in
+the report: join `block_log` against `auth_sessions` in the 24h before each
+block.
+
+### Files changed
+
+- `detectors/web.py` — auth guard, `suspicious_statuses`, `suspicious_threshold`, allowlist
+- `modules/config.py` — `parse_csv_set()`; `parse_service_list()` now delegates to it
+- `wp-guardian.conf`, `wp-guardian.conf.example` — three new keys
+- `install.sh` — setup questions for the endpoint allowlist and status list
+- `tests/test_web_suspicious.py` — **new**, 11 regression tests
+
+No database migration. All three config keys are additive with behavior-
+preserving fallbacks, so existing `wp-guardian.conf` files need no edits.
+
 ## v1.7.9 — false positives are no longer permanent (2026-08-03)
 
 Four bugs that compounded into a multi-day mail outage for a client on
