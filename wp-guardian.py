@@ -559,6 +559,17 @@ class Guardian:
             while self.running:
                 now = time.time()
 
+                # A signal can land anywhere inside an iteration, and
+                # shutdown() closes the SQLite connection. Without this check
+                # the periodic tasks below keep running against a closed
+                # database and a clean `systemctl restart` exits 1, which
+                # systemd reports as 'Failed with result exit-code' — making
+                # every routine restart look like a crash and burying real
+                # ones. Re-check here so the window is one iteration, not one
+                # full periodic pass.
+                if not self.running:
+                    break
+
                 # Cleanup expired data
                 if now - last_cleanup > cleanup_interval:
                     auth_retention = self.config.getint('database', 'auth_retention_days', fallback=90)
@@ -601,11 +612,16 @@ class Guardian:
 
                     last_cleanup = now
 
-                # Daily summary
+                # Daily summary — the one periodic task that was not guarded,
+                # which is why it, and only it, turned a shutdown race into a
+                # fatal exception. The reapers above have always been wrapped.
                 if now - last_summary > summary_interval:
-                    stats = self.db.get_stats()
-                    self.telegram.alert_daily_summary(stats)
-                    self.logger.info(f"Daily stats: {dict(stats)}")
+                    try:
+                        stats = self.db.get_stats()
+                        self.telegram.alert_daily_summary(stats)
+                        self.logger.info(f"Daily stats: {dict(stats)}")
+                    except Exception as e:
+                        self.logger.error(f"Daily summary failed: {e}")
                     last_summary = now
 
                 # Clean up in-memory trackers

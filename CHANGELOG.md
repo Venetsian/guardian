@@ -1,5 +1,42 @@
 # WP-Guardian Changelog
 
+## v1.7.14 — a clean restart no longer reports as a crash (2026-08-12)
+
+Long-standing bug, surfaced by upgrading four hosts in a row. On
+`wp.maiahost.com` a routine `systemctl restart` logged:
+
+```
+sqlite3.ProgrammingError: Cannot operate on a closed database
+  File "wp-guardian.py", line 606, in start
+    stats = self.db.get_stats()
+systemd[1]: wp-guardian.service: Failed with result 'exit-code'.
+```
+
+A signal can arrive anywhere inside a main-loop iteration. `shutdown()` closes
+the SQLite connection, but the loop had already passed its `while self.running`
+check and carried on into the periodic tasks — against a closed database.
+
+The daily-summary block was the only periodic task not wrapped in
+`try/except`; both reapers already were. So it was the one place the race
+became a fatal exception, exiting 1 and making a clean stop look like a crash.
+
+The service always came back, so nothing was lost. The cost was diagnostic:
+every routine restart left `Failed with result 'exit-code'` in the journal,
+which is exactly the string you grep for when hunting a real failure. It cost
+real time during this upgrade before being identified as benign.
+
+Two fixes: re-check `self.running` at the top of each iteration so the race
+window is one iteration rather than one full periodic pass, and wrap the daily
+summary like its neighbours.
+
+No config or schema changes.
+
+### Files changed
+
+`wp-guardian.py`, `VERSION`
+
+---
+
 ## v1.7.13 — `--detect-mail-schema` output is paste-safe (2026-08-12)
 
 Bugfix for v1.7.12. `--detect-mail-schema` printed its suggested settings
