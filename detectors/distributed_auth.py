@@ -33,11 +33,19 @@ class DistributedAuthDetector:
         self.window_seconds = config.getint(
             'compromise_detection', 'window_seconds', fallback=3600
         )
+        # Recalibrated in v1.7.11. The old defaults (3 countries / 5 ASNs) sat
+        # on the noise floor: of six lifetime events, the five false positives
+        # landed on their threshold EXACTLY and never one above, while the only
+        # true positive cleared it by roughly an order of magnitude (28
+        # countries, 39 ASNs, 62 IPs). A large empty region separates the two
+        # populations and the thresholds were pinned to the bottom of it.
+        # 6 / 10 sits inside that gap: every historical false positive falls
+        # silent, the real compromise still trips with a wide margin.
         self.threshold_countries = config.getint(
-            'compromise_detection', 'threshold_distinct_countries', fallback=3
+            'compromise_detection', 'threshold_distinct_countries', fallback=6
         )
         self.threshold_asns = config.getint(
-            'compromise_detection', 'threshold_distinct_asns', fallback=5
+            'compromise_detection', 'threshold_distinct_asns', fallback=10
         )
         self.threshold_ips = config.getint(
             'compromise_detection', 'threshold_distinct_ips', fallback=20

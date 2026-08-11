@@ -344,9 +344,20 @@ enabled = false
 # Sliding window in seconds (default 3600 = 1 hour)
 window_seconds = 3600
 
-# Fire when ANY of these thresholds are hit
-threshold_distinct_countries = 3
-threshold_distinct_asns = 5
+# Fire when ANY of these thresholds are hit.
+#
+# Recalibrated in v1.7.11. The previous defaults (3 countries / 5 ASNs) sat on
+# the noise floor: across six lifetime events on the reference host, all five
+# false positives landed on their threshold EXACTLY and never one above, while
+# the only genuine compromise cleared it by roughly an order of magnitude
+# (28 countries, 39 ASNs, 62 IPs). A wide empty region separates the two
+# populations; these values sit inside it.
+#
+# Raise them further if you host users who legitimately roam a lot. Lowering
+# them back toward 3/5 reintroduces the false positives — a multi-homed user
+# with two fixed lines and a phone routinely reaches 4-5 ASNs in an hour.
+threshold_distinct_countries = 6
+threshold_distinct_asns = 10
 threshold_distinct_ips = 20
 
 # What to do on detection:
@@ -355,6 +366,51 @@ threshold_distinct_ips = 20
 #   disable_mailbox  — alert + disable mailbox in the mail backend
 #   full             — alert + block IPs + disable mailbox (default)
 action = full
+
+# Per-rule enforcement (v1.7.11+). Overrides `action` for one trigger rule;
+# omit a key to inherit `action`.
+#
+# The three rules are not equally trustworthy. `countries` caught the only
+# real compromise on record. `asns` has fired twice and been wrong twice —
+# both times at exactly 5 of 5 ASNs inside a SINGLE country, which is what a
+# US consumer user looks like when their phone roams between carrier pools.
+# One country cannot corroborate a distributed-abuse story, so an ASN-only
+# trigger alerts and leaves both the mailbox and the client's IPs alone.
+#
+# Note this also governs IP blocking: under alert_only the source IPs are NOT
+# firewall-blocked. In the 2026-08-09 false positive five of the client's own
+# addresses were dropped alongside his mailbox.
+#
+# If you remove these keys entirely, `asns` still defaults to alert_only in
+# code. Set action_asns = full explicitly to override that.
+action_countries = full
+action_asns = alert_only
+action_ips = full
+
+# Provisional disables (v1.7.11+).
+#
+# Hours a compromise mailbox-disable stands before Guardian reverses it
+# automatically. Absent operator confirmation the disable is treated as
+# PROVISIONAL, which bounds the cost of a detection error — including error
+# classes nobody has predicted. The 2026-08-09 false positive ran 16h04m
+# because the alert arrived at 23:44 and the operator was asleep; the client
+# only escaped a full night of dead mail because his device happened not to
+# poll overnight.
+#
+# This is safe because reversal does NOT restore the attacker's access: the
+# source IPs stay firewall-blocked on the normal tier schedule (24h minimum),
+# so anyone benefiting would need entirely fresh infrastructure. What comes
+# back is the account, for its owner.
+#
+# /confirm <event_id> pins a disable permanently — before the window elapses,
+# or after (it re-disables). 0 disables the reversal entirely, restoring the
+# pre-v1.7.11 behaviour of "disabled until a human notices".
+auto_reenable_hours = 4
+
+# Max mailboxes restored per hourly sweep. Compromise events are rare; this
+# exists only so a pathological backlog cannot fire hundreds of mail-backend
+# writes in one tick.
+auto_reenable_batch_limit = 50
 
 # Anti-spam: don't re-fire for the same username within this many seconds
 suppression_seconds = 1800

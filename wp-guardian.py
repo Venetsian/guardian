@@ -568,6 +568,21 @@ class Guardian:
                         except Exception as e:
                             self.logger.error(f"Block reaper error: {e}")
 
+                    # Restore mailboxes whose provisional compromise disable
+                    # expired unconfirmed (v1.7.11). Bounds the outage from a
+                    # detection error to auto_reenable_hours instead of
+                    # "however long until a human notices".
+                    try:
+                        mb = self.compromise_action.reap_auto_disabled_mailboxes()
+                        if mb['restored'] or mb['failed']:
+                            self.logger.info(
+                                f"Mailbox reaper: {mb['restored']} restored, "
+                                f"{mb['failed']} failed, {mb['skipped']} skipped, "
+                                f"{mb['remaining']} still queued"
+                            )
+                    except Exception as e:
+                        self.logger.error(f"Mailbox reaper error: {e}")
+
                     last_cleanup = now
 
                 # Daily summary
@@ -1185,6 +1200,10 @@ def main():
     parser.add_argument('--reap-limit', type=int, default=None, metavar='N',
                         help='Max blocks to expire in this --reap-blocks run '
                              '(default: [escalation] reap_batch_limit)')
+    parser.add_argument('--reap-mailboxes', action='store_true',
+                        help='Restore mailboxes whose provisional compromise '
+                             'disable expired unconfirmed (combine with '
+                             '--dry-run to preview)')
     parser.add_argument('--flush', nargs='?', const='all', metavar='TABLE',
                         help='Flush data. Options: all, tripwires, blocks, auth, isolation (default: all)')
     parser.add_argument('--discover-logs', action='store_true',
@@ -1550,6 +1569,42 @@ def main():
             print("")
             print(f"  Re-run to continue, or let the hourly sweep drain it "
                   f"({limit}/hour).")
+        print("")
+        return
+
+    if args.reap_mailboxes:
+        ca = guardian.compromise_action
+        hours = ca.auto_reenable_seconds // 3600
+        print("")
+        print("Mailbox reaper — provisional compromise disables")
+        if hours > 0:
+            print(f"  auto_reenable  : {hours}h")
+        else:
+            print("  auto_reenable  : DISABLED (auto_reenable_hours = 0)")
+        if args.dry_run:
+            print("  mode           : DRY-RUN (nothing will be re-enabled)")
+        print("")
+
+        if hours <= 0:
+            print("Auto-reenable is off. Set [compromise_detection] "
+                  "auto_reenable_hours to enable it.")
+            print("")
+            return
+        if not (guardian.mail_backend and getattr(guardian.mail_backend, 'enabled', False)):
+            print("Mail backend not configured — cannot re-enable mailboxes.")
+            print("")
+            return
+
+        result = ca.reap_auto_disabled_mailboxes(dry_run=args.dry_run)
+        verb = 'would restore' if args.dry_run else 'restored'
+        print(f"  {verb:<14s} : {result['restored']}")
+        if result['skipped']:
+            print(f"  skipped        : {result['skipped']} (operator already "
+                  f"re-enabled them)")
+        if result['failed']:
+            print(f"  failed         : {result['failed']} (mail backend calls "
+                  f"did not succeed — will retry)")
+        print(f"  still pending  : {result['remaining']}")
         print("")
         return
 

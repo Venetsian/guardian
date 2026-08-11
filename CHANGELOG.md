@@ -1,5 +1,151 @@
 # WP-Guardian Changelog
 
+## v1.7.11 — compromise detection stops disabling travelling clients (2026-08-11)
+
+On 2026-08-09 at 23:44 UTC, `DistributedAuthDetector` auto-disabled
+`bob@example.net` and firewall-blocked five of the account holder's
+own IP addresses. He was travelling in the US. The "many ASNs" the detector
+saw were his phone roaming between AT&T carrier pools plus two rural ILECs and
+Charter — five networks, one country. Confirmed directly with the client.
+
+The mailbox stayed off for **16 hours and 4 minutes**, until an operator
+noticed the next afternoon. The client-visible outage was ten minutes only
+because his device happened not to poll overnight. That gap was luck.
+
+### The pattern in the event history
+
+| # | Date | Account | Rule | Countries | ASNs | IPs | Outcome |
+|---|---|---|---|---|---|---|---|
+| 1 | 2026-04-15 | alice@example.com | countries | **28** | **39** | **62** | real compromise |
+| 2 | 2026-04-29 | erin@example.com | countries | 3 | 3 | 4 | operator-reversed |
+| 3 | 2026-04-29 | erin@example.com | countries | 3 | 3 | 4 | operator-reversed |
+| 4 | 2026-06-22 | frank@example.net | countries | 3 | 3 | 3 | reversed in 10 min |
+| 5 | 2026-07-31 | carol@example.org | asns | 1 | 5 | 6 | false positive |
+| 6 | 2026-08-09 | bob@example.net | asns | 1 | 5 | 5 | false positive (confirmed) |
+
+Configured thresholds were 3 countries / 5 ASNs. **Every false positive landed
+on its threshold exactly, never one above. The only true positive cleared it by
+roughly an order of magnitude.** A wide empty region separates the two
+populations and the thresholds were pinned to the bottom of it.
+
+The account in event 6 was not even behaving unusually: it authenticated from
+66 distinct IPs over the retained month and hit 3–5 distinct ASNs *every single
+day*. Jul-15, Aug-03 and Aug-07 also reached five and did not fire. Aug-09
+fired only because five happened to fall inside the same rolling 3600-second
+window. The trigger was a windowing artifact over baseline behaviour.
+
+### 1. Thresholds recalibrated — 6 countries / 10 ASNs
+
+`threshold_distinct_countries` 3 → 6, `threshold_distinct_asns` 5 → 10. Both
+the config default and the code fallback, so an install that never edits its
+config still gets the change.
+
+Validated against the table: event 1 still triggers with a wide margin, events
+2–6 fall silent and produce no event at all.
+
+### 2. Per-rule enforcement — `action_<rule>`
+
+`action = full` applied identically to a 62-IP, 28-country trigger and to a
+1-country, 5-IP one. Enforcement now resolves per trigger rule:
+
+```ini
+action = full            # global fallback, unchanged
+action_countries = full
+action_asns = alert_only # ← the rule that has never once been right
+action_ips = full
+```
+
+`alert_only` records the event and alerts, but blocks nothing and disables
+nothing. **This governs IP blocking too** — in event 6 five of the client's own
+addresses were firewall-dropped alongside his mailbox, and that stops as well.
+
+`asns` defaults to `alert_only` **in code**, not only in the shipped config, so
+an existing install gets the protection on `git pull` + restart. An explicit
+`action_asns = full` still wins. `alert` is accepted as an alias for
+`alert_only`, and an unrecognised value fails safe to `alert_only` rather than
+toward disabling a paying customer's mailbox.
+
+### 3. Provisional disables — the outage is now bounded
+
+Thresholds move the noise floor; they don't stop a sufficiently unusual
+legitimate user from being disabled on geography alone. Detection will be wrong
+again. What changed is what being wrong costs.
+
+A compromise disable is now **provisional**: absent operator confirmation it is
+reversed after `auto_reenable_hours` (default **4**). The hourly sweep calls
+`CompromiseAction.reap_auto_disabled_mailboxes()`, restores the mailbox, and
+fires a HIGH Telegram alert. The event stays OPEN and unreviewed.
+
+This is safe because reversal does not restore the attacker's access: the
+source IPs remain firewall-blocked on the normal tier schedule (24h minimum),
+reaped separately by `Blocker.reap_expired_blocks`. Anyone benefiting would
+need entirely fresh infrastructure.
+
+`/confirm <event_id>` pins a disable permanently — before the window elapses,
+or after, in which case it re-disables the mailbox. That is the expected path
+when the operator wakes to an auto-restore alert and decides the detection was
+right. `auto_reenable_hours = 0` restores the old "disabled until a human
+notices" behaviour.
+
+The reaper skips mailboxes an operator already re-enabled by hand, and leaves
+an event unstamped when the mail backend call fails so the next sweep retries —
+a backend outage must not silently strand a disabled mailbox.
+
+### Config options
+
+| Key | Section | Default |
+|---|---|---|
+| `threshold_distinct_countries` | `[compromise_detection]` | `6` *(was 3)* |
+| `threshold_distinct_asns` | `[compromise_detection]` | `10` *(was 5)* |
+| `action_countries` | `[compromise_detection]` | inherits `action` |
+| `action_asns` | `[compromise_detection]` | `alert_only` |
+| `action_ips` | `[compromise_detection]` | inherits `action` |
+| `auto_reenable_hours` | `[compromise_detection]` | `4` |
+| `auto_reenable_batch_limit` | `[compromise_detection]` | `50` |
+
+### Commands
+
+- `/confirm <event_id> [note]` — the compromise was real; pin the disable
+- `--reap-mailboxes [--dry-run]` — run the provisional-disable sweep manually
+
+`/compromises` now shows `confirmed` / `auto-restored` alongside open/resolved.
+
+### Migration 010
+
+Adds `confirmed_at`, `confirmed_by`, `auto_reversed_at` to `compromise_events`.
+`confirmed_at` is deliberately distinct from `resolved_at`: *resolved* closes an
+incident, *confirmed* asserts the compromise was genuine and enforcement must
+stand. `auto_reversed_at` records that the reaper acted, leaving
+`mailbox_disabled` intact as the forensic record of what the event did.
+
+### Not done here
+
+The report backing this release also proposed requiring a corroborating abuse
+signal (outbound volume, recipient fan-out, rspamd verdicts, preceding
+auth-failure burst) before any auto-disable. That is the right long-term fix —
+geography should select candidates, abuse should authorise enforcement — but it
+is **not** a small patch, because Guardian has no outbound-mail visibility at
+all today: `MailDetector` parses four line shapes (SMTP/Dovecot auth
+success/failure) and ignores Postfix delivery lines entirely, nothing reads
+rspamd, and failed auths live in an in-memory `HitTracker` keyed by IP rather
+than username. It is the "Outbound SMTP volume monitoring" item from the future
+work list, scoped separately.
+
+Also noted while verifying: `account_baselines` is **never written**.
+`update_baseline()` and `is_known_location()` have zero call sites, so the
+per-account country/city baseline has been dead code since v1.3.
+
+### Files changed
+
+`modules/compromise.py`, `modules/database.py`, `modules/migrator.py`,
+`detectors/distributed_auth.py`, `actions/telegram.py`,
+`actions/telegram_commands.py`, `wp-guardian.py`,
+`migrations/010_compromise_confirmed_at.sql`,
+`tests/test_compromise_action.py`, `wp-guardian.conf`,
+`wp-guardian.conf.example`, `install.sh`, `README.md`, `CLAUDE.md`, `VERSION`
+
+---
+
 ## v1.7.10 — the `suspicious` rule stops blocking logged-in customers (2026-08-04)
 
 Two paying customers were blocked at the firewall in two days on

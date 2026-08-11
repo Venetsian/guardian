@@ -108,12 +108,17 @@ class GuardianDB:
                 ips_blocked_count   INTEGER DEFAULT 0,
                 notes               TEXT DEFAULT '',
                 resolved_at         INTEGER DEFAULT 0,
-                resolved_by         TEXT DEFAULT ''
+                resolved_by         TEXT DEFAULT '',
+                confirmed_at        INTEGER DEFAULT 0,
+                confirmed_by        TEXT DEFAULT '',
+                auto_reversed_at    INTEGER DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS idx_compromise_username ON compromise_events(username);
             CREATE INDEX IF NOT EXISTS idx_compromise_detected ON compromise_events(detected_at);
             CREATE INDEX IF NOT EXISTS idx_compromise_open ON compromise_events(resolved_at);
+            CREATE INDEX IF NOT EXISTS idx_compromise_pending_reverse
+                ON compromise_events(mailbox_disabled, confirmed_at, auto_reversed_at, detected_at);
 
             CREATE TABLE IF NOT EXISTS mailbox_actions (
                 id                      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1205,6 +1210,88 @@ class GuardianDB:
                 (now, resolved_by, event_id)
             )
         self.conn.commit()
+
+    def confirm_compromise_event(self, event_id, confirmed_by='cli', note=''):
+        """Mark a compromise as genuine, pinning its mailbox disable.
+
+        Separate from resolve_compromise_event() on purpose. "Resolved" closes
+        the incident; "confirmed" asserts the compromise was real, which is
+        what the auto-reenable reaper checks before reversing a disable. An
+        event can legitimately be confirmed but still open (attacker active,
+        being worked) or resolved but never confirmed (dismissed as a false
+        positive).
+        """
+        now = int(time.time())
+        if note:
+            self.conn.execute(
+                "UPDATE compromise_events SET confirmed_at = ?, confirmed_by = ?, "
+                "notes = CASE WHEN notes = '' THEN ? ELSE notes || char(10) || ? END "
+                "WHERE id = ?",
+                (now, confirmed_by, note, note, event_id)
+            )
+        else:
+            self.conn.execute(
+                "UPDATE compromise_events SET confirmed_at = ?, confirmed_by = ? WHERE id = ?",
+                (now, confirmed_by, event_id)
+            )
+        self.conn.commit()
+
+    def append_compromise_note(self, event_id, note):
+        """Append a line to an event's notes without changing its status."""
+        if not note:
+            return
+        self.conn.execute(
+            "UPDATE compromise_events SET "
+            "notes = CASE WHEN notes = '' THEN ? ELSE notes || char(10) || ? END "
+            "WHERE id = ?",
+            (note, note, event_id)
+        )
+        self.conn.commit()
+
+    def mark_compromise_auto_reversed(self, event_id, note=''):
+        """Stamp that the reaper restored this event's mailbox.
+
+        mailbox_disabled is left at 1 — it records what the event did when it
+        fired, which is forensic history and must not be rewritten. This flag
+        is what stops the event coming back as a reaper candidate on every
+        subsequent sweep.
+        """
+        now = int(time.time())
+        if note:
+            self.conn.execute(
+                "UPDATE compromise_events SET auto_reversed_at = ?, "
+                "notes = CASE WHEN notes = '' THEN ? ELSE notes || char(10) || ? END "
+                "WHERE id = ?",
+                (now, note, note, event_id)
+            )
+        else:
+            self.conn.execute(
+                "UPDATE compromise_events SET auto_reversed_at = ? WHERE id = ?",
+                (now, event_id)
+            )
+        self.conn.commit()
+
+    def get_auto_reenable_candidates(self, cutoff, limit=50):
+        """Compromise events whose provisional mailbox disable is now due for
+        reversal: mailbox actually disabled, not already auto-reversed, never
+        confirmed by an operator, and older than `cutoff` (epoch seconds).
+
+        resolved_at is deliberately NOT filtered on. Resolving an event says
+        "I've dealt with this"; if the operator dealt with it by re-enabling
+        the mailbox themselves, is_mailbox_disabled_by_guardian() already
+        makes the reaper skip it. Excluding resolved events here would instead
+        strand any mailbox that was resolved-as-noted but left disabled — the
+        exact 16-hour outage this feature exists to prevent.
+        """
+        cursor = self.conn.execute(
+            "SELECT id, username, service, trigger_rule, detected_at "
+            "FROM compromise_events "
+            "WHERE mailbox_disabled = 1 AND confirmed_at = 0 "
+            "AND auto_reversed_at = 0 AND detected_at <= ? "
+            "ORDER BY detected_at ASC LIMIT ?",
+            (int(cutoff), int(limit))
+        )
+        return [dict(row) for row in cursor.fetchall()]
 
     # ------------------------------------------------------------------
     # v1.4 — mailbox_actions

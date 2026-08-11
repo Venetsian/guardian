@@ -227,6 +227,8 @@ class TelegramCommander:
             '/enable': self._cmd_enable,
             '/compromises': self._cmd_compromises,
             '/resolve': self._cmd_resolve,
+            # v1.7.11
+            '/confirm': self._cmd_confirm,
             # v1.4.1
             '/verbosity': self._cmd_verbosity,
             # v1.5 — remote troubleshooting
@@ -789,6 +791,10 @@ class TelegramCommander:
         for r in rows:
             when = time.strftime('%m-%d %H:%M', time.localtime(r['detected_at']))
             status = 'OPEN' if not r['resolved_at'] else 'resolved'
+            if r['confirmed_at']:
+                status += ', confirmed'
+            elif r['auto_reversed_at']:
+                status += ', auto-restored'
             lines.append(
                 "[{i}] {w} <code>{u}</code> trig={r} act={a} ({s})".format(
                     i=r['id'], w=when, u=r['username'],
@@ -823,6 +829,72 @@ class TelegramCommander:
         self._reply("Resolved compromise event {i} (<code>{u}</code>)".format(
             i=event_id, u=event['username']
         ))
+
+    def _cmd_confirm(self, args):
+        """/confirm <event_id> [note] — the compromise was real (v1.7.11)
+
+        Pins the mailbox disable against the auto-reenable reaper. If the
+        reaper already restored the mailbox, re-disables it now — that is the
+        expected path when the operator wakes up to an auto-restore alert and
+        decides the detection was right after all.
+        """
+        if not args:
+            self._reply("Usage: /confirm &lt;event_id&gt; [note]")
+            return
+        try:
+            event_id = int(args[0])
+        except ValueError:
+            self._reply("Invalid event id: {x}".format(x=args[0]))
+            return
+        event = self.db.get_compromise_event(event_id)
+        if not event:
+            self._reply("No compromise event with id {i}".format(i=event_id))
+            return
+        if event['confirmed_at']:
+            self._reply("Event {i} is already confirmed.".format(i=event_id))
+            return
+
+        username = event['username']
+        note = ' '.join(args[1:]).strip()
+        actor = 'telegram:{cid}'.format(cid=self.chat_id)
+        self.db.confirm_compromise_event(event_id, confirmed_by=actor, note=note)
+
+        lines = ["Confirmed compromise event {i} (<code>{u}</code>).".format(
+            i=event_id, u=username
+        )]
+
+        # Re-disable if the provisional window already expired and the reaper
+        # restored the mailbox.
+        if event['auto_reversed_at'] and event['mailbox_disabled']:
+            if not self.mail_backend or not getattr(self.mail_backend, 'enabled', False):
+                lines.append(
+                    "⚠️ Mailbox was auto-restored but the mail backend is not "
+                    "configured — disable <code>{u}</code> manually.".format(u=username)
+                )
+            else:
+                try:
+                    changed = self.mail_backend.disable_mailbox(username)
+                    self.db.insert_mailbox_action(
+                        username=username, action='disable', actor=actor,
+                        reason="confirmed compromise event {i}".format(i=event_id),
+                        related_compromise_id=event_id, success=True,
+                    )
+                    lines.append(
+                        "Mailbox re-disabled." if changed
+                        else "Mailbox was already disabled."
+                    )
+                except Exception as e:
+                    self.db.insert_mailbox_action(
+                        username=username, action='disable', actor=actor,
+                        reason="confirmed compromise event {i}".format(i=event_id),
+                        related_compromise_id=event_id, success=False,
+                        error_message=str(e),
+                    )
+                    lines.append("❌ Re-disable FAILED: {e}".format(e=str(e)[:200]))
+        else:
+            lines.append("Disable pinned — auto-reenable will not touch it.")
+
+        self._reply('\n'.join(lines))
 
     # ------------------------------------------------------------------
     # v1.4.1 — Telegram verbosity routing
@@ -1206,6 +1278,8 @@ class TelegramCommander:
             "/enable &lt;user&gt; — re-enable mailbox\n"
             "/compromises [open] — list compromise events\n"
             "/resolve &lt;event_id&gt; [note] — mark event resolved\n"
+            "/confirm &lt;event_id&gt; [note] — compromise was real; pin the\n"
+            "    mailbox disable (re-disables if already auto-restored)\n"
             "\n"
             "<b>Alert routing (v1.4.1+)</b>\n"
             "/verbosity — show rule → level\n"

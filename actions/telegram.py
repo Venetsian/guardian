@@ -157,10 +157,15 @@ class TelegramAlerter:
         self.send(msg, priority='CRITICAL')
 
     def alert_compromise(self, username, service, trigger_rule, counts,
-                         ips_blocked, mailbox_disabled, event_id):
+                         ips_blocked, mailbox_disabled, event_id, action=''):
         """Alert about a detected credential compromise (v1.4+).
 
         Always sent immediately — never digested.
+
+        `action` is the enforcement level resolved for this trigger rule
+        (v1.7.11+). It distinguishes "mailbox left up because policy says this
+        rule is too weak to act on" from "mailbox left up because the backend
+        is broken" — those need opposite responses from the operator.
         """
         trigger_labels = {
             'countries': 'distinct countries',
@@ -170,7 +175,19 @@ class TelegramAlerter:
         label = trigger_labels.get(trigger_rule, trigger_rule)
         trigger_count = counts.get(trigger_rule, 0)
 
-        disable_line = "✅ disabled" if mailbox_disabled else "⚠️ NOT disabled (disable manually)"
+        if mailbox_disabled:
+            disable_line = "✅ disabled"
+        elif action == 'alert_only':
+            disable_line = (
+                "not disabled — rule '{r}' is alert-only\n"
+                "         <code>/disable {u}</code> to act".format(
+                    r=trigger_rule, u=username
+                )
+            )
+        elif action == 'block_ips':
+            disable_line = "not disabled — action={a}".format(a=action)
+        else:
+            disable_line = "⚠️ NOT disabled (disable manually)"
 
         msg = (
             "🔴 <b>COMPROMISE DETECTED</b>\n"
@@ -196,7 +213,36 @@ class TelegramAlerter:
             dl=disable_line,
             eid=event_id,
         )
+        if mailbox_disabled:
+            msg += (
+                "\n\n⏳ Provisional — <code>/confirm {eid}</code> to keep it "
+                "disabled, or it is restored automatically.".format(eid=event_id)
+            )
         self.send(msg, priority='CRITICAL')
+
+    def alert_mailbox_auto_reenabled(self, username, event_id, trigger_rule, hours):
+        """A provisional compromise disable expired unconfirmed (v1.7.11+).
+
+        HIGH rather than CRITICAL: service was just RESTORED, so this is not
+        an emergency — but the operator must know the mailbox is live again
+        and that the event is still unreviewed.
+        """
+        msg = (
+            "🔓 <b>MAILBOX AUTO-RESTORED</b>\n"
+            "Account: <code>{u}</code>\n"
+            "Event ID: {eid} (trigger: {r})\n"
+            "\n"
+            "The compromise disable was never confirmed and has now stood "
+            "for {h}h, so the mailbox has been re-enabled to bound the "
+            "outage. The event is still OPEN and unreviewed.\n"
+            "\n"
+            "If the compromise was real: <code>/confirm {eid}</code> "
+            "(re-disables and pins it)\n"
+            "If it was a false positive: <code>/resolve {eid}</code>\n"
+            "\n"
+            "Source IPs remain firewall-blocked on their own tier schedule."
+        ).format(u=username, eid=event_id, r=trigger_rule, h=hours)
+        self.send(msg, priority='HIGH')
 
     def alert_posture_drift(self, check_id, module, severity, host,
                             status, detail, description=''):

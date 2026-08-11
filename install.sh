@@ -700,12 +700,38 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
     echo "  Flags accounts authenticating from many distinct countries/ASNs/IPs"
     echo "  in a short window — the classic credential-abuse botnet signature."
     COMPROMISE_ENABLED="false"
+    COMPROMISE_ACTION_ASNS="alert_only"
+    AUTO_REENABLE_HOURS="4"
     if ask_yn "  Enable compromise detection?" "n"; then
         COMPROMISE_ENABLED="true"
         if [[ "$GEOIP_ENABLED" != "true" ]]; then
             print_warn "GeoIP is NOT enabled — country/ASN rules will never trigger."
             print_warn "Only the distinct-IPs rule will work without GeoIP."
         fi
+
+        echo ""
+        echo "  The ASN rule (one account seen on N distinct networks) is the"
+        echo "  weakest of the three: a multi-homed user with two fixed lines"
+        echo "  and a phone routinely reaches 4-5 ASNs inside one country."
+        echo "  On the reference host it fired twice and was wrong twice."
+        echo "  Default is to alert without blocking or disabling anything."
+        if ask_yn "  Let the ASN rule enforce (block IPs + disable mailbox)?" "n"; then
+            COMPROMISE_ACTION_ASNS="full"
+        fi
+
+        echo ""
+        echo -e "${BOLD}  Provisional disables (v1.7.11+)${NC}"
+        echo "  A compromise disable is reversed automatically after N hours"
+        echo "  unless you confirm it with /confirm <event_id> in Telegram."
+        echo "  This bounds a false positive to N hours of downtime instead of"
+        echo "  'however long until someone notices' — an alert at 02:00 goes"
+        echo "  unread until morning."
+        echo ""
+        echo "  Reversal does NOT restore attacker access: the source IPs stay"
+        echo "  firewall-blocked on their normal tier schedule."
+        echo ""
+        echo "  Enter 0 to keep disables permanent until manually reversed."
+        AUTO_REENABLE_HOURS=$(ask "  Auto-reenable after how many hours?" "4")
     fi
 
     # --- Block expiry reaper (v1.7.9+) ---
@@ -931,6 +957,14 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
     # v1.4 — Compromise detection
     if [[ "${COMPROMISE_ENABLED:-false}" == "true" ]]; then
         sed -i "/^\[compromise_detection\]/,/^\[/ s|^enabled = .*|enabled = true|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+    fi
+
+    # v1.7.11 — per-rule enforcement + provisional disables
+    if [[ -n "${COMPROMISE_ACTION_ASNS:-}" && "${COMPROMISE_ACTION_ASNS}" != "alert_only" ]]; then
+        sed -i "/^\[compromise_detection\]/,/^\[/ s|^action_asns = .*|action_asns = ${COMPROMISE_ACTION_ASNS}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+    fi
+    if [[ -n "${AUTO_REENABLE_HOURS:-}" && "${AUTO_REENABLE_HOURS}" != "4" ]]; then
+        sed -i "/^\[compromise_detection\]/,/^\[/ s|^auto_reenable_hours = .*|auto_reenable_hours = ${AUTO_REENABLE_HOURS}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
     fi
 
     # v1.7.9 — Block expiry reaper
