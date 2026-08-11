@@ -1,5 +1,156 @@
 # WP-Guardian Changelog
 
+## v1.7.12 — abuse corroboration, and mail schema auto-detection (2026-08-12)
+
+v1.7.11 made compromise detection stop acting on geography alone. It did that
+bluntly — by muting the ASN rule. This release makes the rule useful again by
+giving Guardian a way to tell a travelling client from a takeover.
+
+**Geography selects candidates; abuse evidence authorises enforcement.**
+
+### The dwell-window problem
+
+The obvious corroboration signal is outbound spam. It is also the wrong one to
+build first. A real takeover does not start sending immediately: credentials
+are harvested, the attacker logs in, reads mail, hunts for financial threads,
+plants persistence — and monetises days or weeks later. A model that only knew
+about outbound volume would stay silent through the entire window in which
+intervention is cheap, and speak up only once the damage was underway.
+
+So the checks that ship here are the **reconnaissance-phase** artefacts:
+
+| Signal | Why it fires early |
+|---|---|
+| `auth-failure burst` | credential stuffing leaves a pile of failures immediately before the success that matters |
+| `sieve injection` | ManageSieve accepts the stolen IMAP password — no panel access needed, so it is the cheapest persistence available |
+| `alias injection` | the same persistence step performed through a panel, as a forwarding row in the mail database |
+
+Outbound volume and recipient fan-out are stronger proof and still land later —
+they are just not sufficient on their own, and not first.
+
+### 1. Corroboration promotes, it does not only veto
+
+A muted rule is recovered when there is real evidence:
+
+```ini
+action_asns = alert_only     # 5 ASNs alone: a travelling client
+corroborated_action = full   # 5 ASNs + a sieve rule planted yesterday: a takeover
+```
+
+Promotion only ever moves enforcement **up**, and a broken or unavailable check
+resolves to "no signal" — an exception must never authorise taking a client's
+mailbox offline. Every check fails in that direction by construction, and the
+test suite asserts it for each one.
+
+The inverse gate, `require_corroboration`, refuses to disable a mailbox
+*without* evidence even when the rule says `full`. It is **off by default**: it
+would weaken `countries`, the one rule that has ever been right, and six or
+more countries in an hour is close to impossible legitimately.
+
+The Telegram alert now answers the operator's actual first question — *is this
+real, or is someone travelling again* — by listing the corroborating signals,
+or stating plainly that there are none.
+
+### 2. Mail schema auto-detection
+
+The corroboration checks need to know your alias table, its columns, and where
+Dovecot keeps maildirs. None of that is standardised, and this is an
+open-source tool — hard-coding our own layout would have made the feature
+useless to everyone else.
+
+Both daemons already state their schema in plain text, so Guardian reads it:
+
+```
+postconf -h virtual_alias_maps
+  -> mysql:/etc/postfix/mysql-virtual-aliases.cf
+     query = SELECT destination FROM virtual_aliases WHERE source='%s' AND enabled=1
+
+dovecot: password_query = SELECT email as user, password FROM virtual_users WHERE email='%u' AND enabled=1
+         mail_location  = maildir:/var/vmail/%d/%n
+```
+
+That yields the alias table and columns, the mailbox table and its enabled
+column, the database and host, and the maildir root. **No database credentials
+required** — which matters, because detection has to run before Guardian's
+least-privilege user exists.
+
+It is stack-agnostic because the query *text* differs between stacks but the
+place you find it does not:
+
+```
+postfix+dovecot MySQL   SELECT destination FROM virtual_aliases WHERE source='%s'
+postfixadmin / mailcow  SELECT goto        FROM alias           WHERE address='%s'
+iRedMail                SELECT forwarding  FROM forwardings     WHERE address=%s
+```
+
+```bash
+python3 wp-guardian.py --detect-mail-schema
+```
+
+Prints each setting with the file it came from, verifies against a live
+`DESCRIBE` when credentials happen to be available, and emits the exact `GRANT`
+with real names filled in. It changes nothing — you copy across what you agree
+with. `install.sh` runs the same detection and offers the result as defaults.
+
+Detection never guesses. A query with a `JOIN` or `UNION`, a non-MySQL map
+(`hash:`, `ldap:`), chained maps, or a `SELECT 1` existence probe all produce
+"could not determine, here is the raw query" rather than a confident wrong
+answer.
+
+### Config options
+
+| Key | Section | Default |
+|---|---|---|
+| `corroboration_enabled` | `[compromise_detection]` | `true` |
+| `corroborated_action` | `[compromise_detection]` | `full` |
+| `corroboration_lookback_hours` | `[compromise_detection]` | `168` |
+| `corroboration_failure_threshold` | `[compromise_detection]` | `20` |
+| `corroboration_failure_window` | `[compromise_detection]` | `3600` |
+| `require_corroboration` | `[compromise_detection]` | `false` |
+| `alias_table` | `[mail_backend]` | *(empty — check disabled)* |
+| `alias_source_column` | `[mail_backend]` | *(empty)* |
+| `alias_destination_column` | `[mail_backend]` | *(empty)* |
+| `alias_created_column` | `[mail_backend]` | *(empty)* |
+| `maildir_template` | `[mail_backend]` | *(empty — check disabled)* |
+
+The forwarding check needs one extra, **read-only** grant. Guardian must never
+be able to alter mail routing:
+
+```sql
+GRANT SELECT (source, destination, created_at)
+  ON <db>.<alias_table> TO 'wp_guardian'@'localhost';
+```
+
+`INSTALL.md` gained a **Step 9: Mail Backend** covering all of this — the
+section did not exist before, despite the mail backend having had privilege
+requirements since v1.4.
+
+### Notes
+
+`maildir_template` uses `{domain}` / `{user}` / `{email}`, deliberately **not**
+Dovecot's `%d` / `%n`. Python's `ConfigParser` runs `BasicInterpolation`, so a
+literal `%` anywhere in `wp-guardian.conf` raises at load time and the daemon
+never starts. Detection translates Dovecot's form for you.
+
+The per-username failure counter is in memory rather than a table. The window
+is an hour, write volume during an attack is enormous, and losing the counter
+to a restart costs one corroborating signal — which fails toward "don't
+disable". It also counts only failures from non-whitelisted sources, so an
+operator's own whitelisted box looping on a stale password cannot manufacture
+the evidence for someone else's punishment.
+
+### Files changed
+
+`modules/mail_schema.py` (new), `modules/corroboration.py` (new),
+`modules/compromise.py`, `modules/mail_backend.py`, `detectors/mail.py`,
+`detectors/roundcube.py`, `actions/telegram.py`, `wp-guardian.py`,
+`tests/test_mail_schema.py` (new), `tests/test_corroboration.py` (new),
+`tests/test_compromise_action.py`, `wp-guardian.conf`,
+`wp-guardian.conf.example`, `install.sh`, `INSTALL.md`, `README.md`,
+`CLAUDE.md`, `VERSION`
+
+---
+
 ## v1.7.11 — compromise detection stops disabling travelling clients (2026-08-11)
 
 On 2026-08-09 at 23:44 UTC, `DistributedAuthDetector` auto-disabled

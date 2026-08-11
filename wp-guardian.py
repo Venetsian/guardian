@@ -25,6 +25,7 @@ from modules.blocker import Blocker
 from modules.geoip import GeoIPResolver
 from modules.mail_backend import MailBackend
 from modules.compromise import CompromiseAction
+from modules.corroboration import AbuseCorroborator
 from modules.digest import DigestBuffer
 from modules.verbosity import VerbosityRouter
 from backends.factory import create_backend
@@ -272,9 +273,21 @@ class Guardian:
             self.logger.error(f"MailBackend init failed: {e}")
             self.mail_backend = None
 
+        # Abuse corroboration — turns "authenticating from odd places" into
+        # "actually being misused". Constructed before CompromiseAction, which
+        # consumes it, and handed to the mail detectors, which feed it.
+        try:
+            self.corroborator = AbuseCorroborator(
+                self.config, self.db, self.mail_backend
+            )
+        except Exception as e:
+            self.logger.error(f"AbuseCorroborator init failed: {e}")
+            self.corroborator = None
+
         # Compromise action orchestrator
         self.compromise_action = CompromiseAction(
-            self.config, self.db, self.blocker, self.mail_backend, self.telegram
+            self.config, self.db, self.blocker, self.mail_backend, self.telegram,
+            corroborator=self.corroborator
         )
 
         # Distributed-auth detector — only useful with geoip enabled
@@ -475,6 +488,7 @@ class Guardian:
                 self.config, self.blocker, self.db, self.whitelist,
                 geoip=self.geoip,
                 distributed_auth_detector=self.distributed_auth_detector,
+                corroborator=self.corroborator,
             )
             mail_tailer = LogTailer([mail_log], mail_detector, name='mail')
             mail_tailer.start()
@@ -502,7 +516,9 @@ class Guardian:
             fallback='/var/www/roundcube/logs/errors.log'
         )
         if os.path.exists(roundcube_log):
-            rc_detector = RoundcubeDetector(self.config, self.blocker, self.db, self.whitelist)
+            rc_detector = RoundcubeDetector(self.config, self.blocker, self.db,
+                                            self.whitelist,
+                                            corroborator=self.corroborator)
             rc_tailer = LogTailer([roundcube_log], rc_detector, name='roundcube')
             rc_tailer.start()
             self.tailers.append(rc_tailer)
@@ -1204,6 +1220,10 @@ def main():
                         help='Restore mailboxes whose provisional compromise '
                              'disable expired unconfirmed (combine with '
                              '--dry-run to preview)')
+    parser.add_argument('--detect-mail-schema', action='store_true',
+                        help='Read Postfix/Dovecot config to work out your mail '
+                             'table and column names, and show the [mail_backend] '
+                             'settings and GRANT they imply')
     parser.add_argument('--flush', nargs='?', const='all', metavar='TABLE',
                         help='Flush data. Options: all, tripwires, blocks, auth, isolation (default: all)')
     parser.add_argument('--discover-logs', action='store_true',
@@ -1605,6 +1625,80 @@ def main():
             print(f"  failed         : {result['failed']} (mail backend calls "
                   f"did not succeed — will retry)")
         print(f"  still pending  : {result['remaining']}")
+        print("")
+        return
+
+    if args.detect_mail_schema:
+        from modules import mail_schema
+
+        print("")
+        print("Mail schema detection")
+        print("─" * 60)
+        report = mail_schema.detect()
+
+        if not report['detected']:
+            print("Nothing detected. Reasons:")
+            for key, why in sorted(report['problems'].items()):
+                print(f"  {key:<22s} {why}")
+            print("")
+            print("This is expected on a host that doesn't run mail. If it does,")
+            print("run as root — the Postfix map files are usually 0640 root:postfix.")
+            print("")
+            return
+
+        mb = report['mail_backend']
+
+        # A live DESCRIBE only ever adds confidence. Config-file evidence
+        # stands on its own when no credentials are available.
+        checks = {}
+        backend = guardian.mail_backend
+        if backend and getattr(backend, 'enabled', False):
+            checks = mail_schema.verify_against_db(report, backend._connect)
+            found = mail_schema.find_created_column(report, backend._connect)
+            if found:
+                mb['alias_created_column'] = found
+                report['evidence']['alias_created_column'] = 'DESCRIBE ' + mb['alias_table']
+
+        print("")
+        print(f"  {'SETTING':<28s} {'VALUE':<24s} {'VERIFIED':<10s} SOURCE")
+        for key in sorted(mb):
+            src = report['evidence'].get(key, '')
+            if src.startswith('/'):
+                src = os.path.basename(src)
+            state = checks.get(key, '')
+            mark = {'ok': 'yes', 'missing': 'NO', 'unchecked': '—'}.get(state, '')
+            print(f"  {key:<28s} {str(mb[key])[:24]:<24s} {mark:<10s} {src}")
+
+        if any(v == 'missing' for v in checks.values()):
+            print("")
+            print("  ⚠  Something marked NO does not exist in the database.")
+            print("     Do not apply these values — check the schema by hand.")
+
+        if report['problems']:
+            print("")
+            print("  Not determined:")
+            for key, why in sorted(report['problems'].items()):
+                print(f"    {key:<22s} {why}")
+
+        print("")
+        print("Add to [mail_backend] in wp-guardian.conf:")
+        print("")
+        for key in sorted(mb):
+            print(f"  {key} = {mb[key]}")
+
+        db_user = guardian.config.get('mail_backend', 'user', fallback='wp_guardian')
+        grant = mail_schema.grant_statement(report, db_user=db_user)
+        if grant:
+            print("")
+            print("Then grant read access for the forwarding-injection check:")
+            print("")
+            print(f"  {grant}")
+            print("  FLUSH PRIVILEGES;")
+            print("")
+            print("  (SELECT only — Guardian must never be able to alter mail routing.)")
+        print("")
+        print("Review before applying. Detection reads config files; it cannot")
+        print("know about a schema your mail server doesn't actually use.")
         print("")
         return
 

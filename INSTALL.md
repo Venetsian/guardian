@@ -301,6 +301,194 @@ python3 /opt/wp-guardian/wp-guardian.py --status
 
 ---
 
+## Step 9: Mail Backend (Optional)
+
+Only needed if you want Guardian to **disable a mailbox** when it detects a
+credential compromise. Everything else — IP blocking, alerting, detection —
+works without it. Skip this section if Guardian isn't running on a mail server.
+
+Guardian talks to your mail server's own MariaDB. It never uses a panel API,
+so it works with any stack that stores mailboxes in MySQL/MariaDB.
+
+### 9.1: Let Guardian work out your schema
+
+Before picking anything by hand, ask Guardian to read your mail server's own
+configuration:
+
+```bash
+sudo python3 /opt/wp-guardian/wp-guardian.py --detect-mail-schema
+```
+
+Postfix and Dovecot both state their schema in plain text — `postconf` names
+the map files, each map states its query, and Dovecot's `password_query` and
+`mail_location` do the same for mailboxes. Detection reads those, so it needs
+**no database credentials** and works before the steps below. It prints each
+setting with the file it came from, plus the exact `GRANT` statement, and
+changes nothing.
+
+`install.sh` runs the same detection and offers the result as defaults, so on a
+fresh install this is usually already done.
+
+If it reports "could not determine", that is deliberate — a query with a `JOIN`,
+a non-MySQL map (`ldap:`, `hash:`), or several maps chained cannot be reduced
+to one table and column pair, and a confident wrong answer would be worse than
+none. Fall back to the manual steps below.
+
+### 9.2: Pick a recipe
+
+Set `type` in `[mail_backend]`. Each recipe auto-fills database, table and
+column names, which you can override individually:
+
+| `type` | Stack | Strategy |
+|---|---|---|
+| `cyberpanel` | CyberPanel | `password_reset` |
+| `postfixadmin` | Postfixadmin | `toggle_enabled` |
+| `mailcow` | Mailcow | `toggle_enabled` |
+| `iredmail` | iRedMail | `toggle_enabled` |
+| `custom` | Anything else — you name the table/columns | `toggle_enabled` |
+
+`toggle_enabled` flips an `enabled`/`active` column. `password_reset` scrambles
+the stored password hash and keeps the original in Guardian's own database so
+it can be restored — used where the schema has no enable flag.
+
+**Verify the recipe matches your install** rather than trusting the label.
+Schemas drift between versions:
+
+```bash
+mysql -e "SHOW TABLES FROM <your_mail_db>"
+```
+
+```bash
+mysql -e "DESCRIBE <your_mail_db>.<your_mailbox_table>"
+```
+
+### 9.3: Create a least-privilege user
+
+Guardian should have the narrowest grant that lets it do its job — column-level,
+on one table. Do **not** reuse your postfix or dovecot DB user.
+
+```bash
+mysql -e "CREATE USER 'wp_guardian'@'localhost' IDENTIFIED BY '<strong password>';"
+```
+
+For `toggle_enabled` recipes:
+
+```bash
+mysql -e "GRANT SELECT (email, enabled), UPDATE (enabled) ON <db>.<table> TO 'wp_guardian'@'localhost'; FLUSH PRIVILEGES;"
+```
+
+For `password_reset` recipes:
+
+```bash
+mysql -e "GRANT SELECT (email, password), UPDATE (password) ON <db>.<table> TO 'wp_guardian'@'localhost'; FLUSH PRIVILEGES;"
+```
+
+Substitute your own database, table and column names. The examples in
+`wp-guardian.conf.example` are defaults for common layouts, not requirements.
+
+Verify with:
+
+```bash
+mysql -e "SHOW GRANTS FOR 'wp_guardian'@'localhost'"
+```
+
+### 9.4: Forwarding-injection check (optional, read-only)
+
+Guardian can read your alias/forwarding table to detect a mailbox rule planted
+on a compromised account. This is worth setting up: rule injection is the
+standard BEC follow-on and happens during the attacker's reconnaissance phase,
+typically **days before any spam is sent**. It is much stronger evidence than
+outbound volume, which only appears once the damage has started.
+
+There is no standard schema for this. Check yours first:
+
+```bash
+mysql -e "SHOW TABLES FROM <your_mail_db>"
+```
+
+Layouts seen in the wild:
+
+| Stack | Table | Source col | Destination col |
+|---|---|---|---|
+| postfix+dovecot MySQL | `virtual_aliases` | `source` | `destination` |
+| postfixadmin / mailcow | `alias` | `address` | `goto` |
+| iRedMail | `forwardings` | `address` | `forwarding` |
+
+Then grant SELECT on exactly the columns your table has:
+
+```bash
+mysql -e "GRANT SELECT (source, destination, created_at) ON <db>.<alias_table> TO 'wp_guardian'@'localhost'; FLUSH PRIVILEGES;"
+```
+
+And point Guardian at them in `[mail_backend]`:
+
+```ini
+alias_table = virtual_aliases
+alias_source_column = source
+alias_destination_column = destination
+alias_created_column = created_at
+```
+
+A created/timestamp column is optional but valuable — with it Guardian can tell
+a rule planted an hour ago from one the client has had for two years. Without
+it, only presence is checked.
+
+The companion check looks for sieve filters, which an attacker can upload with
+nothing but the stolen IMAP password via ManageSieve. It needs to know where
+Dovecot keeps maildirs:
+
+```ini
+maildir_template = /var/vmail/{domain}/{user}
+```
+
+Placeholders are `{domain}`, `{user}`, `{email}`. This is deliberately **not**
+Dovecot's own `%d`/`%n` syntax: Python's `ConfigParser` interpolates `%`, so a
+literal `%` anywhere in `wp-guardian.conf` stops the daemon starting.
+`--detect-mail-schema` translates `mail_location` for you. No grant needed —
+it's a filesystem check.
+
+> **Never grant `UPDATE` or `DELETE` on the alias table.** Guardian reads
+> forwarding rules to detect tampering; it never modifies mail routing. If your
+> DB user already holds write access there, revoke it.
+
+Leave these keys unset to skip the check entirely. A missing grant degrades to
+a logged warning, never an error.
+
+### 9.5: Test
+
+The backend connects once at startup and reports the result to the log:
+
+```bash
+sudo journalctl -u wp-guardian --since "5 min ago" | grep -i mailbackend
+```
+
+A working backend logs the resolved recipe, database, table and strategy:
+
+```
+MailBackend [postfixadmin] connected to postfixadmin.mailbox (strategy=toggle_enabled)
+```
+
+A failure logs the reason — wrong credentials, missing grant, unreachable host
+— followed by a line noting that the mailbox-disable action is unavailable.
+**That is not fatal:** Guardian still blocks IPs and sends alerts, it just
+can't take a mailbox offline.
+
+For an end-to-end check, use a mailbox you own:
+
+```bash
+python3 /opt/wp-guardian/wp-guardian.py --disable-mailbox test@yourdomain.com
+```
+
+```bash
+python3 /opt/wp-guardian/wp-guardian.py --enable-mailbox test@yourdomain.com
+```
+
+Confirm the account really did stop and resume authenticating between the two —
+a grant that covers `SELECT` but not `UPDATE` reports success while changing
+nothing.
+
+---
+
 ## Updating
 
 Since WP-Guardian is installed via `git clone` to `/opt/wp-guardian`, updates are simple:

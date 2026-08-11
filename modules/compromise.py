@@ -30,6 +30,12 @@ VALID_ACTIONS = ('alert_only', 'block_ips', 'disable_mailbox', 'full')
 # Tolerated spelling — the obvious short form for alert_only.
 ACTION_ALIASES = {'alert': 'alert_only'}
 
+# Enforcement strength, for resolving "the stronger of two actions" when
+# abuse corroboration promotes a rule. block_ips and disable_mailbox are not
+# naturally ordered against each other; this ranking picks disable as the
+# heavier consequence because it is the one a client feels.
+ACTION_RANK = {'alert_only': 0, 'block_ips': 1, 'disable_mailbox': 2, 'full': 3}
+
 # Rules whose default enforcement is deliberately weaker than the global
 # `action`. Anything absent here inherits `action`.
 #
@@ -51,12 +57,14 @@ RULE_ACTION_DEFAULTS = {
 
 
 class CompromiseAction:
-    def __init__(self, config, db, blocker, mail_backend, telegram):
+    def __init__(self, config, db, blocker, mail_backend, telegram,
+                 corroborator=None):
         self.config = config
         self.db = db
         self.blocker = blocker
         self.mail_backend = mail_backend  # may be None or disabled
         self.telegram = telegram
+        self.corroborator = corroborator  # AbuseCorroborator or None
 
         self.action = self._read_action(config, 'action', 'full')
 
@@ -81,6 +89,24 @@ class CompromiseAction:
                         r=rule, a=act, g=self.action
                     )
                 )
+
+        # Enforcement level once abuse evidence exists. Corroboration PROMOTES
+        # a rule to this level — an account on 5 ASNs is a travelling client,
+        # but an account on 5 ASNs with a sieve rule planted yesterday is a
+        # takeover, and the weak rule should not stay muted for it.
+        self.corroborated_action = self._read_action(
+            config, 'corroborated_action', 'full')
+
+        # Opt-in gate, the inverse direction: refuse to disable a mailbox
+        # WITHOUT abuse evidence, even when the rule says full.
+        #
+        # Off by default. It would weaken `countries`, the one rule that has
+        # ever been right — six or more countries in an hour is close to
+        # impossible legitimately, and demanding a second signal before acting
+        # on it trades a proven detection for an unproven one. Operators who
+        # would rather never auto-disable on geography alone can turn it on.
+        self.require_corroboration = config.getboolean(
+            'compromise_detection', 'require_corroboration', fallback=False)
 
         # Provisional-disable window. A mailbox disabled by this module is
         # restored after this many seconds unless an operator confirms the
@@ -114,8 +140,56 @@ class CompromiseAction:
         return raw
 
     def resolve_action(self, trigger_rule):
-        """Enforcement level for a given trigger rule."""
+        """Enforcement level for a given trigger rule, on geography alone."""
         return self.rule_actions.get(trigger_rule, self.action)
+
+    def _corroborate(self, username):
+        """Abuse signals for this account. Always fails toward none."""
+        if not self.corroborator:
+            return []
+        try:
+            return self.corroborator.evaluate(username) or []
+        except Exception as e:
+            logger.error("Corroboration failed for {u}: {e}".format(u=username, e=e))
+            return []
+
+    def _apply_corroboration(self, geo_action, corroboration, username, trigger_rule):
+        """Resolve the geography-only action against the abuse evidence."""
+        if corroboration:
+            promoted = max(
+                (geo_action, self.corroborated_action),
+                key=lambda a: ACTION_RANK.get(a, 0)
+            )
+            if promoted != geo_action:
+                logger.warning(
+                    "Compromise {u} (rule {r}): abuse corroborated by {c} — "
+                    "enforcement promoted {a} -> {b}".format(
+                        u=username, r=trigger_rule, c='; '.join(corroboration),
+                        a=geo_action, b=promoted
+                    )
+                )
+            else:
+                logger.warning(
+                    "Compromise {u} (rule {r}): abuse corroborated by {c}".format(
+                        u=username, r=trigger_rule, c='; '.join(corroboration))
+                )
+            return promoted
+
+        # No evidence of misuse. Under the opt-in gate that is enough to hold
+        # back the mailbox disable, which is the action a false positive
+        # actually costs a client.
+        if self.require_corroboration and ACTION_RANK.get(geo_action, 0) >= 2:
+            downgraded = 'block_ips' if geo_action == 'full' else 'alert_only'
+            logger.warning(
+                "Compromise {u} (rule {r}): geographic trigger with no "
+                "corroborating abuse signal — require_corroboration is on, "
+                "enforcement reduced {a} -> {b}, mailbox left enabled".format(
+                    u=username, r=trigger_rule, a=geo_action, b=downgraded
+                )
+            )
+            return downgraded
+
+        return geo_action
 
     def handle(self, username, service, trigger_rule, counts,
                window_seconds, actor='auto:DistributedAuthDetector'):
@@ -123,7 +197,10 @@ class CompromiseAction:
 
         Returns the compromise_events row id.
         """
-        action = self.resolve_action(trigger_rule)
+        geo_action = self.resolve_action(trigger_rule)
+        corroboration = self._corroborate(username)
+        action = self._apply_corroboration(
+            geo_action, corroboration, username, trigger_rule)
         try:
             # Every IP seen in the window — the full set is recorded on the
             # event for forensics, but only the untrusted ones are eligible
@@ -151,6 +228,8 @@ class CompromiseAction:
                 sample_ips=sample_ips[:20],
                 sample_countries=sample_countries,
                 action_taken='pending',
+                notes=('corroboration: ' + '; '.join(corroboration))
+                      if corroboration else 'corroboration: none',
             )
         except Exception as e:
             logger.error("Failed to record compromise event: {e}".format(e=e))
@@ -203,6 +282,7 @@ class CompromiseAction:
                     mailbox_disabled=mailbox_disabled,
                     event_id=event_id,
                     action=action,
+                    corroboration=corroboration,
                 )
             else:
                 self.telegram.send(

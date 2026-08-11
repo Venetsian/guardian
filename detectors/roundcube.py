@@ -23,10 +23,11 @@ class RoundcubeDetector:
         r'IMAP Error:\s*Login failed for (?P<user>\S+) against \S+ from (?P<ip>\d+\.\d+\.\d+\.\d+)'
     )
 
-    def __init__(self, config, blocker, db, whitelist=None):
+    def __init__(self, config, blocker, db, whitelist=None, corroborator=None):
         self.blocker = blocker
         self.db = db
         self.whitelist = whitelist
+        self.corroborator = corroborator
         self.time_window = config.getint('thresholds', 'time_window', fallback=300)
         self.threshold = config.getint('thresholds', 'roundcube_fail_threshold', fallback=10)
         self.trust_duration = config.getint('auth_tracking', 'mail_trust_duration', fallback=24) * 3600
@@ -41,6 +42,11 @@ class RoundcubeDetector:
 
         if self.whitelist and self.whitelist.is_whitelisted(ip):
             return
+
+        # Per-username failure counter for compromise corroboration. After the
+        # whitelist bypass on purpose — see MailDetector._record_failure.
+        if self.corroborator and username:
+            self.corroborator.record_auth_failure(username)
 
         count = self.hits.add(ip)
         if count >= self.threshold:

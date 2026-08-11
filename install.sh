@@ -827,8 +827,84 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
     MAIL_BACKEND_USER="wp_guardian"
     MAIL_BACKEND_PASSWORD=""
     MAIL_BACKEND_TABLE=""
-    MAIL_RECIPE_CHOICE=$(ask_choice "  Choice" "6" 1 2 3 4 5 6)
+    MAIL_ALIAS_TABLE=""
+    MAIL_ALIAS_SOURCE=""
+    MAIL_ALIAS_DEST=""
+    MAIL_MAILDIR_TEMPLATE=""
+
+    # Ask Postfix and Dovecot what their own schema is, rather than asking the
+    # operator to hand-copy table and column names. Both daemons state it in
+    # plain text, so this needs no database credentials and works before the
+    # least-privilege user exists. Advisory only — every value is shown and
+    # confirmed before anything is written.
+    if [[ -x "$(command -v postconf 2>/dev/null)" ]]; then
+        DETECTED_JSON=$(cd "${SCRIPT_DIR}" && python3 -c '
+import json, sys
+sys.path.insert(0, ".")
+try:
+    from modules import mail_schema
+    print(json.dumps(mail_schema.detect()))
+except Exception:
+    print("{}")
+' 2>/dev/null || echo "{}")
+
+        if [[ -n "$DETECTED_JSON" && "$DETECTED_JSON" != "{}" ]]; then
+            eval "$(printf '%s' "$DETECTED_JSON" | python3 -c '
+import json, sys
+try:
+    mb = json.load(sys.stdin).get("mail_backend", {})
+except Exception:
+    mb = {}
+def emit(var, key):
+    val = str(mb.get(key, "") or "")
+    if val and all(c.isalnum() or c in "_-./{}" for c in val):
+        print("{v}={q}".format(v=var, q=val))
+emit("DET_DB", "database")
+emit("DET_TABLE", "table")
+emit("DET_EMAIL_COL", "email_column")
+emit("DET_ENABLED_COL", "enabled_column")
+emit("DET_ALIAS_TABLE", "alias_table")
+emit("DET_ALIAS_SOURCE", "alias_source_column")
+emit("DET_ALIAS_DEST", "alias_destination_column")
+emit("DET_MAILDIR", "maildir_template")
+' 2>/dev/null)"
+
+            if [[ -n "${DET_TABLE:-}" || -n "${DET_ALIAS_TABLE:-}" ]]; then
+                echo ""
+                echo -e "${BOLD}  Detected from your Postfix/Dovecot config:${NC}"
+                [[ -n "${DET_DB:-}" ]]           && echo "    database          : ${DET_DB}"
+                [[ -n "${DET_TABLE:-}" ]]        && echo "    mailbox table     : ${DET_TABLE}"
+                [[ -n "${DET_EMAIL_COL:-}" ]]    && echo "    email column      : ${DET_EMAIL_COL}"
+                [[ -n "${DET_ENABLED_COL:-}" ]]  && echo "    enabled column    : ${DET_ENABLED_COL}"
+                [[ -n "${DET_ALIAS_TABLE:-}" ]]  && echo "    alias table       : ${DET_ALIAS_TABLE}"
+                [[ -n "${DET_ALIAS_SOURCE:-}" ]] && echo "    alias source col  : ${DET_ALIAS_SOURCE}"
+                [[ -n "${DET_ALIAS_DEST:-}" ]]   && echo "    alias dest col    : ${DET_ALIAS_DEST}"
+                [[ -n "${DET_MAILDIR:-}" ]]      && echo "    maildir template  : ${DET_MAILDIR}"
+                echo ""
+                if ask_yn "  Use these values?" "y"; then
+                    MAIL_BACKEND_TYPE="custom"
+                    [[ -n "${DET_DB:-}" ]]           && MAIL_BACKEND_DB="${DET_DB}"
+                    [[ -n "${DET_TABLE:-}" ]]        && MAIL_BACKEND_TABLE="${DET_TABLE}"
+                    [[ -n "${DET_ALIAS_TABLE:-}" ]]  && MAIL_ALIAS_TABLE="${DET_ALIAS_TABLE}"
+                    [[ -n "${DET_ALIAS_SOURCE:-}" ]] && MAIL_ALIAS_SOURCE="${DET_ALIAS_SOURCE}"
+                    [[ -n "${DET_ALIAS_DEST:-}" ]]   && MAIL_ALIAS_DEST="${DET_ALIAS_DEST}"
+                    [[ -n "${DET_MAILDIR:-}" ]]      && MAIL_MAILDIR_TEMPLATE="${DET_MAILDIR}"
+                    MAIL_BACKEND_DETECTED="true"
+                fi
+            fi
+        fi
+    fi
+    # Detection already produced a complete, operator-confirmed answer —
+    # don't then ask them to pick a recipe that would overwrite it.
+    if [[ "${MAIL_BACKEND_DETECTED:-false}" == "true" ]]; then
+        MAIL_RECIPE_CHOICE="0"
+    else
+        MAIL_RECIPE_CHOICE=$(ask_choice "  Choice" "6" 1 2 3 4 5 6)
+    fi
     case "$MAIL_RECIPE_CHOICE" in
+        0)
+            : # keep the detected values
+            ;;
         1)
             MAIL_BACKEND_TYPE="cyberpanel"
             MAIL_BACKEND_DB="cyberpanel"
@@ -883,6 +959,35 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
         fi
         echo "      ON ${MAIL_BACKEND_DB}.${MAIL_BACKEND_TABLE} TO '${MAIL_BACKEND_USER}'@'localhost';"
         echo "    FLUSH PRIVILEGES;"
+        echo ""
+
+        echo "  OPTIONAL — forwarding-injection check (read-only):"
+        echo ""
+        echo "  Guardian can read your alias/forwarding table to spot a mailbox"
+        echo "  rule planted on a compromised account. That happens during the"
+        echo "  attacker's reconnaissance phase — days before any spam — so it is"
+        echo "  much stronger evidence than outbound volume alone."
+        echo ""
+        echo "  The alias table is NOT standardised. Check your own schema first:"
+        echo ""
+        echo "    SHOW TABLES FROM ${MAIL_BACKEND_DB};"
+        echo ""
+        echo "  Layouts seen in the wild:"
+        echo "    postfix+dovecot MySQL   virtual_aliases (source, destination, created_at)"
+        echo "    postfixadmin / mailcow  alias           (address, goto)"
+        echo "    iRedMail                forwardings     (address, forwarding)"
+        echo ""
+        echo "  Then grant SELECT on the columns your table actually has:"
+        echo ""
+        echo "    GRANT SELECT (<source_col>, <destination_col>, <created_col>)"
+        echo "      ON ${MAIL_BACKEND_DB}.<alias_table> TO '${MAIL_BACKEND_USER}'@'localhost';"
+        echo "    FLUSH PRIVILEGES;"
+        echo ""
+        echo "  Never grant UPDATE or DELETE here — Guardian only reads forwarding"
+        echo "  rules to detect tampering, it never modifies mail routing."
+        echo ""
+        echo "  Skip this entirely if you don't want the check; Guardian works"
+        echo "  fine without it and logs a warning rather than failing."
         echo ""
         read -r -p "  Press Enter when done..."
     fi
@@ -1006,6 +1111,10 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
         MAIL_BACKEND_DB="${MAIL_BACKEND_DB}" \
         MAIL_BACKEND_USER="${MAIL_BACKEND_USER}" \
         MAIL_BACKEND_TABLE="${MAIL_BACKEND_TABLE}" \
+        MAIL_ALIAS_TABLE="${MAIL_ALIAS_TABLE:-}" \
+        MAIL_ALIAS_SOURCE="${MAIL_ALIAS_SOURCE:-}" \
+        MAIL_ALIAS_DEST="${MAIL_ALIAS_DEST:-}" \
+        MAIL_MAILDIR_TEMPLATE="${MAIL_MAILDIR_TEMPLATE:-}" \
         CONF_PATH="${INSTALL_DIR}/wp-guardian.conf" \
         python3 - <<'PYEOF' || print_warn "Failed to write mail_backend config"
 import configparser, os, sys
@@ -1022,6 +1131,12 @@ for k, env in (
     ('user',           'MAIL_BACKEND_USER'),
     ('password',       'MAIL_BACKEND_PASSWORD'),
     ('table',          'MAIL_BACKEND_TABLE'),
+    # Optional — forwarding-injection corroboration. Empty means "check
+    # disabled", which is a valid, supported state.
+    ('alias_table',              'MAIL_ALIAS_TABLE'),
+    ('alias_source_column',      'MAIL_ALIAS_SOURCE'),
+    ('alias_destination_column', 'MAIL_ALIAS_DEST'),
+    ('maildir_template',         'MAIL_MAILDIR_TEMPLATE'),
 ):
     v = os.environ.get(env)
     if v is not None:

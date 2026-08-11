@@ -157,7 +157,8 @@ class TelegramAlerter:
         self.send(msg, priority='CRITICAL')
 
     def alert_compromise(self, username, service, trigger_rule, counts,
-                         ips_blocked, mailbox_disabled, event_id, action=''):
+                         ips_blocked, mailbox_disabled, event_id, action='',
+                         corroboration=None):
         """Alert about a detected credential compromise (v1.4+).
 
         Always sent immediately — never digested.
@@ -213,6 +214,18 @@ class TelegramAlerter:
             dl=disable_line,
             eid=event_id,
         )
+        # The operator's first question on any compromise alert is "is this
+        # real or is someone travelling again". Answer it in the alert.
+        if corroboration:
+            msg += "\n\n🚨 <b>Abuse corroborated:</b>\n" + '\n'.join(
+                "  • {s}".format(s=s) for s in corroboration
+            )
+        else:
+            msg += (
+                "\n\n<i>No abuse signal found — geographic spread only. "
+                "Consistent with a travelling or multi-homed user.</i>"
+            )
+
         if mailbox_disabled:
             msg += (
                 "\n\n⏳ Provisional — <code>/confirm {eid}</code> to keep it "

@@ -26,6 +26,36 @@ Required privileges differ by strategy:
   password_reset:
     GRANT SELECT (email, password), UPDATE (password)
       ON cyberpanel.e_users TO 'wp_guardian'@'localhost';
+
+Substitute your own database/table/column names — the ones above are the
+defaults for two common layouts, not a fixed requirement. Whatever you set in
+[mail_backend] is what needs granting.
+
+OPTIONAL — forwarding-injection check (read-only):
+
+  Guardian can read your alias/forwarding table to detect a mailbox rule
+  planted on a compromised account. Mailbox-rule injection is the standard
+  BEC follow-on and it happens during the reconnaissance phase, days before
+  any spam is sent, so it is worth far more as evidence than outbound volume
+  alone. Requires SELECT on the alias table:
+
+    GRANT SELECT (<source_col>, <destination_col>, <created_col>)
+      ON <database>.<alias_table> TO 'wp_guardian'@'localhost';
+
+  The table name is NOT standardised across mail stacks. Verify against your
+  own schema (`SHOW TABLES`, `DESCRIBE`) before granting. Layouts seen in the
+  wild:
+
+    postfix+dovecot MySQL   virtual_aliases (source, destination, created_at)
+    postfixadmin / mailcow  alias           (address, goto)
+    iRedMail                forwardings     (address, forwarding)
+
+  Guardian NEVER needs UPDATE or DELETE on this table. It reads forwarding
+  rules to spot tampering; it does not modify mail routing. Do not grant
+  write access here even if your DB user already has it elsewhere.
+
+  The check is entirely optional: leave it unconfigured and Guardian skips it.
+  A missing grant degrades to a logged warning, never an error.
 """
 
 import crypt
@@ -201,6 +231,34 @@ class MailBackend:
             logger.error("Unknown disable_strategy: {s}".format(s=self.disable_strategy))
             return
 
+        # --- optional: alias / forwarding table (read-only) ---------------
+        # Used by the compromise corroboration check to spot a forwarding rule
+        # planted on a hijacked mailbox. Entirely opt-in: no alias_table
+        # configured means the check is skipped, not that it failed.
+        self.alias_table = ''
+        self.alias_source_col = ''
+        self.alias_dest_col = ''
+        self.alias_created_col = ''
+        self._alias_warned = False
+        alias_table = config.get('mail_backend', 'alias_table', fallback='').strip()
+        if alias_table:
+            try:
+                self.alias_table = self._sanitize_ident(alias_table)
+                self.alias_source_col = self._sanitize_ident(
+                    config.get('mail_backend', 'alias_source_column',
+                               fallback='source'))
+                self.alias_dest_col = self._sanitize_ident(
+                    config.get('mail_backend', 'alias_destination_column',
+                               fallback='destination'))
+                created = config.get('mail_backend', 'alias_created_column',
+                                     fallback='').strip()
+                self.alias_created_col = self._sanitize_ident(created) if created else ''
+            except ValueError as e:
+                logger.error(
+                    "Invalid alias column config, forwarding check disabled: {e}".format(e=e)
+                )
+                self.alias_table = ''
+
         try:
             self._test_connection()
         except Exception as e:
@@ -291,6 +349,90 @@ class MailBackend:
             return self._is_enabled_password_check(email)
         else:
             return self._is_enabled_toggle_check(email)
+
+    # ------------------------------------------------------------------
+    # Alias / forwarding inspection (read-only, optional)
+    # ------------------------------------------------------------------
+
+    @property
+    def alias_check_available(self):
+        return bool(self.enabled and self.alias_table)
+
+    def recent_aliases(self, email, since_ts=None):
+        """Forwarding rules pointing away from this mailbox.
+
+        Returns a list of {'destination': str, 'created_at': int|None}, or
+        **None** when the check could not run (not configured, missing GRANT,
+        DB unreachable). None and [] mean opposite things to the caller: []
+        is evidence of absence, None is absence of evidence, and a corroboration
+        check must never treat the second as the first.
+
+        `since_ts` filters on the created column when one is configured. Without
+        it every existing rule looks freshly planted, so when no created column
+        exists the filter is dropped and the caller is told via created_at=None.
+        """
+        if not self.alias_check_available:
+            return None
+
+        cols = [self.alias_dest_col]
+        if self.alias_created_col:
+            cols.append(self.alias_created_col)
+
+        sql = "SELECT {c} FROM {t} WHERE {s} = %s".format(
+            c=', '.join('`{x}`'.format(x=c) for c in cols),
+            t=self.alias_table, s=self.alias_source_col
+        )
+        params = [email]
+        if self.alias_created_col and since_ts is not None:
+            sql += " AND `{c}` >= FROM_UNIXTIME(%s)".format(c=self.alias_created_col)
+            params.append(int(since_ts))
+
+        try:
+            conn = self._connect()
+        except Exception as e:
+            self._warn_alias_once("cannot connect: {e}".format(e=e))
+            return None
+
+        try:
+            cur = conn.cursor()
+            try:
+                cur.execute(sql, tuple(params))
+                rows = cur.fetchall()
+            finally:
+                cur.close()
+        except Exception as e:
+            # Almost always a missing GRANT on the alias table. Warn once —
+            # the corroboration path runs on every compromise event and a
+            # per-event error would drown the log.
+            self._warn_alias_once(str(e))
+            return None
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        out = []
+        for row in rows:
+            created = None
+            if self.alias_created_col and len(row) > 1 and row[1] is not None:
+                created = row[1]
+            out.append({'destination': row[0], 'created_at': created})
+        return out
+
+    def _warn_alias_once(self, detail):
+        if self._alias_warned:
+            logger.debug("alias check unavailable: {d}".format(d=detail))
+            return
+        self._alias_warned = True
+        logger.warning(
+            "Forwarding-injection check unavailable on {db}.{tbl}: {d} — "
+            "the mailbox GRANT does not cover this table. Add: "
+            "GRANT SELECT ON {db}.{tbl} TO '<guardian user>'@'localhost'. "
+            "Compromise detection continues without this signal.".format(
+                db=self.database, tbl=self.alias_table, d=detail
+            )
+        )
 
     # ------------------------------------------------------------------
     # toggle_enabled strategy (Postfixadmin, Mailcow, iRedMail, custom)

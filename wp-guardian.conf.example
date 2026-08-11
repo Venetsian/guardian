@@ -387,6 +387,58 @@ action_countries = full
 action_asns = alert_only
 action_ips = full
 
+# ---------------------------------------------------------------------------
+# Abuse corroboration (v1.7.12+)
+# ---------------------------------------------------------------------------
+# Geography selects candidates; abuse evidence authorises enforcement.
+#
+# The detector answers "is this account authenticating from an implausible
+# spread of networks". These checks answer the separate question "is there any
+# sign it is actually being MISUSED" — and where a rule is muted on geography
+# alone, real evidence promotes it back up to corroborated_action.
+#
+# Signals are matched to how a takeover actually unfolds. Credentials are
+# stolen, the attacker logs in, reads mail, plants persistence, and monetises
+# days or weeks later. Checking only for outbound spam would stay silent
+# through the whole window where intervention is cheap, so these look for the
+# reconnaissance-phase artefacts instead:
+#
+#   auth-failure burst   credential stuffing leaves a pile of failures
+#                        immediately before the success that matters
+#   sieve injection      a mailbox filter planted over ManageSieve, which
+#                        accepts nothing but the stolen IMAP password
+#   alias injection      a forwarding row planted in the mail database
+#
+# Requires [mail_backend] maildir_template for the sieve check and
+# alias_table for the forwarding check. Missing either just drops that one
+# signal — nothing errors.
+corroboration_enabled = true
+
+# Enforcement once abuse is corroborated. An account on 5 ASNs is a
+# travelling client; an account on 5 ASNs with a sieve rule planted yesterday
+# is a takeover. Promotion only ever moves enforcement UP.
+corroborated_action = full
+
+# How far back a persistence artefact still counts, in hours. Much wider than
+# the detector's 1h window on purpose: the sieve rule was planted during a
+# dwell phase that may predate the geographic trigger by days.
+corroboration_lookback_hours = 168
+
+# Failed auths for one ACCOUNT (across all source IPs) that count as a
+# stuffing burst. Distinct from the per-IP brute-force thresholds — stuffing
+# arrives from many addresses by design, so a per-IP counter never sees it.
+corroboration_failure_threshold = 20
+corroboration_failure_window = 3600
+
+# The inverse gate: refuse to disable a mailbox WITHOUT abuse evidence, even
+# when the rule says full.
+#
+# Off by default, deliberately. It would weaken `countries` — the one rule
+# that has ever been right — and six or more countries in an hour is close to
+# impossible legitimately. Turn it on if you would rather never auto-disable
+# on geography alone and accept catching a real compromise later.
+require_corroboration = false
+
 # Provisional disables (v1.7.11+).
 #
 # Hours a compromise mailbox-disable stands before Guardian reverses it
@@ -531,6 +583,63 @@ universal_paths =
 # For password_reset recipes (cyberpanel):
 #   GRANT SELECT (email, password), UPDATE (password)
 #     ON cyberpanel.e_users TO 'wp_guardian'@'localhost';
+#
+# ---------------------------------------------------------------------------
+# OPTIONAL — alias / forwarding table (read-only)
+# ---------------------------------------------------------------------------
+# Guardian can read your alias table to detect a forwarding rule planted on a
+# compromised mailbox. Mailbox-rule injection is the standard BEC follow-on
+# and happens during the attacker's reconnaissance phase — typically days
+# before any spam is sent — which makes it far stronger evidence than
+# outbound volume alone.
+#
+# There is NO standard schema for this across mail stacks. Check yours with
+# `SHOW TABLES FROM <database>` and `DESCRIBE <table>` before configuring.
+# Layouts seen in the wild:
+#
+#   postfix+dovecot MySQL   virtual_aliases (source, destination, created_at)
+#   postfixadmin / mailcow  alias           (address, goto)
+#   iRedMail                forwardings     (address, forwarding)
+#
+# EASIEST WAY TO FILL THESE IN — let Guardian read your Postfix and Dovecot
+# config and tell you what your schema is:
+#
+#   python3 /opt/wp-guardian/wp-guardian.py --detect-mail-schema
+#
+# It prints the settings below with the file each one came from, plus the
+# exact GRANT statement. It reads config files only, so it needs no database
+# credentials, and it changes nothing — you copy across what you agree with.
+#
+# Leave alias_table empty and Guardian skips the check entirely; the feature
+# is optional and its absence just means one fewer corroborating signal.
+#
+# A created/timestamp column is optional but valuable: with it Guardian can
+# tell a rule planted an hour ago from one the client has had for two years.
+# Without it, only presence is checked.
+alias_table =
+alias_source_column =
+alias_destination_column =
+alias_created_column =
+
+# Where Dovecot keeps maildirs, used by the sieve-injection check to find
+# ~/.dovecot.sieve. Placeholders are {domain} {user} {email}.
+#
+# NOTE this is deliberately NOT Dovecot's own %d/%n syntax. Python's
+# ConfigParser performs interpolation on %, so a literal % anywhere in this
+# file makes the daemon fail to start. --detect-mail-schema translates
+# Dovecot's mail_location into the brace form for you.
+#
+# Example: mail_location = maildir:/var/vmail/%d/%n
+#       -> maildir_template = /var/vmail/{domain}/{user}
+maildir_template =
+#
+# Grant SELECT on exactly those columns, nothing more:
+#   GRANT SELECT (<source>, <destination>, <created>)
+#     ON <database>.<alias_table> TO 'wp_guardian'@'localhost';
+#
+# Guardian NEVER needs UPDATE or DELETE here. It reads forwarding rules to
+# spot tampering; it does not modify mail routing. If your DB user already
+# holds write access on this table, revoke it.
 type = none
 host = 127.0.0.1
 port = 3306

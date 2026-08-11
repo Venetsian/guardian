@@ -124,7 +124,21 @@ class FakeDB:
         self.reversed_ids.append(event_id)
 
 
-def build_action(db=None, mail_backend=None, telegram=None, blocker=None, **overrides):
+class FakeCorroborator:
+    """Returns a fixed signal list; raises if constructed to."""
+
+    def __init__(self, signals=None, explode=False):
+        self.signals = signals or []
+        self.explode = explode
+
+    def evaluate(self, username):
+        if self.explode:
+            raise RuntimeError("corroboration subsystem down")
+        return list(self.signals)
+
+
+def build_action(db=None, mail_backend=None, telegram=None, blocker=None,
+                 corroborator=None, **overrides):
     """CompromiseAction wired to fakes. Kwargs override [compromise_detection]."""
     config = configparser.ConfigParser()
     config.add_section('compromise_detection')
@@ -136,6 +150,7 @@ def build_action(db=None, mail_backend=None, telegram=None, blocker=None, **over
         blocker if blocker is not None else FakeBlocker(),
         mail_backend if mail_backend is not None else FakeMailBackend(),
         telegram if telegram is not None else FakeTelegram(),
+        corroborator=corroborator,
     )
 
 
@@ -230,6 +245,128 @@ class TestHandleEnforcement(unittest.TestCase):
         action.handle(username='bob@example.net', service='imap',
                       trigger_rule='asns', counts=FP_COUNTS, window_seconds=3600)
         self.assertEqual(mail.disabled, ['bob@example.net'])
+
+
+class TestCorroboration(unittest.TestCase):
+    """Abuse evidence promotes a weak rule; its absence can gate a strong one."""
+
+    SIEVE = ['sieve rule created/modified 3h ago']
+
+    def test_corroboration_promotes_the_muted_asns_rule(self):
+        # 5 ASNs alone is a travelling client. 5 ASNs plus a sieve rule
+        # planted yesterday is a takeover, and the rule must not stay muted.
+        db, mail, blocker = FakeDB(), FakeMailBackend(), FakeBlocker()
+        action = build_action(db=db, mail_backend=mail, blocker=blocker,
+                              action='full',
+                              corroborator=FakeCorroborator(self.SIEVE))
+
+        action.handle(username='bob@example.net', service='imap',
+                      trigger_rule='asns', counts=FP_COUNTS, window_seconds=3600)
+
+        self.assertEqual(mail.disabled, ['bob@example.net'])
+        self.assertEqual(len(blocker.blocks), 5)
+
+    def test_no_corroboration_leaves_asns_muted(self):
+        db, mail, blocker = FakeDB(), FakeMailBackend(), FakeBlocker()
+        action = build_action(db=db, mail_backend=mail, blocker=blocker,
+                              action='full',
+                              corroborator=FakeCorroborator([]))
+
+        action.handle(username='bob@example.net', service='imap',
+                      trigger_rule='asns', counts=FP_COUNTS, window_seconds=3600)
+
+        self.assertEqual(mail.disabled, [])
+        self.assertEqual(blocker.blocks, [])
+
+    def test_promotion_target_is_configurable(self):
+        db, mail, blocker = FakeDB(), FakeMailBackend(), FakeBlocker()
+        action = build_action(db=db, mail_backend=mail, blocker=blocker,
+                              action='full', corroborated_action='block_ips',
+                              corroborator=FakeCorroborator(self.SIEVE))
+
+        action.handle(username='bob@example.net', service='imap',
+                      trigger_rule='asns', counts=FP_COUNTS, window_seconds=3600)
+
+        self.assertEqual(mail.disabled, [], "block_ips must not disable")
+        self.assertEqual(len(blocker.blocks), 5)
+
+    def test_corroboration_never_weakens_a_rule(self):
+        # A rule already at full stays at full even if corroborated_action
+        # is set lower — promotion only ever moves upward.
+        db, mail = FakeDB(), FakeMailBackend()
+        action = build_action(db=db, mail_backend=mail, action='full',
+                              corroborated_action='alert_only',
+                              corroborator=FakeCorroborator(self.SIEVE))
+
+        action.handle(username='alice@example.com', service='imap',
+                      trigger_rule='countries',
+                      counts={'countries': 28, 'asns': 39, 'ips': 62},
+                      window_seconds=3600)
+
+        self.assertEqual(mail.disabled, ['alice@example.com'])
+
+    def test_require_corroboration_gates_the_disable(self):
+        db, mail, blocker = FakeDB(), FakeMailBackend(), FakeBlocker()
+        action = build_action(db=db, mail_backend=mail, blocker=blocker,
+                              action='full', require_corroboration='true',
+                              corroborator=FakeCorroborator([]))
+
+        action.handle(username='erin@example.com', service='imap',
+                      trigger_rule='countries',
+                      counts={'countries': 6, 'asns': 6, 'ips': 8},
+                      window_seconds=3600)
+
+        self.assertEqual(mail.disabled, [], "no evidence, no disable")
+        self.assertEqual(len(blocker.blocks), 5, "IPs are still blocked")
+
+    def test_require_corroboration_is_off_by_default(self):
+        # Gating would weaken `countries`, the one rule that has ever been
+        # right. Operators opt in; it is not the shipped default.
+        db, mail = FakeDB(), FakeMailBackend()
+        action = build_action(db=db, mail_backend=mail, action='full',
+                              corroborator=FakeCorroborator([]))
+        self.assertFalse(action.require_corroboration)
+
+        action.handle(username='alice@example.com', service='imap',
+                      trigger_rule='countries',
+                      counts={'countries': 28, 'asns': 39, 'ips': 62},
+                      window_seconds=3600)
+        self.assertEqual(mail.disabled, ['alice@example.com'])
+
+    def test_broken_corroborator_does_not_promote(self):
+        db, mail = FakeDB(), FakeMailBackend()
+        action = build_action(db=db, mail_backend=mail, action='full',
+                              corroborator=FakeCorroborator(explode=True))
+
+        action.handle(username='bob@example.net', service='imap',
+                      trigger_rule='asns', counts=FP_COUNTS, window_seconds=3600)
+
+        self.assertEqual(mail.disabled, [], "an exception must not authorise a disable")
+
+    def test_absent_corroborator_preserves_v1_7_11_behaviour(self):
+        db, mail = FakeDB(), FakeMailBackend()
+        action = build_action(db=db, mail_backend=mail, action='full',
+                              corroborator=None)
+        action.handle(username='bob@example.net', service='imap',
+                      trigger_rule='asns', counts=FP_COUNTS, window_seconds=3600)
+        self.assertEqual(mail.disabled, [])
+
+    def test_signals_are_recorded_on_the_event(self):
+        db, tg = FakeDB(), FakeTelegram()
+        action = build_action(db=db, telegram=tg,
+                              corroborator=FakeCorroborator(self.SIEVE))
+        action.handle(username='bob@example.net', service='imap',
+                      trigger_rule='asns', counts=FP_COUNTS, window_seconds=3600)
+
+        self.assertIn('sieve', db.inserted[0]['notes'])
+        self.assertEqual(tg.alerts[0]['corroboration'], self.SIEVE)
+
+    def test_absence_is_recorded_too(self):
+        db = FakeDB()
+        action = build_action(db=db, corroborator=FakeCorroborator([]))
+        action.handle(username='bob@example.net', service='imap',
+                      trigger_rule='asns', counts=FP_COUNTS, window_seconds=3600)
+        self.assertIn('none', db.inserted[0]['notes'])
 
 
 class TestAutoReenableReaper(unittest.TestCase):
