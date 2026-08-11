@@ -1,5 +1,42 @@
 # WP-Guardian Changelog
 
+## v1.7.13 — `--detect-mail-schema` output is paste-safe (2026-08-12)
+
+Bugfix for v1.7.12. `--detect-mail-schema` printed its suggested settings
+indented by two spaces, for looks:
+
+```
+Add to [mail_backend] in wp-guardian.conf:
+
+  alias_table = virtual_aliases
+  alias_source_column = source
+```
+
+That block is meant to be copy-pasted into an INI file, and **in INI syntax a
+leading space makes a line a continuation of the key above it.** Pasting it
+folded eight settings into the value of whichever key landed first, and the
+next daemon start died with `DuplicateOptionError` against a key that already
+existed further down the section. Observed on a production mail host: Guardian
+crash-looped in `activating` until the config was repaired.
+
+Two fixes:
+
+1. **The block prints flush-left, between copy markers,** with an explicit
+   warning not to add indentation.
+2. **`load_config()` no longer dies with a raw traceback.** A malformed config
+   now names the duplicated option and its section, points at indentation as
+   the usual cause, and exits with a one-line message instead of a stack trace
+   through `configparser` internals. A security daemon that won't start should
+   say why in terms of the file the operator edited.
+
+No config or schema changes.
+
+### Files changed
+
+`wp-guardian.py`, `modules/config.py`, `VERSION`
+
+---
+
 ## v1.7.12 — abuse corroboration, and mail schema auto-detection (2026-08-12)
 
 v1.7.11 made compromise detection stop acting on geography alone. It did that

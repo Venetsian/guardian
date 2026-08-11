@@ -117,7 +117,28 @@ def load_config(config_path=None):
     config = configparser.ConfigParser()
 
     if os.path.exists(path):
-        config.read(path)
+        try:
+            config.read(path)
+        except configparser.Error as e:
+            # A malformed config kills the daemon at startup, and the raw
+            # traceback names configparser internals rather than the line at
+            # fault. Since operators hand-edit this file — and pasting a block
+            # with leading spaces silently turns every line into a
+            # continuation of the previous key — say plainly what to fix.
+            logger.error(f"Cannot parse {path}: {e}")
+            if isinstance(e, configparser.DuplicateOptionError):
+                logger.error(
+                    f"  '{e.option}' appears twice in [{e.section}]. Usually a "
+                    f"pasted block that duplicates keys already present — "
+                    f"delete the older copy."
+                )
+            logger.error(
+                "  Check for INDENTED key lines: a leading space makes a line "
+                "a continuation of the key above it, not a key of its own."
+            )
+            raise SystemExit(
+                "wp-guardian: {p} is malformed — see the errors above.".format(p=path)
+            )
         logger.info(f"Configuration loaded from {path}")
 
         # Security check: warn if config is readable by group/others

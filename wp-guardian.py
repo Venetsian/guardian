@@ -1680,11 +1680,20 @@ def main():
             for key, why in sorted(report['problems'].items()):
                 print(f"    {key:<22s} {why}")
 
+        # Printed flush-left and fenced, because this block is meant to be
+        # copy-pasted into an INI file. Indenting it for looks makes every
+        # line a ConfigParser line-continuation, which silently folds the
+        # whole block into the preceding key's value and then dies with
+        # DuplicateOptionError on the next daemon start.
         print("")
-        print("Add to [mail_backend] in wp-guardian.conf:")
+        print("Copy the block between the markers into [mail_backend] in")
+        print("wp-guardian.conf, replacing any existing copies of these keys.")
+        print("Do not add indentation — leading spaces change the meaning.")
         print("")
+        print("8<---------------- copy from here ----------------")
         for key in sorted(mb):
-            print(f"  {key} = {mb[key]}")
+            print(f"{key} = {mb[key]}")
+        print("---------------- to here ---------------------->8")
 
         db_user = guardian.config.get('mail_backend', 'user', fallback='wp_guardian')
         grant = mail_schema.grant_statement(report, db_user=db_user)
