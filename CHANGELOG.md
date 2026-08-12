@@ -1,5 +1,192 @@
 # WP-Guardian Changelog
 
+## v1.7.15 — outbound volume and recipient fan-out corroboration (2026-08-12)
+
+Future Work #3, and the payload-phase half of the abuse corroboration that
+shipped in v1.7.12. Guardian had **no outbound visibility at all** before this:
+`MailDetector` parsed four line shapes, all of them authentication, and
+discarded Postfix delivery lines entirely.
+
+Two new corroboration checks, alongside the three reconnaissance-phase ones:
+
+| Check | Asks | Needs history |
+|---|---|---|
+| `outbound_volume` | is the account sending far above its own normal rate | yes — see below |
+| `outbound_fanout` | did one message go to an implausible number of recipients | no |
+
+They feed the same machinery as the existing signals: evidence **promotes** a
+rule that geography alone leaves muted (`action_asns = alert_only` →
+`corroborated_action`), and a promotion still only ever moves enforcement up.
+
+### The queue ID is the join key, and the join is mandatory
+
+Postfix logs two lines that matter, seconds apart and interleaved with
+everything else:
+
+```
+postfix/smtps/smtpd[65793]: 0F5B86C403F7: client=host[198.51.100.20],
+    sasl_method=PLAIN, sasl_username=erin@example.com
+postfix/qmgr[4031830]: 0F5B86C403F7: from=<...>, size=80933, nrcpt=1 (queue active)
+```
+
+Only the first says who sent it. Only the second says how big it was and how
+many recipients it had. And **qmgr logs inbound and outbound mail
+identically** — on the reference host most sampled qmgr lines were inbound
+bounces and spam. Counting qmgr alone would measure how much mail the server
+*receives* for an account and report it as sending, so a queue ID is ours going
+out only if it was first seen on an authenticated smtpd line.
+
+`modules/outbound.OutboundTracker` holds a short-lived queue-ID map
+(`outbound_queue_ttl`, default 300s) with a hard size cap, and rides the
+existing maillog tailer — no fourth tailer, no second read of the same file.
+
+This also catches PHP-originated mail: `web.maiahost.com` relays through the
+mail host with a `sasl_username`, so a compromised *website* is visible through
+exactly the same path.
+
+### The volume check is inert for about two weeks after you upgrade
+
+Deliberate, and the most important operational note in this release. The
+baseline compares an account against **its own** history, because mailboxes
+differ by orders of magnitude — a booking address that sends 400 a day and a
+director's address that sends four are both normal, and no single number
+describes them. On a fresh table there is nothing to compare against and every
+account looks anomalous.
+
+So the check stays silent until the table holds `outbound_min_observation_days`
+(default 14) of history, measured **across all accounts** rather than the one
+being examined. That global measure is what lets Guardian tell "this mailbox is
+genuinely silent" from "Guardian was installed on Tuesday" — without it, the
+strongest signal in the whole feature (a silent account suddenly sending
+hundreds) would be unusable.
+
+`--outbound-stats` shows how much has accrued and whether the check is armed.
+
+**Unless you backfill.** `tools/backfill_maillog.py --outbound-only
+--also-rotated --days 30` replays existing rotated maillogs into the new table
+and arms the baseline immediately. A host with a month of logs on disk already
+has the history; there is no reason to wait two weeks to rediscover it. The
+replay runs through the real `OutboundTracker` — a backfilled row is produced
+by exactly the code path that produces a live one — and `outbound_exists()`
+makes re-runs idempotent.
+
+**Recipient fan-out needs no baseline**, which is why it ships alongside rather
+than later: it is armed the moment you upgrade and covers the window in which
+the volume baseline is still accruing on a host with no logs worth replaying.
+
+### Calibration against a real host
+
+The fan-out default ships at **250, not the 50 originally chosen**, after
+replaying 4.5 weeks of production maillog — 5,413 outbound messages, 63
+senders. The distribution is starkly bimodal: **everything is ≤ 9 recipients
+except a single message at 133**, a flooring retailer's Outlook-sent newsletter
+to its own customer list.
+
+A threshold of 50 would have fired on it, and on the worst possible account:
+that mailbox is simultaneously the host's only bulk sender *and* its most
+geographically scattered one (90 IPs, 11 ASNs, 4 countries, already the subject
+of a false-positive compromise event). Those two risks are not independent —
+they are concentrated on one paying client.
+
+Two weeks of the same logs showed a maximum of 6 and would have justified
+*lowering* the threshold instead. The lesson is the one the ASN rule already
+taught in v1.7.11: a threshold calibrated on a short window sits on the noise
+floor.
+
+Note that the volume check is structurally immune to that newsletter — it
+counts **messages**, and a newsletter is one message however many recipients it
+carries. Fan-out is the fragile half of the pair, and the one to disable
+(`outbound_fanout_threshold = 0`) if your users send bulk mail from their own
+mailboxes.
+
+### Design decisions worth knowing
+
+- **Rolling query, not a stored per-account rate.** The baseline is computed on
+  demand from the same table. A materialised rate would need its own recompute
+  job and its own staleness semantics — a second place to be wrong — for a
+  query that runs only when a compromise event fires (six times in this
+  detector's lifetime).
+- **The baseline excludes the recent window.** Otherwise a burst inflates the
+  bar it is being measured against, and the check quietly stops working at
+  exactly the volumes that matter most.
+- **The baseline denominator is the account's own span**, not the window
+  length. A mailbox created three days ago inside a thirty-day window would
+  otherwise have its rate divided by ten — understating the baseline, and
+  erring in the direction that manufactures evidence.
+- **The absolute floor is load-bearing.** `outbound_volume_floor` (100 messages
+  in the window) must be cleared as well as the multiplier. A multiplier
+  against a near-zero baseline is a division by almost nothing and would fire
+  on a mailbox going from one message a week to three.
+- **Every new check fails toward NO SIGNAL**, like the existing three: no
+  database, a raising query, an empty table, a young install — all resolve to
+  silence. `tests/test_outbound.py` asserts each direction individually.
+
+### Config
+
+New in `[compromise_detection]`:
+
+| Key | Default | Note |
+|---|---|---|
+| `outbound_monitoring` | `true` | false stops recording entirely |
+| `outbound_window_hours` | `6` | wider than the detector's 1h — the burst and the geographic anomaly need not be simultaneous |
+| `outbound_baseline_days` | `30` | |
+| `outbound_min_observation_days` | `14` | the inert period |
+| `outbound_volume_floor` | `100` | messages in the window |
+| `outbound_volume_multiplier` | `10` | times the account's own rate |
+| `outbound_fanout_threshold` | `250` | recipients on one message; `0` disables |
+| `outbound_queue_ttl` | `300` | seconds a submission waits for its qmgr line |
+| `outbound_max_pending` | `10000` | cap on unmatched submissions held in memory |
+
+New in `[database]`: `outbound_retention_days = 30`. Shorter than the 90 days
+`auth_sessions` keeps, because this table grows per *message* rather than per
+login and its only consumer looks back 30 days. Guardian logs a startup warning
+if you set it below `outbound_baseline_days`.
+
+**No existing default was retuned, so no `sed` is needed** — `config-upgrade`
+adds all of the above as missing keys.
+
+`outbound_fanout_threshold` is still the one most likely to need tuning for
+your users. Check before trusting it:
+
+```bash
+python3 wp-guardian.py --outbound-stats --days 30
+```
+
+### Schema
+
+Migration `011_outbound_activity.sql` — new `outbound_activity` table, one row
+per authenticated outbound message. Schema version 10 → 11. The table is also
+in `_create_tables()`, which is what fresh installs get (they stamp the version
+without replaying migrations).
+
+### CLI
+
+```
+python3 wp-guardian.py --outbound-stats [--days N]
+```
+
+Shows how much history has accrued, whether the volume baseline is armed, the
+configured trip points, and the busiest senders.
+
+```
+python3 tools/backfill_maillog.py --outbound-only --also-rotated --days 30
+```
+
+Arms the volume baseline from rotated logs. Add `--dry-run` first. Use
+`--outbound` instead of `--outbound-only` to backfill auth history in the same
+pass. Both are idempotent, so a re-run over overlapping logs is safe.
+
+### Files changed
+
+`modules/outbound.py` (new), `migrations/011_outbound_activity.sql` (new),
+`tests/test_outbound.py` (new), `modules/corroboration.py`,
+`modules/database.py`, `modules/migrator.py`, `detectors/mail.py`,
+`tools/backfill_maillog.py`, `wp-guardian.py`, `wp-guardian.conf`,
+`wp-guardian.conf.example`, `install.sh`, `README.md`, `CLAUDE.md`,
+`CHANGELOG.md`, `VERSION`
+
+---
+
 ## v1.7.14 — a clean restart no longer reports as a crash (2026-08-12)
 
 Long-standing bug, surfaced by upgrading four hosts in a row. On

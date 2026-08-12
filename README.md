@@ -16,6 +16,7 @@ WP-Guardian monitors web, SMTP, IMAP/POP3, and SSH logs, automatically blocks at
 - **Active /tmp cleanup module (v1.6+)** — opt-in daily janitor for stale, root-owned, world-readable, allowlisted files in /tmp. Three modes: `off` (default), `dry_run` (scan + log + Telegram digest), `live` (delete + log to `posture_events`). Strict criteria (realpath under /tmp, owner uid 0, mode o+r, age ≥ 7d, allowlist match, lsof-clean). Recommended rollout: enable as `dry_run` for ~14 days, review the digests, promote to `live`.
 - **Credential compromise detection (v1.4+)** — `DistributedAuthDetector` catches the classic distributed credential-abuse botnet pattern (same mailbox authenticating from many countries/ASNs/IPs in a short window), automatically blocks source IPs, and disables the mailbox in the mail backend. Mailbox management works with any stack storing accounts in MySQL/MariaDB (CyberPanel, Postfixadmin, Mailcow, iRedMail, or a custom schema you name yourself) via a least-privilege, column-scoped DB user — see [INSTALL.md](INSTALL.md) Step 9. It's optional: without it Guardian still blocks and alerts
 - **Abuse corroboration (v1.7.12+)** — geography selects candidates, abuse evidence authorises enforcement. Guardian looks for signs the account is actually being *misused* — a credential-stuffing failure burst, a sieve filter planted over ManageSieve, a forwarding row injected into the mail database — and uses them to promote a rule that geography alone leaves muted. The checks are deliberately **reconnaissance-phase**: a real takeover reads mail and plants persistence for days before it starts sending, so corroborating only on outbound spam would stay silent through the whole window where intervention is cheap. Every check fails toward "no signal" — an exception or a missing grant can never authorise disabling a client's mailbox
+- **Outbound corroboration (v1.7.15+)** — the payload-phase counterpart to the above: Guardian records what a mailbox actually *sent* and corroborates on volume far above the account's own normal rate, or one message addressed to an implausible number of recipients. Postfix's queue ID is the join key and the join is mandatory — `qmgr` logs inbound and outbound mail identically, so counting it alone would measure how much mail *arrives* for an account and call it sending. Only a queue ID first seen on an authenticated `smtpd` line is counted, which also picks up PHP-originated mail relayed from a compromised website. The volume check compares each account against itself and is therefore **deliberately inert for its first two weeks** — on an empty table every account looks anomalous — but `backfill_maillog.py --outbound-only` replays your existing rotated logs and arms it on day one. Recipient fan-out needs no baseline at all. `--outbound-stats` shows what has accrued
 - **Mail schema auto-detection (v1.7.12+)** — `--detect-mail-schema` reads what Postfix and Dovecot already declare about themselves (`postconf` map files, `password_query`, `mail_location`) and tells you the `[mail_backend]` settings and the exact `GRANT` they imply. No database credentials needed, so it runs before Guardian's own DB user exists, and it works across Postfixadmin / Mailcow / iRedMail / CyberPanel / custom schemas because the query text differs but the place you find it doesn't. It refuses to guess — a `JOIN`, an `ldap:` map or a chained map reports "could not determine" rather than a confident wrong table name
 - **Compromise enforcement is per-rule and provisional (v1.7.11+)** — the three trigger rules are not equally trustworthy, so each carries its own `action_<rule>`. The ASN rule ships as `alert_only`: a multi-homed user with two fixed lines and a phone routinely reaches 4–5 ASNs inside one country, which is indistinguishable from credential abuse and produced two production false positives. And any mailbox disable is **reversed automatically after 4h** unless an operator confirms it with `/confirm <event_id>` — bounding a detection error to hours instead of "however long until someone notices an alert that landed at 02:00". Reversal is safe because the source IPs stay firewall-blocked on their own tier schedule
 - **GeoIP enrichment (v1.4+)** — every auth event and block is tagged with country, city, ASN, and ASN organization via MaxMind GeoLite2
@@ -129,6 +130,13 @@ python3 wp-guardian.py --reap-blocks --reap-limit 2000
 # Provisional compromise disables (v1.7.11+) — also automatic on the hourly loop
 python3 wp-guardian.py --reap-mailboxes --dry-run    # preview what's due for restore
 python3 wp-guardian.py --reap-mailboxes             # restore them now
+
+# Outbound corroboration (v1.7.15+)
+python3 wp-guardian.py --outbound-stats              # is the volume baseline armed yet?
+python3 wp-guardian.py --outbound-stats --days 30    # busiest senders, fan-out sizes
+# Arm the baseline immediately from rotated logs instead of waiting 14 days
+python3 tools/backfill_maillog.py --outbound-only --also-rotated --days 30 --dry-run
+python3 tools/backfill_maillog.py --outbound-only --also-rotated --days 30
 
 # Update
 cd /opt/wp-guardian && git pull && sudo bash update.sh
@@ -415,6 +423,9 @@ All of the above is observable from Telegram once `commands_enabled = true`:
 │   ├── blocker.py          # Block decision engine
 │   ├── geoip.py            # MaxMind GeoLite2 lookup
 │   ├── compromise.py       # CompromiseAction (block IPs + disable mailbox)
+│   ├── corroboration.py    # Abuse evidence that authorises enforcement (v1.7.12+)
+│   ├── outbound.py         # Queue-ID correlation for sent mail (v1.7.15+)
+│   ├── mail_schema.py      # Postfix/Dovecot schema auto-detection (v1.7.12+)
 │   ├── digest.py           # Hourly Telegram digest buffer
 │   ├── verbosity.py        # Per-rule alert routing
 │   ├── cms_registry.py     # Auto-detected vhost → CMS map (v1.5+)
@@ -467,10 +478,14 @@ All of the above is observable from Telegram once `commands_enabled = true`:
 │   ├── backfill_maillog.py      # Seed auth_sessions from maillog history
 │   ├── backfill_ip_history.py   # Geo-enrich ip_history rows (v1.4.2+ repair)
 │   └── config-upgrade.py        # Detect & merge new config options on upgrade
-├── tests/
-│   └── test_web_suspicious.py   # Regression tests for the suspicious rule (v1.7.10+)
+├── tests/                   # stdlib unittest, no test deps
+│   ├── test_web_suspicious.py    # Regression tests for the suspicious rule (v1.7.10+)
+│   ├── test_compromise_action.py # Per-rule enforcement + provisional disables (v1.7.11+)
+│   ├── test_corroboration.py     # Fail-safe direction per abuse check (v1.7.12+)
+│   ├── test_mail_schema.py       # Schema detection refusals (v1.7.12+)
+│   └── test_outbound.py          # Queue-ID join + outbound signals (v1.7.15+)
 ├── migrations/
-│   └── *.sql               # Database migrations (007_cms_sites, 008_posture_audit, 009_block_cleared_at)
+│   └── *.sql               # Database migrations (009_block_cleared_at, 010_compromise_confirmed_at, 011_outbound_activity)
 ├── state/
 │   └── guardian.db          # SQLite database
 └── logs/

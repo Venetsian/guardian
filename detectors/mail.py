@@ -7,6 +7,7 @@ import re
 import logging
 
 from .base import HitTracker, is_guardian_disabled_client
+from modules.outbound import parse_qmgr, parse_submission
 
 
 class MailDetector:
@@ -14,13 +15,14 @@ class MailDetector:
 
     def __init__(self, config, blocker, db, whitelist=None,
                  geoip=None, distributed_auth_detector=None,
-                 corroborator=None):
+                 corroborator=None, outbound_tracker=None):
         self.blocker = blocker
         self.db = db
         self.whitelist = whitelist
         self.geoip = geoip
         self.distributed_auth_detector = distributed_auth_detector
         self.corroborator = corroborator
+        self.outbound_tracker = outbound_tracker
         self.time_window = config.getint('thresholds', 'time_window', fallback=300)
 
         self.smtp_threshold = config.getint('thresholds', 'smtp_auth_fail_threshold', fallback=10)
@@ -116,6 +118,16 @@ class MailDetector:
                 ip = ip_match.group(1)
                 username = user_match.group(1)
                 self._on_auth(ip, 'smtp', username)
+                # This line is also the ONLY place the queue ID is tied to an
+                # authenticated sender. Everything downstream — the qmgr line
+                # with the size and recipient count — is indistinguishable from
+                # inbound mail without it. The username string is reused
+                # verbatim (not re-parsed) so outbound_activity joins cleanly
+                # against auth_sessions and the compromise event.
+                if self.outbound_tracker:
+                    qid = parse_submission(line)
+                    if qid:
+                        self.outbound_tracker.note_submission(qid, username, ip)
             return
 
         # Dovecot failed auth (IMAP/POP3)
@@ -157,4 +169,19 @@ class MailDetector:
                 username = user_match.group(1)
                 service = 'imap' if 'imap-login' in line else 'pop3'
                 self._on_auth(ip, service, username)
+            return
+
+        # Queue manager — size and recipient count for a message (v1.7.15).
+        #
+        # Runs last because it is the only branch that is not authentication,
+        # and because a qmgr line cannot match any branch above. It carries no
+        # sender identity of its own: qmgr logs inbound and outbound mail in
+        # exactly the same shape, so the tracker discards any queue ID it did
+        # not first see on an authenticated submission. Most lines reaching
+        # here on a real host are inbound and are correctly ignored.
+        if self.outbound_tracker and 'nrcpt=' in line:
+            parsed = parse_qmgr(line)
+            if parsed:
+                qid, size_bytes, nrcpt = parsed
+                self.outbound_tracker.note_delivery(qid, size_bytes, nrcpt)
             return

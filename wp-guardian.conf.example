@@ -311,6 +311,12 @@ path = /opt/wp-guardian/state/guardian.db
 auth_retention_days = 90
 ip_history_retention_days = 180
 
+# Outbound send records (v1.7.15+). Shorter than auth_sessions on purpose:
+# this table grows per MESSAGE rather than per login, and its only consumer is
+# a baseline that looks back outbound_baseline_days. Setting it below that
+# value silently truncates the baseline — Guardian warns at startup if you do.
+outbound_retention_days = 30
+
 [log_analysis]
 # Automated log discovery and tripwire analysis
 # When enabled, runs periodically inside the daemon
@@ -429,6 +435,74 @@ corroboration_lookback_hours = 168
 # arrives from many addresses by design, so a per-IP counter never sees it.
 corroboration_failure_threshold = 20
 corroboration_failure_window = 3600
+
+# ---------------------------------------------------------------------------
+# Outbound corroboration — the payload phase (v1.7.15+)
+# ---------------------------------------------------------------------------
+# The checks above look for what an attacker does while getting established.
+# These two look at what the account actually SENT, which is harder proof but
+# arrives later in the takeover.
+#
+# Records one row per authenticated outbound message, correlating Postfix's
+# authenticated smtpd line with the qmgr line that carries the size and
+# recipient count. The queue ID is the join key, and the join is mandatory:
+# qmgr logs inbound and outbound mail identically, so counting it alone would
+# measure how much mail arrives FOR an account and call it sending.
+#
+# Set to false to stop recording entirely (the table is then never written).
+outbound_monitoring = true
+
+# How far back "recent sending" reaches, in hours. Wider than the detector's
+# 1h window because the burst and the geographic anomaly need not be
+# simultaneous — sending may start an hour before the login that trips the
+# country count, or the other way round.
+outbound_window_hours = 6
+
+# The account's own normal rate is computed over this many days, excluding the
+# recent window (so a burst cannot inflate the bar it is measured against).
+outbound_baseline_days = 30
+
+# THE VOLUME CHECK IS INERT UNTIL THE TABLE HOLDS THIS MUCH HISTORY, measured
+# across all accounts rather than one. On a fresh install every account looks
+# anomalous because there is nothing to compare against, and this check can
+# promote enforcement as far as disabling a mailbox. Expect roughly two weeks
+# after upgrading before it does anything at all — `--outbound-stats` shows
+# how much has accrued. The fan-out check below is armed immediately and
+# covers that gap.
+outbound_min_observation_days = 14
+
+# Both of these must be cleared for a volume signal. The floor is the
+# load-bearing one: a multiplier against a near-zero baseline is a division by
+# almost nothing, and would fire on a mailbox going from one message a week to
+# three.
+outbound_volume_floor = 100
+outbound_volume_multiplier = 10
+
+# Recipients on a SINGLE message (Postfix's nrcpt). Needs no history, so this
+# is the one outbound signal that works on the day you install it.
+#
+# 250 is calibrated against 4.5 weeks of a real small-business mail host: every
+# message there had 9 recipients or fewer, except one legitimate newsletter at
+# 133. An earlier default of 50 would have fired on that newsletter — and on
+# the worst possible mailbox, because the one account that sends bulk was also
+# the one that roams across the most networks. Those two risks land on the same
+# client rather than being independent, which is what makes a low threshold
+# here expensive.
+#
+# Set to 0 to disable the check. That is the right choice if your users send
+# bulk mail from their own mailboxes: the volume check above is immune to it,
+# since volume counts MESSAGES and a newsletter is one message however many
+# recipients it carries.
+#
+# Check your own numbers before raising it:
+#   python3 wp-guardian.py --outbound-stats --days 30
+outbound_fanout_threshold = 250
+
+# How long a submission waits for its qmgr line, in seconds, and the hard cap
+# on unmatched submissions held in memory. Only worth touching if the log
+# shows the pending map hitting its cap.
+outbound_queue_ttl = 300
+outbound_max_pending = 10000
 
 # The inverse gate: refuse to disable a mailbox WITHOUT abuse evidence, even
 # when the rule says full.

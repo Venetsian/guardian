@@ -213,6 +213,21 @@ class GuardianDB:
             );
 
             CREATE INDEX IF NOT EXISTS idx_cms_sites_cms ON cms_sites(cms);
+
+            CREATE TABLE IF NOT EXISTS outbound_activity (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                username    TEXT NOT NULL,
+                ip          TEXT DEFAULT '',
+                timestamp   INTEGER NOT NULL,
+                queue_id    TEXT DEFAULT '',
+                nrcpt       INTEGER DEFAULT 1,
+                size_bytes  INTEGER DEFAULT 0
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_outbound_user_time
+                ON outbound_activity(username, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_outbound_time
+                ON outbound_activity(timestamp);
         """)
 
         self.conn.commit()
@@ -867,13 +882,160 @@ class GuardianDB:
         return result.rowcount
 
     # ------------------------------------------------------------------
+    # v1.7.15 — Outbound activity (payload-phase corroboration)
+    # ------------------------------------------------------------------
+    def record_outbound(self, username, ip, nrcpt, size_bytes=0, queue_id='',
+                        timestamp=None):
+        """Record one authenticated outbound message.
+
+        Written only after the queue ID has been matched against an
+        authenticated smtpd line — see OutboundTracker. An unmatched qmgr line
+        is inbound mail and must never reach here.
+        """
+        if timestamp is None:
+            timestamp = int(time.time())
+        self.conn.execute(
+            "INSERT INTO outbound_activity "
+            "(username, ip, timestamp, queue_id, nrcpt, size_bytes) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (username, ip or '', int(timestamp), queue_id or '',
+             int(nrcpt or 1), int(size_bytes or 0))
+        )
+        self.conn.commit()
+
+    def outbound_exists(self, queue_id, timestamp, tolerance=2):
+        """Idempotency check for the backfill tool.
+
+        Deliberately NOT called by record_outbound: the live daemon writes each
+        queue ID exactly once by construction (the pending entry is popped on
+        match), so it must not pay a SELECT per message. A backfill can be
+        re-run over overlapping rotated logs, so it checks first.
+        """
+        if not queue_id:
+            return False
+        cursor = self.conn.execute(
+            "SELECT 1 FROM outbound_activity WHERE queue_id = ? "
+            "AND timestamp BETWEEN ? AND ? LIMIT 1",
+            (queue_id, int(timestamp) - tolerance, int(timestamp) + tolerance)
+        )
+        return cursor.fetchone() is not None
+
+    def outbound_observation_days(self):
+        """Days of outbound history in the table, across ALL accounts.
+
+        Gates the volume baseline. An account with no send history is only
+        meaningfully "silent" if Guardian has been watching long enough to
+        know the difference between a quiet mailbox and a fresh install —
+        without this the feature would read every account as anomalous on the
+        day it is switched on.
+        """
+        row = self.conn.execute(
+            "SELECT MIN(timestamp) AS first_seen FROM outbound_activity"
+        ).fetchone()
+        if not row or not row['first_seen']:
+            return 0.0
+        return max(0.0, (time.time() - row['first_seen']) / 86400.0)
+
+    def outbound_window_stats(self, username, window_seconds):
+        """Send activity for one account over the recent window.
+
+        Returns {'messages': int, 'recipients': int, 'max_nrcpt': int}.
+        """
+        cutoff = int(time.time()) - int(window_seconds)
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS messages, "
+            "       COALESCE(SUM(nrcpt), 0) AS recipients, "
+            "       COALESCE(MAX(nrcpt), 0) AS max_nrcpt "
+            "FROM outbound_activity WHERE username = ? AND timestamp >= ?",
+            (username, cutoff)
+        ).fetchone()
+        if not row:
+            return {'messages': 0, 'recipients': 0, 'max_nrcpt': 0}
+        return {
+            'messages': row['messages'] or 0,
+            'recipients': row['recipients'] or 0,
+            'max_nrcpt': row['max_nrcpt'] or 0,
+        }
+
+    def outbound_baseline(self, username, baseline_seconds, exclude_recent_seconds=0):
+        """The account's own normal send rate, in messages per hour.
+
+        `exclude_recent_seconds` holds the recent window out of the baseline.
+        Without it a burst inflates the very baseline it is measured against,
+        which is self-defeating for the one comparison that matters.
+
+        The denominator is the account's OWN span inside the window, not the
+        window length, whenever the account has any history there. A mailbox
+        created three days ago inside a thirty-day window would otherwise have
+        its rate divided by ten, understating the baseline and making the
+        multiplier trip on ordinary traffic — an error in the direction that
+        manufactures evidence.
+
+        Returns {'messages': int, 'hours': float, 'per_hour': float} or None
+        when the window is degenerate.
+        """
+        now = int(time.time())
+        end = now - int(exclude_recent_seconds)
+        start = now - int(baseline_seconds)
+        if end <= start:
+            return None
+
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS messages, MIN(timestamp) AS first_seen "
+            "FROM outbound_activity "
+            "WHERE username = ? AND timestamp >= ? AND timestamp < ?",
+            (username, start, end)
+        ).fetchone()
+
+        messages = (row['messages'] or 0) if row else 0
+        if messages and row['first_seen']:
+            # Only count the span in which this account actually existed.
+            hours = max(1.0, (end - row['first_seen']) / 3600.0)
+        else:
+            # Genuinely silent for the whole window. The global observation
+            # gate has already established that the silence is real history
+            # rather than an empty table.
+            hours = (end - start) / 3600.0
+
+        return {
+            'messages': messages,
+            'hours': hours,
+            'per_hour': (messages / hours) if hours > 0 else 0.0,
+        }
+
+    def outbound_top_senders(self, days=1, limit=20):
+        """Busiest senders over the last `days`. Operator reporting only."""
+        cutoff = int(time.time()) - int(days) * 86400
+        cursor = self.conn.execute(
+            "SELECT username, COUNT(*) AS messages, "
+            "       COALESCE(SUM(nrcpt), 0) AS recipients, "
+            "       COALESCE(MAX(nrcpt), 0) AS max_nrcpt, "
+            "       MAX(timestamp) AS last_seen "
+            "FROM outbound_activity WHERE timestamp >= ? "
+            "GROUP BY username ORDER BY messages DESC LIMIT ?",
+            (cutoff, int(limit))
+        )
+        return [
+            {
+                'username': row['username'],
+                'messages': row['messages'] or 0,
+                'recipients': row['recipients'] or 0,
+                'max_nrcpt': row['max_nrcpt'] or 0,
+                'last_seen': row['last_seen'] or 0,
+            }
+            for row in cursor.fetchall()
+        ]
+
+    # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
-    def cleanup_expired(self, auth_retention_days=90, history_retention_days=180):
+    def cleanup_expired(self, auth_retention_days=90, history_retention_days=180,
+                        outbound_retention_days=30):
         """Remove old data beyond retention periods."""
         now = int(time.time())
         auth_cutoff = now - (auth_retention_days * 86400)
         history_cutoff = now - (history_retention_days * 86400)
+        outbound_cutoff = now - (outbound_retention_days * 86400)
 
         # Clean old auth sessions
         r1 = self.conn.execute("DELETE FROM auth_sessions WHERE timestamp < ?", (auth_cutoff,))
@@ -888,12 +1050,18 @@ class GuardianDB:
         baseline_cutoff = now - (auth_retention_days * 86400)
         r4 = self.conn.execute("DELETE FROM account_baselines WHERE last_seen < ?", (baseline_cutoff,))
 
+        # Clean old outbound send records (v1.7.15). Shorter retention than
+        # auth_sessions on purpose — this table grows per message, and its
+        # only consumer is a baseline that looks back 30 days.
+        r5 = self.conn.execute("DELETE FROM outbound_activity WHERE timestamp < ?", (outbound_cutoff,))
+
         self.conn.commit()
 
-        total = r1.rowcount + r2.rowcount + r3.rowcount + r4.rowcount
+        total = r1.rowcount + r2.rowcount + r3.rowcount + r4.rowcount + r5.rowcount
         if total > 0:
             logger.info(f"Cleanup: removed {r1.rowcount} auth sessions, {r2.rowcount} block logs, "
-                       f"{r3.rowcount} expired whitelist, {r4.rowcount} old baselines")
+                       f"{r3.rowcount} expired whitelist, {r4.rowcount} old baselines, "
+                       f"{r5.rowcount} old outbound records")
 
     # ------------------------------------------------------------------
     # Statistics

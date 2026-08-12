@@ -702,6 +702,8 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
     COMPROMISE_ENABLED="false"
     COMPROMISE_ACTION_ASNS="alert_only"
     AUTO_REENABLE_HOURS="4"
+    OUTBOUND_MONITORING="true"
+    OUTBOUND_FANOUT="250"
     if ask_yn "  Enable compromise detection?" "n"; then
         COMPROMISE_ENABLED="true"
         if [[ "$GEOIP_ENABLED" != "true" ]]; then
@@ -732,6 +734,30 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
         echo ""
         echo "  Enter 0 to keep disables permanent until manually reversed."
         AUTO_REENABLE_HOURS=$(ask "  Auto-reenable after how many hours?" "4")
+
+        echo ""
+        echo -e "${BOLD}  Outbound corroboration (v1.7.15+)${NC}"
+        echo "  Records one row per authenticated outbound message so a flagged"
+        echo "  account can be checked for signs it is actually being misused:"
+        echo "  sending far above its own normal rate, or one message addressed"
+        echo "  to a large number of recipients."
+        echo ""
+        echo "  Note the volume check is INERT for its first 14 days — with no"
+        echo "  history every account looks anomalous, so it waits. The fan-out"
+        echo "  check works immediately. Run --outbound-stats to see progress."
+        if ask_yn "  Record authenticated outbound mail?" "y"; then
+            OUTBOUND_MONITORING="true"
+            echo ""
+            echo "  Fan-out threshold: recipients on a SINGLE message. 250 is"
+            echo "  calibrated on a real host where the largest legitimate send"
+            echo "  was a 133-recipient newsletter and everything else was <= 9."
+            echo "  Enter 0 to disable if your users mail large lists from their"
+            echo "  own mailboxes — the volume check counts messages, not"
+            echo "  recipients, so it is unaffected by newsletters."
+            OUTBOUND_FANOUT=$(ask "  Fan-out threshold (recipients, 0=off)?" "250")
+        else
+            OUTBOUND_MONITORING="false"
+        fi
     fi
 
     # --- Block expiry reaper (v1.7.9+) ---
@@ -1070,6 +1096,14 @@ emit("DET_MAILDIR", "maildir_template")
     fi
     if [[ -n "${AUTO_REENABLE_HOURS:-}" && "${AUTO_REENABLE_HOURS}" != "4" ]]; then
         sed -i "/^\[compromise_detection\]/,/^\[/ s|^auto_reenable_hours = .*|auto_reenable_hours = ${AUTO_REENABLE_HOURS}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+    fi
+
+    # v1.7.15 — outbound corroboration
+    if [[ "${OUTBOUND_MONITORING:-true}" == "false" ]]; then
+        sed -i "/^\[compromise_detection\]/,/^\[/ s|^outbound_monitoring = .*|outbound_monitoring = false|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+    fi
+    if [[ -n "${OUTBOUND_FANOUT:-}" && "${OUTBOUND_FANOUT}" != "250" ]]; then
+        sed -i "/^\[compromise_detection\]/,/^\[/ s|^outbound_fanout_threshold = .*|outbound_fanout_threshold = ${OUTBOUND_FANOUT}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
     fi
 
     # v1.7.9 — Block expiry reaper

@@ -26,6 +26,7 @@ from modules.geoip import GeoIPResolver
 from modules.mail_backend import MailBackend
 from modules.compromise import CompromiseAction
 from modules.corroboration import AbuseCorroborator
+from modules.outbound import OutboundTracker
 from modules.digest import DigestBuffer
 from modules.verbosity import VerbosityRouter
 from backends.factory import create_backend
@@ -284,6 +285,15 @@ class Guardian:
             self.logger.error(f"AbuseCorroborator init failed: {e}")
             self.corroborator = None
 
+        # Outbound send correlation — feeds the payload-phase corroboration
+        # checks. Holds the short-lived queue-ID map that ties an
+        # authenticated submission to its qmgr record.
+        try:
+            self.outbound_tracker = OutboundTracker(self.config, self.db)
+        except Exception as e:
+            self.logger.error(f"OutboundTracker init failed: {e}")
+            self.outbound_tracker = None
+
         # Compromise action orchestrator
         self.compromise_action = CompromiseAction(
             self.config, self.db, self.blocker, self.mail_backend, self.telegram,
@@ -489,6 +499,7 @@ class Guardian:
                 geoip=self.geoip,
                 distributed_auth_detector=self.distributed_auth_detector,
                 corroborator=self.corroborator,
+                outbound_tracker=self.outbound_tracker,
             )
             mail_tailer = LogTailer([mail_log], mail_detector, name='mail')
             mail_tailer.start()
@@ -574,7 +585,9 @@ class Guardian:
                 if now - last_cleanup > cleanup_interval:
                     auth_retention = self.config.getint('database', 'auth_retention_days', fallback=90)
                     history_retention = self.config.getint('database', 'ip_history_retention_days', fallback=180)
-                    self.db.cleanup_expired(auth_retention, history_retention)
+                    outbound_retention = self.config.getint('database', 'outbound_retention_days', fallback=30)
+                    self.db.cleanup_expired(auth_retention, history_retention,
+                                            outbound_retention)
 
                     iso_retention = self.config.getint('thresholds', 'login_isolation_retention_hours', fallback=48)
                     removed = self.db.login_isolation_cleanup(iso_retention * 3600)
@@ -1240,6 +1253,10 @@ def main():
                         help='Read Postfix/Dovecot config to work out your mail '
                              'table and column names, and show the [mail_backend] '
                              'settings and GRANT they imply')
+    parser.add_argument('--outbound-stats', action='store_true',
+                        help='Show recorded authenticated outbound mail, and '
+                             'whether the volume baseline has accrued enough '
+                             'history to be armed (combine with --days N)')
     parser.add_argument('--flush', nargs='?', const='all', metavar='TABLE',
                         help='Flush data. Options: all, tripwires, blocks, auth, isolation (default: all)')
     parser.add_argument('--discover-logs', action='store_true',
@@ -1641,6 +1658,49 @@ def main():
             print(f"  failed         : {result['failed']} (mail backend calls "
                   f"did not succeed — will retry)")
         print(f"  still pending  : {result['remaining']}")
+        print("")
+        return
+
+    if args.outbound_stats:
+        corr = guardian.corroborator
+        days = args.days if args.days else 1
+        observed = guardian.db.outbound_observation_days()
+        min_days = corr.outbound_min_observation_days if corr else 14
+
+        print("")
+        print("Outbound activity — payload-phase corroboration")
+        print("─" * 68)
+        print(f"  history accrued     : {observed:.1f} days")
+        if observed < min_days:
+            remaining = min_days - observed
+            print(f"  volume baseline     : INERT — needs {min_days} days, "
+                  f"{remaining:.1f} to go")
+            print("                        (fan-out check is armed regardless)")
+        else:
+            print(f"  volume baseline     : ARMED (needs {min_days} days)")
+        if corr:
+            print(f"  window              : {corr.outbound_window_seconds // 3600}h")
+            print(f"  volume trip         : >= {corr.outbound_volume_floor} messages "
+                  f"AND >= {corr.outbound_volume_multiplier:g}x own baseline")
+            print(f"  fan-out trip        : >= {corr.outbound_fanout_threshold} "
+                  f"recipients on one message")
+        print("")
+
+        senders = guardian.db.outbound_top_senders(days=days, limit=25)
+        if not senders:
+            print(f"No authenticated outbound recorded in the last {days} day(s).")
+            print("")
+            print("If this host does send mail, check that [compromise_detection]")
+            print("outbound_monitoring = true and that the daemon has been running")
+            print("since the setting was added — records only accrue while it runs.")
+            print("")
+            return
+
+        print(f"Top senders, last {days} day(s):")
+        print(f"  {'account':<38s} {'msgs':>7s} {'rcpts':>8s} {'max fan':>8s}")
+        for row in senders:
+            print(f"  {row['username'][:38]:<38s} {row['messages']:>7d} "
+                  f"{row['recipients']:>8d} {row['max_nrcpt']:>8d}")
         print("")
         return
 
