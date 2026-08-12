@@ -31,3 +31,9 @@ Thumbs.db
 # Backups
 *.bak
 *.orig
+
+# Internal working docs — incident reports and implementation specs.
+# These carry real customer data and production firewall config.
+# Kept locally, never published (this repo is public).
+guardian-fp-report.md
+wp-guardian-v1.4-spec.md

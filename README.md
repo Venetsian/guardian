@@ -495,7 +495,7 @@ All of the above is observable from Telegram once `commands_enabled = true`:
 
 ## Requirements
 
-- Python 3.6+ (tested with 3.6.8)
+- Python 3.6+ (code is kept 3.6-compatible; reference hosts run 3.9)
 - SQLite3 (built into Python)
 - `requests` Python module (for Telegram alerts)
 - Root access

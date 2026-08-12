@@ -62,13 +62,13 @@ class TestFailureBurst(unittest.TestCase):
 
     def test_local_part_and_full_address_are_summed(self):
         # Observed on the live host: a bot tries grace@example.org then
-        # helen. Counting those separately halves the burst and can drop it
+        # grace. Counting those separately halves the burst and can drop it
         # under the threshold.
         c = build(corroboration_failure_threshold=20)
         for _ in range(10):
             c.record_auth_failure('grace@example.org')
         for _ in range(10):
-            c.record_auth_failure('helen')
+            c.record_auth_failure('grace')
         signals = c.evaluate('grace@example.org')
         self.assertEqual(len(signals), 1)
 
