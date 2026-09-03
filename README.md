@@ -204,7 +204,7 @@ Each web access log line goes through these checks in order (first match wins):
 12. xmlrpc.php abuse — block after 5 hits
 13. Author enumeration — block after 8 hits
 14. PHP 404 scanning — block after 20 hits
-15. General 404 storm — block after 50 hits
+15. General 404 storm — block after 50 hits, provided misses dominate the client's traffic (v1.7.16+; framework prefetch payloads are counted separately, see below)
 
 For SSH (`/var/log/secure`):
 - `Invalid user` → instant block (`ssh_invalid`)
@@ -381,6 +381,53 @@ legit_php_paths = /billing.php, /account.php
 Built-in exemptions: `/api.php`, `/ajax.php`, `/public.php`, `/cron.php`, `/rss.php`, `/feed.php`, `/client.php`, `/index.php`. `legit_php_paths` adds to that set, it does not replace it.
 
 **On `suspicious_statuses`:** 404 is the classic enumeration signature, but deny-heavy installs (Apache/nginx `deny`, ModSecurity, CyberPanel) answer scans with **403** instead — on one Apache host in our fleet 403 outnumbers 404 on these paths by roughly 100:1, so the default counts all three. Narrow it to `404` only if this server fronts a customer portal whose PHP endpoints return application-level 403s to logged-in users.
+
+### 404 storms on SPA / Next.js hosts (v1.7.16+)
+
+A single-page app prefetches one payload per route it might navigate to. When a
+deploy makes the build on disk disagree with the route manifest inside an
+already-loaded browser tab, every one of those prefetches misses at once — and
+the client doing it is usually the developer.
+
+Measured on a production Next.js host: **134 misses in a single minute** from a
+developer's own browser against a threshold of 50 per 300s, alongside 100
+successful requests in the same window. It produced six blocks over four
+months, one escalated to a 30-day tier 2.
+
+Two changes separate that from a scanner, both tunable:
+
+```ini
+[thresholds]
+framework_404_threshold = 400      # own bucket for framework payloads
+general_404_min_fail_ratio = 0.9   # misses as a share of everything served
+general_404_hard_limit = 500       # past this, block whatever the ratio says
+
+[whitelist]
+framework_payload_paths = /_myapp/  # extra build-tool prefixes, if needed
+```
+
+**Framework payloads get their own bucket.** Requests carrying `?_rsc=` or
+`?_data=`, or living under `/_next/`, `/_nuxt/`, `/_astro/`, `/_app/`,
+`/page-data/`, `/@vite/`, plus generated filenames like `__next.*.txt`,
+`__data.json` and `_payload.json`, are generated URLs rather than path
+enumeration, so they are charged against `framework_404_threshold` instead.
+
+This is a budget, not an exemption, and it cannot be used as a bypass: a
+`.php` path is **never** classified as a payload, so no tripwire, webshell or
+PHP-scan rule is reachable through it, and the query markers only apply to
+route-shaped paths — `/backup.zip?_rsc=1`, `/.env?_rsc=1` and `/.git/config`
+stay ordinary enumeration.
+
+`general_404_hard_limit` is checked against whichever bucket crossed its
+threshold, never the two summed, so a long rebuild session cannot stack
+payload misses into the ceiling meant for enumeration.
+
+**A storm is a ratio, not a count.** Before blocking, misses must make up at
+least `general_404_min_fail_ratio` of everything the client was served in the
+window. A browser rendering a site pulls real content alongside its misses; a
+scanner pulls almost nothing that exists. Across four months of fleet logs,
+developers mid-rebuild sat at **0.59-0.60** and real scanners at
+**0.98-1.00**. Set the ratio to `0` for the old count-only behaviour.
 
 ### Remote troubleshooting
 

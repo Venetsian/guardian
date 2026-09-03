@@ -1,5 +1,123 @@
 # WP-Guardian Changelog
 
+## v1.7.16 — the 404 storm is a ratio, not a count (2026-09-03)
+
+`general_404` blocked a developer off his own client's site several times a
+day. The rule counted 404s and 403s per IP and blocked at 50 in 300s, with no
+notion of who was asking or why.
+
+### What a single-page app does to that counter
+
+A Next.js App Router client prefetches one payload per route it might navigate
+to. The moment a deploy makes the build on disk disagree with the route
+manifest inside an already-loaded browser tab, every one of those prefetches
+misses at once:
+
+```
+GET /shipper/signup/__next.shipper.signup.txt?_rsc=1nnv4 HTTP/2" 404
+    Referer: https://dev.example.com/     UA: Chrome/152 Edg/152
+```
+
+Measured on one host, in the worst single minute:
+
+| | misses | of which framework payloads | successes |
+|---|---|---|---|
+| developer mid-rebuild | 134 | 129 | 100 |
+| second developer IP | 74 | 68 | 156 |
+
+134 misses in sixty seconds against a threshold of 50 per 300s. Six blocks
+over four months, one escalated to a 30-day tier 2. The client was a current
+browser sending a same-origin Referer that had already pulled 766 successful
+responses from that vhost. The same burst hits any *visitor* who happens to be
+browsing during a deploy.
+
+### Framework payloads are counted separately
+
+New `modules/spa_assets.py` classifies a request as a build tool's own
+navigation payload: the `_rsc` and `_data` query parameters, the `/_next/`,
+`/_nuxt/`, `/_astro/`, `/_app/`, `/page-data/`, `/@vite/`, `/@id/`, `/@fs/`
+prefixes, and the generated filenames `__next.*.txt`, `__data.json`,
+`_payload.json`, `app-data.json` and `*.map`. Those are charged against a new
+`framework_404_threshold` (default 400) instead of `general_404_threshold`.
+
+A budget, not an exemption, and deliberately not a bypass token:
+
+- a `.php` path is **never** classified as a payload, and every high-value web
+  rule — structural, instant, suspicious, tripwire, php_scan — is `.php`-scoped,
+  so none of them is reachable this way;
+- the query markers only count on a route-shaped path, so `/backup.zip?_rsc=1`,
+  `/.env?_rsc=1` and `/.git/config?_rsc=1` remain ordinary enumeration;
+- the ratio guard below still applies to whatever is left.
+
+### A storm is a ratio, not a count
+
+`general_404_min_fail_ratio` (default 0.9) requires misses to make up at least
+that share of everything the IP was served in the window before a block. A
+browser rendering a site pulls real content alongside its misses; a scanner
+enumerating one pulls almost nothing that exists. `general_404_hard_limit`
+(default 500) is the ceiling — past that many misses the ratio stops mattering,
+so padding a scan with real requests only delays a block.
+
+Replaying four months of production logs through the new code:
+
+| | worst general bucket | worst payload bucket | worst miss ratio |
+|---|---|---|---|
+| developer A | 19 | 129 | 0.60 |
+| developer B | 6 | 68 | 0.59 |
+| scanner A | 389 | 0 | 1.00 |
+| scanner B | 154 | 0 | 1.00 |
+| scanner C | 271 | 0 | 0.98 |
+
+Classification alone puts the developers 2.6x under the threshold; the ratio
+guard is the second line. No scanner produced a single framework-bucket hit.
+All three were still blocked.
+
+### Also
+
+- `general_404_threshold = 0` now disables the rule, as `[thresholds]` has
+  always documented. It previously meant "block on the first miss".
+- **In-memory trackers are now actually swept.** The 5-minute
+  "clean up in-memory trackers" tick in the main loop had an empty body, so
+  none of the eleven `HitTracker`s across the five detectors was ever pruned:
+  `add()` trims an IP's timestamp list but never drops the key, so every IP
+  the daemon had ever seen kept a dict entry for the life of the process. New
+  `detectors.base.cleanup_trackers()` sweeps each tailer's detector, and
+  `PostFloodDetector.cleanup()` (which already existed and was likewise never
+  called) is invoked alongside it. This mattered enough to fix now because
+  `hits_success` records every 2xx/3xx response, so the web trackers grow with
+  ordinary visitors rather than only with attack traffic.
+
+### Config
+
+```ini
+[thresholds]
+framework_404_threshold = 400
+general_404_min_fail_ratio = 0.9
+general_404_hard_limit = 500
+
+[whitelist]
+framework_payload_paths =          # extra build-tool prefixes, rarely needed
+```
+
+Existing installs keep the old behaviour until these are added — see
+`wp-guardian.conf.example`. A `sed` to retune in place:
+
+```bash
+sed -i '/^general_404_threshold/a framework_404_threshold = 400
+general_404_min_fail_ratio = 0.9
+general_404_hard_limit = 500' /opt/wp-guardian/wp-guardian.conf
+```
+
+### Files
+
+- `modules/spa_assets.py` (new) — framework payload classification
+- `detectors/web.py` — payload bucket, success tracking, `_is_scanning_ratio()`
+- `detectors/base.py`, `wp-guardian.py` — tracker sweep
+- `tests/test_web_404_storm.py` (new) — 15 tests: both measured incidents,
+  detection regressions, and the evasion cases
+- `wp-guardian.conf.example`, `README.md`, `VERSION`
+
+
 ## v1.7.15 — outbound volume and recipient fan-out corroboration (2026-08-12)
 
 Future Work #3, and the payload-phase half of the abuse corroboration that

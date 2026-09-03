@@ -14,6 +14,7 @@ import logging
 from .base import HitTracker
 from .log_formats import parse_line
 from modules.config import parse_csv_set
+from modules.spa_assets import is_framework_payload
 
 
 class WebDetector:
@@ -36,6 +37,24 @@ class WebDetector:
         self.php_404_threshold = config.getint('thresholds', 'php_404_threshold', fallback=20)
         self.general_404_threshold = config.getint('thresholds', 'general_404_threshold', fallback=50)
 
+        # A 404 storm is a *ratio*, not a count. A browser rendering a site
+        # pulls real content alongside its misses; a scanner enumerating one
+        # pulls almost nothing that exists. Counting alone is what turned a
+        # developer's post-deploy prefetch burst into a 30-day tier-2 block.
+        # Require misses to dominate the client's traffic this heavily before
+        # calling it a storm.
+        self.general_404_min_fail_ratio = config.getfloat(
+            'thresholds', 'general_404_min_fail_ratio', fallback=0.9)
+        # Framework navigation payloads get their own, far looser budget
+        # rather than a blanket exemption — see the branch that uses it.
+        self.framework_404_threshold = config.getint(
+            'thresholds', 'framework_404_threshold', fallback=400)
+        # Ceiling on the guard above: past this many misses in the window,
+        # block whatever the ratio says. Stops a high-volume dirbuster from
+        # buying immunity by padding its run with pages that exist.
+        self.general_404_hard_limit = config.getint(
+            'thresholds', 'general_404_hard_limit', fallback=500)
+
         # Auth tracking
         self.trust_duration = config.getint('auth_tracking', 'wp_trust_duration', fallback=24) * 3600
 
@@ -45,6 +64,12 @@ class WebDetector:
         self.hits_author = HitTracker(self.time_window)
         self.hits_php404 = HitTracker(self.time_window)
         self.hits_404 = HitTracker(self.time_window)
+        # Successful (2xx/3xx) responses per IP — the denominator of the
+        # miss-ratio guard above.
+        self.hits_success = HitTracker(self.time_window)
+        # Misses on framework navigation payloads, kept apart from hits_404
+        # so the two can carry different thresholds.
+        self.hits_fw404 = HitTracker(self.time_window)
 
         # Structural tripwires (always active, no file needed)
         self.structural_patterns = [
@@ -73,6 +98,12 @@ class WebDetector:
         self.legit_short_php |= parse_csv_set(
             config.get('whitelist', 'legit_php_paths', fallback='')
         )
+
+        # Extra build-tool path prefixes for this install, on top of the
+        # frameworks modules/spa_assets.py already recognises.
+        self.framework_payload_paths = tuple(parse_csv_set(
+            config.get('whitelist', 'framework_payload_paths', fallback='')
+        ))
 
         # Paths that should NEVER be tripwires (legitimate WordPress/app paths)
         self.safe_path_patterns = [
@@ -139,6 +170,12 @@ class WebDetector:
         # ----- LOGIN ISOLATION: track CSS loads (real browser signal) -----
         if clean_path.endswith('.css'):
             self.db.login_isolation_record_css(ip)
+
+        # ----- REAL-CONTENT TRACKING (denominator for the 404-storm ratio) -----
+        # Recorded here, ahead of every rule that can return, so a served
+        # request counts no matter which branch below handles it.
+        if status[:1] in ('2', '3'):
+            self.hits_success.add(ip)
 
         # ----- AUTHENTICATION TRACKING -----
         if method == 'POST' and 'wp-login.php' in clean_path and status == '302':
@@ -253,7 +290,62 @@ class WebDetector:
 
         # General 404 storm
         if status in ('404', '403'):
-            count = self.hits_404.add(ip)
-            if count >= self.general_404_threshold:
-                self.blocker.block(ip, f"404 storm ({count} in {self.time_window}s)", service='web', site=site, rule='general_404')
+            # A framework's own navigation payloads are not path enumeration.
+            # After a deploy an SPA re-requests every route it had prefetched
+            # and misses on all of them at once — measurements in
+            # modules/spa_assets.py. Counted in their own bucket at a far
+            # looser threshold rather than exempted outright, so `?_rsc=` is
+            # not a token that switches the rule off. Never matches a .php
+            # path, so none of the PHP rules above can be reached this way.
+            if is_framework_payload(path, clean_path, self.framework_payload_paths):
+                count = self.hits_fw404.add(ip)
+                threshold = self.framework_404_threshold
+                label = 'Framework payload 404 storm'
+            else:
+                count = self.hits_404.add(ip)
+                threshold = self.general_404_threshold
+                label = '404 storm'
+
+            # A threshold of 0 means "disabled" everywhere else in this
+            # config section; without the guard it would mean "block on the
+            # first miss" here.
+            if threshold and count >= threshold:
+                if not self._is_scanning_ratio(ip, count):
+                    return
+                self.blocker.block(ip, f"{label} ({count} in {self.time_window}s)", service='web', site=site, rule='general_404')
             return
+
+    def _is_scanning_ratio(self, ip, bucket_count):
+        """True when misses dominate this IP's traffic enough to be a scan.
+
+        `bucket_count` is the count of whichever bucket just crossed its
+        threshold. The hard limit is checked against that bucket alone, not
+        against the two summed: a long rebuild session can pile up several
+        hundred payload misses beside a normal handful of plain ones, and
+        summing them would put a developer back over the ceiling that exists
+        to catch enumeration.
+
+        The ratio itself does use both buckets — a client is one client
+        whichever shape its failures take.
+        """
+        if bucket_count >= self.general_404_hard_limit:
+            return True
+
+        misses = self.hits_404.get_count(ip) + self.hits_fw404.get_count(ip)
+
+        successes = self.hits_success.get_count(ip)
+        total = misses + successes
+        if total <= 0:
+            return True
+
+        ratio = float(misses) / total
+        if ratio >= self.general_404_min_fail_ratio:
+            return True
+
+        logging.getLogger('wp-guardian.web').info(
+            "%s reached %d misses in %ds but was served %d real responses "
+            "(miss ratio %.2f < %.2f) — browsing a broken build, not scanning",
+            ip, misses, self.time_window, successes, ratio,
+            self.general_404_min_fail_ratio
+        )
+        return False

@@ -19,6 +19,7 @@ import glob as glob_module
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from modules.config import load_config, load_whitelist_file, load_tripwire_file, parse_duration
+from detectors.base import cleanup_trackers
 from modules.database import GuardianDB
 from modules.whitelist import WhitelistManager
 from modules.blocker import Blocker
@@ -639,6 +640,13 @@ class Guardian:
 
                 # Clean up in-memory trackers
                 if now - last_tracker_cleanup > tracker_interval:
+                    try:
+                        for tailer in self.tailers:
+                            cleanup_trackers(getattr(tailer, 'detector', None))
+                        if self.post_flood_detector is not None:
+                            self.post_flood_detector.cleanup()
+                    except Exception as e:
+                        self.logger.error(f"Tracker cleanup failed: {e}")
                     last_tracker_cleanup = now
 
                 # Whitelist file auto-reload

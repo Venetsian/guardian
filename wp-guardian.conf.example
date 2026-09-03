@@ -29,6 +29,43 @@ author_enum_threshold = 8
 php_404_threshold = 20
 general_404_threshold = 50
 
+# --- 404-storm shaping (v1.7.16+) -------------------------------------------
+# The count above answers "how many misses?". On a host serving a React /
+# Next.js / Nuxt / SvelteKit front end that question alone gets the answer
+# wrong, because two very different clients produce the same number.
+#
+# A single-page app prefetches one payload per route it might navigate to.
+# The moment a deploy makes the build on disk disagree with the route manifest
+# in an already-loaded browser tab, every one of those prefetches misses at
+# once. Measured on a production Next.js host: 134 misses in one minute from a
+# developer's own browser against a threshold of 50 per 300s, alongside 100
+# successful requests in the same window. Six blocks over four months, one
+# escalated to a 30-day tier 2.
+#
+# Two knobs separate that from a scanner.
+
+# 1. Framework navigation payloads (?_rsc=, /_next/, __next.*.txt, /_nuxt/,
+#    __data.json, ...) are counted in their own bucket at this much looser
+#    threshold. They are generated URLs, not path enumeration. A .php path is
+#    NEVER classified this way, so no tripwire, webshell or PHP-scan rule can
+#    be reached through it, and a route-shaped path is required, so
+#    /backup.zip?_rsc=1 and /.env?_rsc=1 stay ordinary enumeration.
+#    Set equal to general_404_threshold to disable the distinction.
+framework_404_threshold = 400
+
+# 2. A storm is a ratio, not a count. Before blocking, require misses to be
+#    at least this share of everything the client was served in the window.
+#    A browser rendering a site pulls real content alongside its misses; a
+#    scanner enumerating one pulls almost nothing that exists. Fleet data:
+#    developers mid-rebuild sit at 0.59-0.60, real scanners at 0.98-1.00.
+#    Set to 0 to restore the old count-only behaviour.
+general_404_min_fail_ratio = 0.9
+
+# Ceiling on the ratio guard: past this many misses in the window, block
+# whatever the ratio says. Stops a high-volume scanner from buying immunity
+# by padding its run with requests for pages that exist.
+general_404_hard_limit = 500
+
 # Suspicious PHP scanning — random/gibberish .php filenames (v1.7.10+)
 # How many pattern hits within time_window before blocking.
 suspicious_threshold = 3
@@ -207,6 +244,12 @@ file = /opt/wp-guardian/whitelist.conf
 # lowercase. Added to the built-in set (/api.php, /ajax.php, /public.php,
 # /cron.php, /rss.php, /feed.php, /client.php, /index.php), never replaces it.
 # legit_php_paths = /billing.php, /account.php
+
+# Extra build-tool path prefixes exempted from the general 404-storm count
+# and charged to the looser framework bucket instead (v1.7.16+). Only needed
+# for a framework modules/spa_assets.py does not already know. Prefixes, not
+# globs; .php paths are never eligible whatever is listed here.
+# framework_payload_paths = /_myapp/, /__build/
 
 [geoip]
 # MaxMind GeoLite2 databases (v1.4+)

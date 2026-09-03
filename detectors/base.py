@@ -82,3 +82,24 @@ class HitTracker:
         stale = [ip for ip, hits in self._hits.items() if not hits or hits[-1] < cutoff]
         for ip in stale:
             del self._hits[ip]
+
+
+def cleanup_trackers(*owners):
+    """Prune every HitTracker held by these objects.
+
+    add() and get_count() trim an IP's timestamp list but never drop the key,
+    so without this every IP the daemon has ever seen keeps a dict entry for
+    the life of the process. The 5-minute tick in wp-guardian.py that was
+    meant to do this had an empty body, so none of the eleven trackers across
+    the five detectors was ever swept.
+
+    It matters more since v1.7.16: WebDetector.hits_success records every
+    2xx/3xx response, so the web trackers now grow with ordinary visitors
+    rather than only with attack traffic.
+    """
+    for owner in owners:
+        if owner is None:
+            continue
+        for value in vars(owner).values():
+            if isinstance(value, HitTracker):
+                value.cleanup()
