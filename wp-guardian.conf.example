@@ -89,10 +89,20 @@ suspicious_statuses = 404, 401, 403
 # Login isolation — bots that ONLY hit wp-login.php without loading CSS
 # Threshold: how many wp-login.php requests with zero CSS loads = block
 login_isolation_threshold = 3
-# Detection window in seconds (how long to wait for a CSS load before deciding)
+# Reserved — read into the detector but never applied. A sliding window was
+# measured as a false-positive fix in v1.7.17 and rejected: bots pace their
+# wp-login hits slowly, so any window short enough to help a human cut bot
+# detection by two thirds. Browser memory below is the fix instead.
 login_isolation_window = 120
 # How long to keep tracking data (hours) — longer = better escalation for repeat offenders
 login_isolation_retention_hours = 48
+# Browser memory (days). An IP that ever loaded a static asset is remembered
+# as a real browser for this long, instead of being forgotten with the row
+# above. This is what stops a returning admin whose CSS is cached (or served
+# by a CDN) from looking identical to a login bot. Such an IP is never
+# blocked by this rule anyway, so a longer memory cannot hide an attacker —
+# it only prevents false positives. 0 disables it.
+login_isolation_browser_memory_days = 30
 
 # SMTP module
 # Mail clients (Outlook, Apple Mail, Thunderbird) retry aggressively after a

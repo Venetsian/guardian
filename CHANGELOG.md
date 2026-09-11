@@ -1,5 +1,79 @@
 # WP-Guardian Changelog
 
+## v1.7.17 — login isolation was blocking people with warm caches (2026-09-11)
+
+Reported by clients, not by a log review: real customers were being firewall-
+blocked when they opened a WordPress login page.
+
+`login_isolation` asks one question — "did this IP render a page, or does it
+only ever touch wp-login.php?" — and answered it by looking for a single
+`.css` request. That signal is missing for reasons that have nothing to do
+with being a bot:
+
+- WordPress serves login stylesheets with a `?ver=` cache buster and a
+  far-future max-age, so a returning admin re-opens the page with every
+  stylesheet already in cache and requests no CSS at all
+- a CDN answers assets from the edge and the origin log never sees them
+- the browser evidence lived on the same row as the hit counter, which is
+  deleted after `login_isolation_retention_hours` (48h) — so the visit that
+  proved someone was a browser was gone before the visit that judged them
+
+Of the blocked IPs still present in one host's access logs, 355 (6.4%) had
+fetched static assets *and* carried a browser user-agent. They had rendered
+pages. They were people.
+
+### The fix
+
+Two changes, both scoped to this rule:
+
+- **the browser signal is any static asset**, not just `.css` — js, images,
+  fonts, icons (`is_browser_asset()` in `detectors/web.py`)
+- **browser evidence is remembered for 30 days** (`login_isolation_browser_
+  memory_days`), independent of the 48h hit row. An IP with the flag set is
+  never blocked by this rule anyway, so a longer memory cannot hide an
+  attacker — only a false positive
+
+Measured by replaying 55,132 real access-log lines through the detector,
+against two behavioural cohorts: IPs that fetched assets with a browser UA
+("people"), and IPs that touched nothing but wp-login.php ("bots").
+
+| | people blocked | bots blocked |
+|---|---|---|
+| before | 258 | 385 |
+| widened asset signal | 27 | 385 |
+| + 30-day browser memory | **15** | **385** |
+
+94% of the false positives, none of the detection.
+
+### Three fixes that were measured and rejected
+
+Each looks obviously right and each costs far more than it buys. They are
+pinned by tests in `tests/test_web_login_isolation.py` so they are not
+re-proposed:
+
+| candidate | FPs removed | bot detection kept |
+|---|---|---|
+| skip 5xx responses (a 503 renders nothing) | +1% | 55% |
+| 120s sliding hit window | +1% | 34% |
+| treat `GET wp-login.php -> 302` as a logged-in bounce | +1% | 87% |
+
+The window fails because bots pace their login hits slowly — the rule's reach
+always came from accumulating across 48 hours. The 302 fails because plenty of
+sites redirect wp-login.php for *everyone* (hidden-login plugins, http->https,
+canonical host), so bots collect that redirect too.
+
+`login_isolation_window` remains reserved and unapplied; its config comment
+used to describe behaviour that did not exist and now says so.
+
+### Changed
+
+- `detectors/web.py` — `is_browser_asset()`, widened signal, rationale comments
+- `modules/database.py` — `login_isolation_cleanup()` takes a second retention
+- `wp-guardian.py` — passes `login_isolation_browser_memory_days`
+- `wp-guardian.conf`, `wp-guardian.conf.example` — new key, corrected comments
+- `tests/test_web_login_isolation.py` — new, 17 cases
+- `README.md`, `VERSION`
+
 ## v1.7.16 — the 404 storm is a ratio, not a count (2026-09-03)
 
 `general_404` blocked a developer off his own client's site several times a

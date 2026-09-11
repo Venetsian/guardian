@@ -591,7 +591,10 @@ class Guardian:
                                             outbound_retention)
 
                     iso_retention = self.config.getint('thresholds', 'login_isolation_retention_hours', fallback=48)
-                    removed = self.db.login_isolation_cleanup(iso_retention * 3600)
+                    browser_memory = self.config.getint(
+                        'thresholds', 'login_isolation_browser_memory_days', fallback=30)
+                    removed = self.db.login_isolation_cleanup(
+                        iso_retention * 3600, browser_memory * 86400)
                     if removed > 0:
                         self.logger.debug(f"Cleaned {removed} expired login isolation entries")
 

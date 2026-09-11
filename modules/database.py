@@ -846,7 +846,13 @@ class GuardianDB:
             return (1, 0)
 
     def login_isolation_record_css(self, ip):
-        """Record that this IP has loaded a CSS file (real browser signal)."""
+        """Record a real-browser signal for this IP.
+
+        Named for the original `.css`-only signal and kept that way so the
+        column, PostFloodDetector's signal A and this method stay in step.
+        The caller decides what qualifies — since v1.7.17 that is any static
+        asset, not just a stylesheet. See detectors/web.py is_browser_asset().
+        """
         now = int(time.time())
         existing = self.conn.execute(
             "SELECT 1 FROM login_isolation WHERE ip = ?", (ip,)
@@ -872,14 +878,35 @@ class GuardianDB:
         ).fetchone()
         return row is not None and row['has_css'] == 1
 
-    def login_isolation_cleanup(self, max_age_seconds):
-        """Remove login isolation entries older than max_age."""
-        cutoff = int(time.time()) - max_age_seconds
-        result = self.conn.execute(
-            "DELETE FROM login_isolation WHERE last_seen < ?", (cutoff,)
-        )
+    def login_isolation_cleanup(self, max_age_seconds, browser_max_age_seconds=0):
+        """Remove login isolation entries older than max_age.
+
+        Rows carrying browser evidence (has_css=1) are kept for
+        `browser_max_age_seconds` instead — this is the "browser memory" that
+        fixes the rule's false positives. A returning admin used to be judged
+        only on the current 48h row: their stylesheets were cached (or CDN- or
+        plugin-served), so the row looked exactly like a bot's and the earlier
+        visit that proved they were a browser had already been deleted.
+
+        Keeping the evidence and nothing else is what makes this safe — an IP
+        with has_css=1 is never blocked by this rule anyway, so a longer
+        retention cannot suppress a detection, only a false one. Measured on
+        55k replayed log lines from wp.maiahost.com: 94% of false positives
+        removed with 385/385 bot detections retained. 0 disables it and
+        restores the single-retention behavior.
+        """
+        now = int(time.time())
+        removed = self.conn.execute(
+            "DELETE FROM login_isolation WHERE last_seen < ? AND has_css = 0",
+            (now - max_age_seconds,)
+        ).rowcount
+        browser_age = browser_max_age_seconds or max_age_seconds
+        removed += self.conn.execute(
+            "DELETE FROM login_isolation WHERE last_seen < ? AND has_css = 1",
+            (now - browser_age,)
+        ).rowcount
         self.conn.commit()
-        return result.rowcount
+        return removed
 
     # ------------------------------------------------------------------
     # v1.7.15 — Outbound activity (payload-phase corroboration)

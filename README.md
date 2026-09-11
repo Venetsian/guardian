@@ -11,7 +11,7 @@ WP-Guardian monitors web, SMTP, IMAP/POP3, and SSH logs, automatically blocks at
 - **CMS auto-detect (v1.5+)** — fingerprints each vhost on startup (WordPress / Joomla / Drupal / Magento / PrestaShop / OpenCart / phpMyAdmin) and uses that to dispatch CMS-specific rules; per-vhost overrides via optional `vhosts.conf`
 - **POST-flood detector (v1.5+)** — generic catch-all for admin/auth POST flooding. Watchlist-only (registered admin paths + universal `/login`, `/signin`, `/phpmyadmin/`, etc.) plus a two-stage gate (rate threshold + behavioral confirmation: zero CSS / off-host Referer / uniform Content-Length) so it doesn't false-positive on offices behind shared NAT. Off by default, opt-in per server.
 - **SSH root brute-force rule (v1.5+)** — `ssh_root` rule fires on the first `Failed password for root` attempt by default. Port-agnostic (works on sshd port 22, 69, or anything else).
-- **Smart detection pipeline** — structural tripwires, known webshells, login isolation (CSS-based bot detection), brute force thresholds, PHP scanning detection, author enumeration, 404 storms
+- **Smart detection pipeline** — structural tripwires, known webshells, login isolation (static-asset browser fingerprint), brute force thresholds, PHP scanning detection, author enumeration, 404 storms
 - **Posture audit + host-health module (v1.5+, expanded v1.6 + v1.7)** — daily read-only scan for security and operational drift. **22 checks shipped through v1.7.1**: kernel CVEs (`kernel_copy_fail` / `pwnkit`) — livepatch-aware (KernelCare / kpatch / Ksplice) so they don't false-alarm CRITICAL on hosts where binary patches are applied at runtime; generic distro security errata (`security_updates`, the long-tail successor to hand-coded per-CVE checks); kernel livepatch posture (`livepatch_state`); generic Linux (`/proc hidepid`, sshd config, listening ports, SUID drift, /tmp hygiene); defense-in-depth visibility (SELinux state, mod_security mode); multi-tenant + CloudLinux (tenant home perms 0711, public_html 0750, CageFS/LVE state, mod_hostinglimits, Apache vhost UID mapping); host-health (SMART with growth detection, disk usage, MTA queue, Apache worker saturation, DB connection/slow/buffer-pool, mod_security audit-log volume). Each check declares its applicability against an auto-detected host profile so a free single-site VPS only runs the generic Linux checks while a multi-tenant CL+Apache box gets the full set. Telegram alerts fire on transitions whose severity meets `[posture] alert_severity_min` (default `high`); recoveries silent by default.
 - **Active /tmp cleanup module (v1.6+)** — opt-in daily janitor for stale, root-owned, world-readable, allowlisted files in /tmp. Three modes: `off` (default), `dry_run` (scan + log + Telegram digest), `live` (delete + log to `posture_events`). Strict criteria (realpath under /tmp, owner uid 0, mode o+r, age ≥ 7d, allowlist match, lsof-clean). Recommended rollout: enable as `dry_run` for ~14 days, review the digests, promote to `live`.
 - **Credential compromise detection (v1.4+)** — `DistributedAuthDetector` catches the classic distributed credential-abuse botnet pattern (same mailbox authenticating from many countries/ASNs/IPs in a short window), automatically blocks source IPs, and disables the mailbox in the mail backend. Mailbox management works with any stack storing accounts in MySQL/MariaDB (CyberPanel, Postfixadmin, Mailcow, iRedMail, or a custom schema you name yourself) via a least-privilege, column-scoped DB user — see [INSTALL.md](INSTALL.md) Step 9. It's optional: without it Guardian still blocks and alerts
@@ -192,14 +192,14 @@ Each web access log line goes through these checks in order (first match wins):
 
 1. Auto-detect log format (OLS / Apache combined / nginx) and parse IP, method, path, status, referer, user-agent
 2. **POST-flood watchlist** (v1.5+) — two-stage gate on registered admin paths; runs in parallel before WP-specific rules
-3. Track CSS loads (browser fingerprint for login isolation)
+3. Track static-asset loads (browser fingerprint for login isolation)
 4. Record successful WordPress logins (trusted for 24h)
 5. Skip safe paths (`/wp-admin/`, `/wp-includes/`)
 6. PHP in `/wp-content/uploads/` — instant block
 7. Known webshells (alfa.php, c99.php, etc.) — instant block
 8. Suspicious PHP patterns (random filenames) — block after 3 hits (authenticated IPs exempt since v1.7.10; tunable via `suspicious_threshold` / `suspicious_statuses` / `legit_php_paths`)
 9. Tripwire paths from log analysis — instant block on 404/401/403
-10. Login isolation — wp-login.php without CSS = bot — block after 3 hits
+10. Login isolation — wp-login.php without any static asset = bot — block after 3 hits
 11. wp-login.php brute force — block after 10 failed POSTs
 12. xmlrpc.php abuse — block after 5 hits
 13. Author enumeration — block after 8 hits

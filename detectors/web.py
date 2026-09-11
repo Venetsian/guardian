@@ -17,6 +17,39 @@ from modules.config import parse_csv_set
 from modules.spa_assets import is_framework_payload
 
 
+# Extensions that only a rendering browser fetches. Login isolation originally
+# keyed on `.css` alone, which produced confirmed false positives on real
+# customers: the login stylesheet carries a `?ver=` cache buster and a far-future
+# max-age, so a returning admin re-opens wp-login.php with every stylesheet
+# already in cache and issues zero `.css` requests. A CDN in front of the site
+# (or a 503 that stops WordPress rendering at all) removes the signal the same
+# way. Measured on wp.maiahost.com: of 60 datacenter IPs blocked by this rule,
+# 59 fetched not one of these — widening the signal costs ~1.7% of the rule's
+# reach and rescues every browser that merely had a warm cache.
+_BROWSER_ASSET_EXT = (
+    '.css', '.js', '.mjs',
+    '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.avif', '.ico', '.bmp',
+    '.woff', '.woff2', '.ttf', '.otf', '.eot',
+)
+
+
+def is_browser_asset(clean_path):
+    """True when the path is a static asset only a rendering client requests.
+
+    `clean_path` is already lowercased with the query string stripped by
+    parse_line(), so a plain suffix test is enough.
+    """
+    return clean_path.endswith(_BROWSER_ASSET_EXT)
+
+
+# Rejected, with the measurement, so nobody re-proposes it: treating
+# `GET wp-login.php -> 302` as proof of an already-logged-in visitor. It reads
+# well — WordPress does bounce a valid auth cookie to the dashboard — but on
+# 55k replayed lines it removed 1% of false positives while losing 13% of bot
+# detection. Plenty of sites redirect wp-login.php for *everyone* (hidden-login
+# plugins, http->https, canonical host), so bots collect that 302 too.
+
+
 class WebDetector:
     """Parses web access logs and detects attacks."""
 
@@ -167,8 +200,9 @@ class WebDetector:
                 self.db.record_auth(ip, 'wordpress', wp_user, site=site, country='', city='')
             return
 
-        # ----- LOGIN ISOLATION: track CSS loads (real browser signal) -----
-        if clean_path.endswith('.css'):
+        # ----- LOGIN ISOLATION: track browser assets (real browser signal) -----
+        # Any static asset, not just `.css` — see is_browser_asset().
+        if is_browser_asset(clean_path):
             self.db.login_isolation_record_css(ip)
 
         # ----- REAL-CONTENT TRACKING (denominator for the 404-storm ratio) -----
@@ -245,6 +279,11 @@ class WebDetector:
             return
 
         # ----- LOGIN ISOLATION DETECTION -----
+        # Two other candidate fixes were measured and rejected here: skipping
+        # 5xx responses (kept 55% of bot detection, removed 1% more FPs) and a
+        # sliding hit window (bots pace wp-login hits slowly, so any window
+        # short enough to help a human gutted the rule — 120s kept 34%). The
+        # durable browser memory below does the job without either.
         if 'wp-login.php' in clean_path:
             if not self.db.is_ip_authenticated(ip, self.trust_duration):
                 login_hits, has_css = self.db.login_isolation_record_hit(ip)
