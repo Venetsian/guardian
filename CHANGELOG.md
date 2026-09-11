@@ -19,8 +19,16 @@ with being a bot:
   proved someone was a browser was gone before the visit that judged them
 
 Of the blocked IPs still present in one host's access logs, 355 (6.4%) had
-fetched static assets *and* carried a browser user-agent. They had rendered
-pages. They were people.
+fetched static assets *and* carried a browser user-agent — they had rendered
+pages, which is precisely what this rule claims to test for and exactly what
+the confirmed customer reports looked like.
+
+Not all 355 are customers: a headless browser on a cloud host renders too, and
+a later pass over the currently-blocked set found it dominated by scanners
+running Chrome from Google Cloud and OVH. That does not change the fix. The
+rule's question is "did this client render the page?", and anything that did
+is out of its scope by construction — asset-fetching scanners are the job of
+`suspicious`, `php_scan` and `post_flood`, which still see them.
 
 ### The fix
 

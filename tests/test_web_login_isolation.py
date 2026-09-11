@@ -2,7 +2,11 @@
 
 The rule blocked real customers on wp.maiahost.com: of the IPs it blocked that
 appear in the current logs, 355 (6.4%) had fetched static assets AND carried a
-browser user-agent — they had rendered pages, so they were people, not bots.
+browser user-agent, i.e. they had rendered the page — the thing this rule
+claims to test for. (Not all 355 are customers; a headless browser on a cloud
+host renders too. Anything that renders is out of this rule's scope either way
+— scanners that fetch assets are caught by `suspicious` / `php_scan` /
+`post_flood`.)
 
 Cause: the only "real browser" signal was a `.css` request, and the evidence
 died with the 48h tracking row. A returning admin re-opens wp-login.php with
