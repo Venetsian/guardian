@@ -24,8 +24,10 @@ class TelegramCommander:
     Polls Telegram for incoming commands and responds.
     Runs as a daemon thread alongside the log tailers.
 
-    Security: ONLY messages from the configured chat_id are processed.
-    All other messages are silently ignored.
+    Security: ONLY messages from the configured chat_id are processed, and
+    within that chat only an authorised sender: [telegram] allowed_user_ids
+    when set, otherwise a private chat (see _sender_authorized). All other
+    messages are ignored.
     """
 
     def __init__(self, config, db, blocker, whitelist, tripwires=None, base_dir=None,
@@ -36,6 +38,13 @@ class TelegramCommander:
         self.bot_token = config.get('telegram', 'bot_token', fallback='')
         self.chat_id = config.get('telegram', 'chat_id', fallback='')
         self.poll_timeout = config.getint('telegram', 'commands_poll_timeout', fallback=30)
+        # Numeric Telegram user ids allowed to run commands. A chat id says
+        # which CHAT a message came from, not who sent it: in a group every
+        # member shares it, so chat_id alone would make each one an admin.
+        self.allowed_user_ids = self._parse_user_ids(
+            config.get('telegram', 'allowed_user_ids', fallback='')
+        )
+        self._group_refusal_sent = False  # explain the group rule once per process
 
         self.config = config
         self.db = db
@@ -75,6 +84,35 @@ class TelegramCommander:
                 self.enabled = False
             else:
                 logger.info("Telegram command handler enabled")
+                if not self.allowed_user_ids and str(self.chat_id).startswith('-'):
+                    logger.warning(
+                        "Telegram chat_id %s looks like a group chat but "
+                        "[telegram] allowed_user_ids is empty: commands will be "
+                        "refused until it lists the numeric user ids that may "
+                        "run them", self.chat_id
+                    )
+
+    @staticmethod
+    def _parse_user_ids(raw):
+        """Parse a comma/space separated list of numeric Telegram user ids.
+
+        Returns a set of normalised id strings. '#' comments are dropped;
+        non-numeric tokens are warned about and ignored (never matched
+        loosely: an unparsable entry must not widen access).
+        """
+        ids = set()
+        for line in str(raw or '').splitlines():
+            for token in re.split(r'[\s,]+', line.split('#')[0]):
+                if not token:
+                    continue
+                if re.match(r'^[0-9]+$', token):
+                    ids.add(str(int(token)))
+                else:
+                    logger.warning(
+                        "Ignoring invalid [telegram] allowed_user_ids entry "
+                        "'%s' (must be a numeric user id)", token
+                    )
+        return ids
 
     def start(self):
         """Start the polling thread."""
@@ -190,6 +228,10 @@ class TelegramCommander:
         if not text:
             return
 
+        # SECURITY: the chat matched, but who sent it?
+        if not self._sender_authorized(message):
+            return
+
         logger.info(f"Telegram command received: {text}")
 
         # Parse and dispatch command
@@ -204,6 +246,60 @@ class TelegramCommander:
         else:
             # Treat plain text as a command too (without the /)
             self._dispatch_command('/' + text, msg_chat_id)
+
+    def _sender_authorized(self, message):
+        """Is the sender of this (already chat-checked) message allowed to command us?
+
+        1. A message carrying sender_chat is refused outright: it is an
+           anonymous group admin or a channel identity, so there is no user
+           id to authorise.
+        2. With [telegram] allowed_user_ids set, from.id must be listed.
+        3. Without it, only a private chat is accepted (there from.id equals
+           chat.id by construction, so chat_id already identifies the user).
+           A group/supergroup is refused, with one explanatory reply per
+           process, never one per message.
+        """
+        if message.get('sender_chat'):
+            logger.warning(
+                "Telegram command from sender_chat %s refused "
+                "(anonymous admin or channel identity)",
+                (message.get('sender_chat') or {}).get('id', '?')
+            )
+            return False
+
+        from_id = str((message.get('from') or {}).get('id', ''))
+
+        if self.allowed_user_ids:
+            if from_id in self.allowed_user_ids:
+                return True
+            logger.warning(
+                "Telegram command from user_id %s refused "
+                "(not in [telegram] allowed_user_ids)", from_id or '?'
+            )
+            return False
+
+        if (message.get('chat') or {}).get('type') == 'private':
+            return True
+
+        logger.warning(
+            "Telegram command in a group chat refused: [telegram] "
+            "allowed_user_ids is not set (user_id %s)", from_id or '?'
+        )
+        if not self._group_refusal_sent:
+            self._group_refusal_sent = True
+            self._reply(
+                "Commands are disabled in this group chat: every member would "
+                "be able to run admin commands.\n"
+                "Set <code>allowed_user_ids</code> under <code>[telegram]</code> "
+                "in wp-guardian.conf to the numeric Telegram user id(s) that may "
+                "give commands, then restart WP-Guardian. Or talk to the bot in "
+                "a private chat."
+            )
+        return False
+
+    def _dry_run(self):
+        """Global dry-run flag (the blocker is its single source of truth)."""
+        return bool(getattr(self.blocker, 'dry_run', False))
 
     def _dispatch_command(self, text, chat_id):
         """Parse command and call the appropriate handler."""
@@ -303,12 +399,25 @@ class TelegramCommander:
         tier = ip_data['current_tier']
 
         try:
-            self.blocker.unblock(ip)
-            self._reply(
-                "Unblocked <code>{ip}</code> (was tier {tier}).".format(
-                    ip=ip, tier=tier
+            if not self.blocker.unblock(ip):
+                # The blocker leaves the tier and history untouched on a
+                # failed firewall call, so the IP really is still blocked.
+                self._reply(
+                    "❌ Failed to unblock <code>{ip}</code> (still tier {tier}): "
+                    "the firewall backend is unavailable or refused. "
+                    "Block state unchanged — see the log.".format(ip=ip, tier=tier)
                 )
-            )
+            elif self._dry_run():
+                self._reply(
+                    "[DRY-RUN] Would unblock <code>{ip}</code> (tier {tier}). "
+                    "Nothing changed.".format(ip=ip, tier=tier)
+                )
+            else:
+                self._reply(
+                    "Unblocked <code>{ip}</code> (was tier {tier}).".format(
+                        ip=ip, tier=tier
+                    )
+                )
         except Exception as e:
             self._reply(
                 "Failed to unblock <code>{ip}</code>: {err}".format(
@@ -424,12 +533,19 @@ class TelegramCommander:
         # Also unblock if currently blocked
         ip_data = self.db.get_ip(ip)
         was_blocked = False
+        would_unblock = False
+        unblock_failed = False
         if ip_data and ip_data['current_tier'] > 0:
             try:
-                self.blocker.unblock(ip)
-                was_blocked = True
+                if not self.blocker.unblock(ip):
+                    unblock_failed = True
+                elif self._dry_run():
+                    would_unblock = True
+                else:
+                    was_blocked = True
             except Exception as e:
                 logger.warning(f"Failed to unblock {ip} during whitelist: {e}")
+                unblock_failed = True
 
         self.whitelist.add(
             ip, wl_type=wl_type, duration_seconds=duration_seconds,
@@ -442,6 +558,16 @@ class TelegramCommander:
         if was_blocked:
             msg += "\nAlso unblocked (was tier {tier}).".format(
                 tier=ip_data['current_tier']
+            )
+        elif would_unblock:
+            msg += "\n[DRY-RUN] Would also unblock (tier {tier}); nothing changed.".format(
+                tier=ip_data['current_tier']
+            )
+        elif unblock_failed:
+            msg += (
+                "\n⚠️ Could NOT remove its firewall block (backend unavailable "
+                "or refused): it stays blocked. Retry /unblock {ip} once the "
+                "backend is back.".format(ip=ip)
             )
         self._reply(msg)
 
@@ -500,11 +626,13 @@ class TelegramCommander:
             msg += "\n\n<b>Recent blocks:</b>"
             for block in blocks[:5]:
                 ts = time.strftime('%m-%d %H:%M', time.localtime(block['timestamp']))
-                msg += "\n  {ts} T{tier} {svc}: {reason}".format(
+                msg += "\n  {ts} T{tier} {svc}: {reason}{sim}".format(
                     ts=ts,
                     tier=block['tier'],
                     svc=block['service'],
                     reason=block['reason'][:40],
+                    # A simulated block never reached a firewall.
+                    sim=' [dry-run]' if block['blocker'] == 'dry-run' else '',
                 )
 
         self._reply(msg)
@@ -726,6 +854,14 @@ class TelegramCommander:
 
         username = args[0]
         reason = ' '.join(args[1:]).strip() or 'manual Telegram disable'
+        if self._dry_run():
+            # No backend call and no mailbox_actions row: a simulated disable
+            # recorded as real would read as "disabled by Guardian" later.
+            self._reply(
+                "[DRY-RUN] Would disable mailbox <code>{u}</code>. "
+                "Mail backend not called, nothing changed.".format(u=username)
+            )
+            return
         try:
             changed = self.mail_backend.disable_mailbox(username)
             self.db.insert_mailbox_action(
@@ -757,6 +893,12 @@ class TelegramCommander:
             return
 
         username = args[0]
+        if self._dry_run():
+            self._reply(
+                "[DRY-RUN] Would enable mailbox <code>{u}</code>. "
+                "Mail backend not called, nothing changed.".format(u=username)
+            )
+            return
         try:
             changed = self.mail_backend.enable_mailbox(username)
             self.db.insert_mailbox_action(
@@ -870,6 +1012,11 @@ class TelegramCommander:
                 lines.append(
                     "⚠️ Mailbox was auto-restored but the mail backend is not "
                     "configured — disable <code>{u}</code> manually.".format(u=username)
+                )
+            elif self._dry_run():
+                lines.append(
+                    "[DRY-RUN] Would re-disable mailbox <code>{u}</code>. "
+                    "Mail backend not called, nothing changed.".format(u=username)
                 )
             else:
                 try:
@@ -1201,9 +1348,14 @@ class TelegramCommander:
         except Exception:
             schema = '?'
 
-        backend_name = type(self.firewall).__name__ if self.firewall else 'none (dry-run)'
+        dry_run = self._dry_run()
+        if self.firewall:
+            backend_name = type(self.firewall).__name__
+        elif dry_run:
+            backend_name = 'none (dry-run)'
+        else:
+            backend_name = 'UNAVAILABLE (IP blocking OFF, retrying)'
         profile = self.config.get('profile', 'mode', fallback='steady')
-        dry_run = self.config.getboolean('general', 'dry_run', fallback=False)
         alert_mode = self.config.get('telegram', 'alert_mode', fallback='verbose')
         commands_enabled = self.config.getboolean('telegram', 'commands_enabled', fallback=False)
         cms_enabled = self.config.getboolean('cms_detection', 'enabled', fallback=True)

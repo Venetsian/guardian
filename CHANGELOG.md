@@ -1,5 +1,130 @@
 # WP-Guardian Changelog
 
+## v1.7.18 — a redirect was a login, and a firewall outage was a silent dry run (2026-10-08)
+
+An external code audit, checked against the code and then measured on the
+four production hosts. Two of its findings turned out worse in production than
+on paper; both are fixed here, with four smaller ones.
+
+### A `wp-login.php` redirect is no longer proof of a login
+
+`POST wp-login.php → 302` used to mark the IP authenticated for 24h, exempting
+it from the uploads/tripwire/suspicious-PHP rules, login isolation and — across
+services — the mail failure thresholds. A redirect is not a login:
+
+- WordPress core answers `POST wp-login.php?action=postpass` (any password,
+  any same-site Referer) with a 302 — and because core reads `action` from
+  `$_REQUEST`, it can sit in the POST body, where the access log never shows
+  it. One request bought 24h of immunity on stock WordPress.
+- hidden-login plugins and http→https redirects answer *every* login POST with
+  a redirect. On one host 4,978 IPs got `POST wp-login.php → 302` in the
+  retained logs and 17 of them ever loaded an admin page; the old rule counted
+  ~12,000 bot IPs as authenticated there, and 343 tripwire hits went
+  unblocked as "authenticated".
+- the path only had to *contain* `wp-login.php`.
+
+Now the 302 is only a **candidate**, held in memory per (ip, site). It becomes
+trust when the same (ip, site) gets a 200 from an admin screen that anonymous
+clients cannot load (`/wp-admin/`, `edit.php`, `profile.php` …) within 120s.
+Core non-login actions in the query string (`postpass`, `lostpassword`, `rp`,
+`register` …) and look-alike paths are not candidates at all. A second
+unconfirmed candidate from the same client counts as a failed login for login
+isolation and brute force — the redirect host above was invisible to both.
+Known cost: a login whose `redirect_to` is a front-end page earns no trust.
+
+### Webshell probes and PHP scans inside `/wp-admin/` and `/wp-includes/`
+
+The safe-path skip ran before every other rule, so 100 requests for
+`/wp-includes/c99.php` answered 404 produced zero blocks. Known webshell names
+now run before the skip and block authenticated IPs too (no legitimate client
+requests `c99.php`; the docs always claimed this, the code never did). PHP
+404/401s under the safe paths count toward `php_scan` (20 / 5 min) — not 403,
+which `.htaccess` IP restrictions on wp-admin produce, and not
+`admin-ajax.php` / `admin-post.php`, which front-end plugins poll.
+
+### A firewall backend that fails at startup is an outage, not a dry run
+
+A backend that failed to initialise switched the daemon to dry-run for its
+whole uptime, with nothing but a log line. The unit started after
+`network.target` only, so a reboot raced the firewall: on the MikroTik host
+this happened on **5 of 5** logged reboots, about 50 days without enforcement
+between April and August. The firewalld hosts were only lucky with ordering.
+
+- the unit now has `Wants=network-online.target` and
+  `After=network-online.target firewalld.service`
+- a failed backend keeps detection running, sends **one CRITICAL Telegram
+  alert**, refuses blocks without recording them, and retries every 60s
+  (backing off to 10 min); on recovery it attaches the backend everywhere and
+  sends one message with how many blocks went unenforced
+- `--status`, `--test-backend` and `/serverinfo` show the backend as
+  UNAVAILABLE instead of looking like a dry run
+
+### Dry-run no longer creates enforcement state
+
+A simulated block called `record_block()`, which set `current_tier`. The next
+real detection of that IP was then skipped as "already blocked" (tier 3:
+forever), the simulation counted as escalation evidence, and it fed /24
+aggregation. Dry-run now writes a review row only (`block_log.blocker =
+'dry-run'`, ignored by tiering) and dedupes repeats in memory. Migration 012
+resets tiers whose latest evidence is a dry-run row (none on the fleet today).
+
+`--dry-run` is also applied before any component is built (it used to be set
+after the backend's startup rule setup had run live), skips
+`ensure_firewall_rules()`, and covers mailboxes: compromise auto-disable, the
+auto-restore reaper, `/disable`, `/enable`, `/confirm`, `--disable-mailbox`
+and `--enable-mailbox` simulate instead of acting. Compromise alerts say
+`[DRY-RUN]`.
+
+### Smaller fixes
+
+- **`unblock()` reports failure.** It ignored the backend's answer, cleared the
+  tier and history, and said "Unblocked" while the firewall still dropped the
+  client. Now a failed or missing backend leaves state alone and `/unblock`,
+  `/whitelist` and `--unblock` say so (`--unblock` exits 1). CSF's unblock
+  treats "nothing to remove" (confirmed with `csf -g`) as success, as the other
+  backends already did.
+- **Telegram commands authorise the sender, not only the chat.** New
+  `[telegram] allowed_user_ids`. Empty (default): private chat with the bot
+  only. Set: only those user IDs. Anonymous group admins and channel identities
+  are always refused.
+- **`install.sh` could not write empty keys.** Its `sed` patterns expected
+  `key = …` with a space after `=`, but the example config ships `bot_token =`,
+  `chat_id =`, `api_key =`, `api_secret =` and `platform =` with none, so a
+  token pasted during install was silently dropped. All patterns now match
+  `key *=`.
+
+### Upgrade notes
+
+- **Group `chat_id` installs:** commands are refused after the upgrade until
+  `allowed_user_ids` is set (alerts are unaffected). A private-chat install
+  needs nothing.
+- `update.sh` installs the new unit file and runs `daemon-reload`; migration
+  012 runs on the next start.
+
+### Known, not in this release
+
+Firewalld subnet (CIDR) blocks still never expire — the duration is logged but
+the set has no timeout and nothing reaps subnets (the hosts hold entries up to
+~174 days old). That is the next release. IPv6 clients are still not parsed.
+
+### Changed
+
+- `detectors/web.py` — login candidate + confirmation, repeat counting,
+  webshell check before the safe-path skip, PHP misses under safe paths
+- `modules/blocker.py` — simulated blocks, dry-run dedupe, outage branch,
+  honest `unblock()`, manual blocks while the backend is down
+- `modules/database.py` — `record_simulated_block()`, dry-run rows out of tiering
+- `modules/migrator.py`, `migrations/012_dry_run_tiers.sql` — schema 12
+- `modules/compromise.py`, `actions/telegram.py` — dry-run mailbox handling and alert text
+- `actions/telegram_commands.py` — sender authorisation, honest unblock replies, dry-run mailbox commands
+- `backends/csf.py` — idempotent unblock
+- `wp-guardian.py` — `--dry-run` before construction, backend outage + retry, CLI fixes
+- `wp-guardian.service` — network-online and firewalld ordering
+- `wp-guardian.conf.example`, `install.sh` — `allowed_user_ids`; install key patterns
+- tests: `test_web_auth_trust.py`, `test_dry_run_enforcement.py`,
+  `test_firewall_outage.py`, `test_telegram_sender_auth.py`,
+  `fakes_enforcement.py`; updated login-isolation and suspicious tests
+
 ## v1.7.17 — login isolation was blocking people with warm caches (2026-09-11)
 
 Reported by clients, not by a log review: real customers were being firewall-

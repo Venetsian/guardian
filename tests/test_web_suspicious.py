@@ -187,12 +187,25 @@ class SuspiciousRuleTests(unittest.TestCase):
         self.assertEqual(blocker.rules_blocked(), ['structural'])
 
     def test_instant_webshell_unchanged_by_the_auth_guard(self):
-        """Same check for the known-webshell branch that sits just above ours."""
+        """Same check for the known-webshell branch.
+
+        Unlike the structural branch, a known webshell name blocks everyone:
+        no legitimate client requests alfa.php, so a live session earns no
+        exemption (see tests/test_web_auth_trust.py for the /wp-admin/ cases).
+        """
         detector, blocker = build_detector()
 
         detector.process_line(log_line('198.51.100.7', 'GET', '/alfa.php', '404'))
 
         self.assertEqual(blocker.rules_blocked(), ['instant'])
+
+        authed_db = FakeDB(authenticated_ips=['198.51.100.8'])
+        detector, blocker = build_detector(authed_db)
+
+        detector.process_line(log_line('198.51.100.8', 'GET', '/alfa.php', '404'))
+
+        self.assertEqual(blocker.rules_blocked(), ['instant'],
+                         'authenticated IP must not be exempt from the webshell rule')
 
     def test_threshold_is_not_reached_below_limit(self):
         """Two hits must not block — the rule needs suspicious_threshold hits."""

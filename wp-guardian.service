@@ -1,7 +1,8 @@
 [Unit]
 Description=WP-Guardian Security Monitoring Daemon
 Documentation=https://github.com/wp-guardian
-After=network.target
+Wants=network-online.target
+After=network-online.target firewalld.service
 
 [Service]
 Type=simple

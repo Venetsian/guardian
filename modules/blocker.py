@@ -6,11 +6,15 @@ Determines tier, checks whitelist, executes block via the configured firewall ba
 
 import ipaddress
 import logging
+import threading
 import time
 from modules.config import parse_asn_list, parse_duration, parse_service_list
 
 logger = logging.getLogger('wp-guardian.blocker')
 block_logger = logging.getLogger('wp-guardian.blocks')
+
+# Operator-facing text for a manual block attempted while the backend is down.
+UNAVAILABLE_MSG = "Firewall backend unavailable — not blocked."
 
 
 class Blocker:
@@ -85,6 +89,22 @@ class Blocker:
 
         # Same dedupe for trusted-ASN enforcement skips: (ip, service).
         self._trusted_asn_alerts = {}
+
+        # Dry-run dedupe: ip -> time until which a repeat detection is not
+        # logged again. A dry run records no tier (see record_simulated_block),
+        # so without this every repeat hit from the same attacker would write
+        # another block_log row for the whole of the dry run.
+        self._dry_run_seen = {}
+        self._dry_run_seen_max = 10000
+
+        # Backend-outage bookkeeping. While the firewall backend is missing
+        # (failed to initialise, Guardian is retrying) block() cannot enforce
+        # anything and records nothing; these counters let Guardian tell the
+        # operator afterwards how much went unenforced.
+        self.unenforced_count = 0
+        self._unenforced_ips = set()
+        self._unenforced_lock = threading.Lock()
+        self._unenforced_last_log = 0
 
     def set_digest_buffer(self, digest_buffer):
         """Wire in the digest buffer for alert routing."""
@@ -161,17 +181,33 @@ class Blocker:
         else:
             duration = 'permanent'
 
-        # Dry run mode
+        # Dry run mode. record_simulated_block() keeps a review row in
+        # block_log but, unlike record_block(), sets no tier: a tier here would
+        # make the next REAL detection of this IP skip as "already blocked".
         if self.dry_run:
+            # A manual block (force_tier) is a deliberate act, always logged.
+            if force_tier is None and self._dry_run_seen_recently(ip):
+                logger.debug(f"[DRY-RUN] {ip} already simulated within "
+                             f"{self.tier1_duration}, skipping")
+                return True
             logger.info(f"[DRY-RUN] Would block {ip} tier={tier} duration={duration} "
                        f"reason={reason} service={service}")
             block_logger.info(f"DRY-RUN ip={ip} tier={tier} duration={duration} "
                             f"service={service} reason={reason}")
-            self.db.record_block(ip, tier, reason, service, 'dry-run', duration)
+            self.db.record_simulated_block(ip, tier, reason, service, duration)
+            self._dry_run_remember(ip)
             return True
 
+        # No backend at all (it failed to initialise and Guardian is retrying).
+        # This is an outage, not a dry run: nothing is recorded, because a
+        # block_log row or a tier would claim a block that never happened.
+        firewall = self.firewall
+        if firewall is None:
+            self._note_unenforced(ip, reason, service)
+            return False
+
         # Execute block via configured firewall backend
-        blocked = self.firewall.block(ip, tier, reason, service)
+        blocked = firewall.block(ip, tier, reason, service)
 
         if blocked:
             # Record in database
@@ -211,7 +247,7 @@ class Blocker:
                 # else: silent — block still executes, just no Telegram notification
 
             # Check if this block pushes a /24 subnet over the CIDR threshold
-            if self.cidr_enabled and self.firewall.supports_cidr:
+            if self.cidr_enabled and firewall.supports_cidr:
                 self._check_cidr_aggregation(ip, service)
         else:
             logger.error(f"BLOCK FAILED for {ip} via {self._backend_name}")
@@ -227,6 +263,50 @@ class Blocker:
             )
 
         return blocked
+
+    def _dry_run_seen_recently(self, ip):
+        expiry = self._dry_run_seen.get(ip)
+        return expiry is not None and time.time() < expiry
+
+    def _dry_run_remember(self, ip):
+        now = time.time()
+        self._dry_run_seen[ip] = now + self.tier1_seconds
+        if len(self._dry_run_seen) > self._dry_run_seen_max:
+            # Swap rather than delete in place: tailer threads share this dict.
+            self._dry_run_seen = {
+                k: v for k, v in list(self._dry_run_seen.items()) if v > now
+            }
+
+    def _note_unenforced(self, ip, reason, service):
+        """Account for a block that could not be enforced: no backend.
+
+        No DB write and no per-event Telegram -- Guardian sends one alert when
+        the outage starts and one when it ends. The error log is limited to
+        once a minute so a scan burst cannot flood guardian.log.
+        """
+        now = time.time()
+        with self._unenforced_lock:
+            self.unenforced_count += 1
+            if len(self._unenforced_ips) < 5000:
+                self._unenforced_ips.add(ip)
+            count = self.unenforced_count
+            log_now = now - self._unenforced_last_log >= 60
+            if log_now:
+                self._unenforced_last_log = now
+        if log_now:
+            logger.error(
+                f"BLOCK NOT ENFORCED: no firewall backend ({self._backend_name} "
+                f"unavailable) -- last ip={ip} service={service} reason={reason}; "
+                f"{count} unenforced since the outage began"
+            )
+
+    def take_unenforced(self):
+        """Return (events, distinct_ips) left unenforced by an outage, and reset."""
+        with self._unenforced_lock:
+            result = (self.unenforced_count, len(self._unenforced_ips))
+            self.unenforced_count = 0
+            self._unenforced_ips = set()
+        return result
 
     def _is_trusted_mail_asn(self, ip, service, rule, geo):
         """Refuse to block an IP that belongs to a trusted cloud mail relay.
@@ -324,6 +404,8 @@ class Blocker:
 
     def _check_cidr_aggregation(self, ip, service):
         """After blocking an IP, check if its /24 subnet should be blocked too."""
+        if self.firewall is None:
+            return
         # Extract /24 prefix: "192.0.2.123" -> "192.0.2."
         parts = ip.split('.')
         if len(parts) != 4:
@@ -487,8 +569,30 @@ class Blocker:
         the client retried, got re-blocked, and determine_tier() read the
         block_log row we had just overridden — so every rescue attempt
         promoted the victim one tier, 1 -> 2 -> 3 (permanent).
+
+        Returns True only when the IP is really unblocked (or, in dry-run,
+        when it would be). If the backend is missing, raises, or reports
+        failure the database is left untouched and this returns False: the
+        old behaviour cleared the tier and history anyway and told the
+        operator "Unblocked" while the firewall still dropped the client.
         """
-        self.firewall.unblock(ip)
+        if self.dry_run:
+            logger.info(f"[DRY-RUN] would unblock {ip}")
+            return True
+
+        if self.firewall is None:
+            logger.error(f"UNBLOCK FAILED for {ip}: no firewall backend available")
+            return False
+
+        try:
+            removed = self.firewall.unblock(ip)
+        except Exception as e:
+            logger.error(f"UNBLOCK FAILED for {ip} via {self._backend_name}: {e}")
+            return False
+        if not removed:
+            logger.error(f"UNBLOCK FAILED for {ip}: {self._backend_name} reported "
+                         f"failure, database state left unchanged")
+            return False
 
         # Reset tier in database
         self.db.conn.execute(
@@ -699,6 +803,8 @@ class Blocker:
         # already expired) gets re-pushed rather than silently skipped.
         ip_data = self.db.get_ip(ip)
         was_blocked = bool(ip_data and ip_data['current_tier'] > 0)
+        if self.firewall is None and not self.dry_run:
+            return (False, UNAVAILABLE_MSG)
         if was_blocked and not self.dry_run and self.firewall is not None:
             try:
                 self.firewall.unblock(ip)
@@ -737,10 +843,14 @@ class Blocker:
         if self.whitelist.overlaps_cidr(subnet):
             return (False, f"Refusing to block {subnet}: it contains whitelisted IP(s).")
 
-        # Dry-run, or no working backend (firewall failed to init at startup).
-        if self.dry_run or self.firewall is None:
+        if self.dry_run:
             block_logger.info(f"DRY-RUN MANUAL-CIDR subnet={subnet} duration={duration_str}")
             return (True, f"[DRY-RUN] Would block {subnet} ({duration_str}).")
+
+        # No working backend (failed to initialise). Not a dry run: say plainly
+        # that nothing was blocked instead of pretending it was simulated.
+        if self.firewall is None:
+            return (False, UNAVAILABLE_MSG)
 
         if not self.firewall.supports_cidr:
             return (False, f"Backend '{self._backend_name}' does not support CIDR blocks.")

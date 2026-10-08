@@ -24,7 +24,7 @@ WP-Guardian monitors web, SMTP, IMAP/POP3, and SSH logs, automatically blocks at
 - **Cloud mail relay protection (v1.7.9+)** — IPs in a trusted ASN (Microsoft 365, Google Workspace, iCloud) are never firewall-dropped for mail rules or compromise handling. New Outlook syncs IMAP through Microsoft's cloud, so blocking a relay cuts off the legitimate client and stops no attacker — and per-IP whitelisting doesn't hold because those relays rotate. Scoped to mail services, so an Azure VM in the same ASN scanning `wp-login.php` is still blocked
 - **No self-inflicted lockouts (v1.7.9+)** — when Guardian disables a mailbox after a compromise event, the owner's mail client turns into a failed-auth generator on every retry. Those failures no longer feed the brute-force ladder, provided the IP is a known client of that account
 - **CIDR /24 aggregation** — auto-blocks entire subnets when coordinated scanning is detected
-- **Authenticated user protection** — any successful login (WordPress, IMAP, POP3, SMTP, SSH) grants the IP a 24h grace period across all detectors, so a mail client with a wrong outgoing password can't get its working IMAP connection cut off
+- **Authenticated user protection** — any successful login (WordPress, IMAP, POP3, SMTP, SSH) grants the IP a 24h grace period across all detectors, so a mail client with a wrong outgoing password can't get its working IMAP connection cut off. A WordPress login counts only once the client loads a logged-in admin page (v1.7.18) — a `wp-login.php` redirect alone can be produced without a password
 - **Telegram alerts** — real-time notifications for every block, with per-rule routing (v1.4.1+): mute noisy rules like `php_scan` / `general_404` / `author_enum`, digest others hourly, keep auth and compromise rules loud. Tune live via `/verbosity <rule> <level>` from chat — `compromise`, `cidr`, and `block_failed` are always-immediate and cannot be muted by accident
 - **Telegram commands** — manage blocks, whitelists, and compromise events remotely via Telegram chat (`/status`, `/block`, `/unblock`, `/whitelist`, `/history`, `/authmap`, `/suspects`, `/disable`, `/enable`, `/compromises`, `/resolve`, `/confirm`)
 - **Per-account auth map (v1.4+)** — `--auth-map`, `--auth-suspects`, `--hunt-compromises` for investigating account activity and surfacing pre-existing compromises
@@ -76,7 +76,7 @@ The daemon runs three log tailers (web, mail, SSH) in background threads, each s
 ```bash
 # Run / manage
 python3 wp-guardian.py                           # Run daemon
-python3 wp-guardian.py --dry-run                 # Watch only, don't block
+python3 wp-guardian.py --dry-run                 # Watch only: no firewall, mailbox or block-state changes
 systemctl start|stop|restart|status wp-guardian  # Service control
 
 # Version & status
@@ -151,7 +151,7 @@ cd /opt/wp-guardian && git checkout -- . && git pull && sudo bash update.sh
 
 When `commands_enabled = true` in your `[telegram]` config, WP-Guardian polls for incoming Telegram messages and responds to commands. No webhooks or open ports needed — it uses Telegram's `getUpdates` long-polling.
 
-**Security:** Only messages from the configured `chat_id` are processed. All other messages are silently ignored.
+**Security:** Only messages from the configured `chat_id` are processed, and only from an authorised sender (v1.7.18): in a private chat with the bot that is you; for a **group** `chat_id`, set `allowed_user_ids` to the numeric Telegram user IDs allowed to give commands — without it, group commands are refused, because every member shares the chat ID. Anonymous group admins and channel posts are always refused.
 
 ```
 /status                      — block counts, IPs tracked, auth sessions, tripwires
@@ -184,6 +184,7 @@ Enable in `wp-guardian.conf`:
 [telegram]
 commands_enabled = true
 commands_poll_timeout = 30    # long-poll timeout in seconds
+allowed_user_ids =            # required for a group chat_id (v1.7.18)
 ```
 
 ## Detection Pipeline
@@ -193,10 +194,10 @@ Each web access log line goes through these checks in order (first match wins):
 1. Auto-detect log format (OLS / Apache combined / nginx) and parse IP, method, path, status, referer, user-agent
 2. **POST-flood watchlist** (v1.5+) — two-stage gate on registered admin paths; runs in parallel before WP-specific rules
 3. Track static-asset loads (browser fingerprint for login isolation)
-4. Record successful WordPress logins (trusted for 24h)
-5. Skip safe paths (`/wp-admin/`, `/wp-includes/`)
-6. PHP in `/wp-content/uploads/` — instant block
-7. Known webshells (alfa.php, c99.php, etc.) — instant block
+4. Record successful WordPress logins (trusted for 24h) — a `POST wp-login.php → 302` counts only when the same client then loads a logged-in admin page (`/wp-admin/` → 200) within 2 minutes; unconfirmed repeats count as failed logins (v1.7.18)
+5. Known webshells (alfa.php, c99.php, etc.) — instant block, also inside `/wp-admin/` and `/wp-includes/` and also for authenticated IPs (v1.7.18)
+6. Skip safe paths (`/wp-admin/`, `/wp-includes/`) — except that PHP 404/401s there count toward PHP 404 scanning (v1.7.18)
+7. PHP in `/wp-content/uploads/` — instant block
 8. Suspicious PHP patterns (random filenames) — block after 3 hits (authenticated IPs exempt since v1.7.10; tunable via `suspicious_threshold` / `suspicious_statuses` / `legit_php_paths`)
 9. Tripwire paths from log analysis — instant block on 404/401/403
 10. Login isolation — wp-login.php without any static asset = bot — block after 3 hits
@@ -290,6 +291,13 @@ flush_conntrack = true   # firewalld/nftables: tear down live connections on blo
 | pfSense / OPNsense | Network edge (appliance) | Networks with pfSense/OPNsense firewalls |
 
 See [backends/README.md](backends/README.md) for creating custom backends.
+
+> **If the backend is down at startup (v1.7.18).** Guardian keeps detecting,
+> sends one CRITICAL Telegram alert, refuses blocks without recording them, and
+> retries the backend every 60s (backing off to 10 min) until it comes up — then
+> sends one recovery message with the number of blocks that went unenforced.
+> Before v1.7.18 it silently switched to dry-run until the next restart. The
+> systemd unit now starts after `network-online.target` and `firewalld.service`.
 
 > **firewalld/nftables — install `conntrack` (recommended).** Stateful firewalls
 > accept already-established connections before the block rule runs, so without
@@ -532,7 +540,7 @@ All of the above is observable from Telegram once `commands_enabled = true`:
 │   ├── test_mail_schema.py       # Schema detection refusals (v1.7.12+)
 │   └── test_outbound.py          # Queue-ID join + outbound signals (v1.7.15+)
 ├── migrations/
-│   └── *.sql               # Database migrations (009_block_cleared_at, 010_compromise_confirmed_at, 011_outbound_activity)
+│   └── *.sql               # Database migrations (… 010_compromise_confirmed_at, 011_outbound_activity, 012_dry_run_tiers)
 ├── state/
 │   └── guardian.db          # SQLite database
 └── logs/

@@ -158,7 +158,8 @@ class TelegramAlerter:
 
     def alert_compromise(self, username, service, trigger_rule, counts,
                          ips_blocked, mailbox_disabled, event_id, action='',
-                         corroboration=None):
+                         corroboration=None, dry_run=False,
+                         mailbox_simulated=False):
         """Alert about a detected credential compromise (v1.4+).
 
         Always sent immediately — never digested.
@@ -167,6 +168,10 @@ class TelegramAlerter:
         (v1.7.11+). It distinguishes "mailbox left up because policy says this
         rule is too weak to act on" from "mailbox left up because the backend
         is broken" — those need opposite responses from the operator.
+
+        `dry_run` / `mailbox_simulated` (v1.7.18): under global dry-run nothing
+        was blocked or disabled, and "NOT disabled (disable manually)" would
+        read as a broken mail backend.
         """
         trigger_labels = {
             'countries': 'distinct countries',
@@ -176,7 +181,9 @@ class TelegramAlerter:
         label = trigger_labels.get(trigger_rule, trigger_rule)
         trigger_count = counts.get(trigger_rule, 0)
 
-        if mailbox_disabled:
+        if mailbox_simulated:
+            disable_line = "[DRY-RUN] would have been disabled — nothing was changed"
+        elif mailbox_disabled:
             disable_line = "✅ disabled"
         elif action == 'alert_only':
             disable_line = (
@@ -191,7 +198,7 @@ class TelegramAlerter:
             disable_line = "⚠️ NOT disabled (disable manually)"
 
         msg = (
-            "🔴 <b>COMPROMISE DETECTED</b>\n"
+            "🔴 <b>COMPROMISE DETECTED</b>{dr}\n"
             "Account: <code>{user}</code>\n"
             "Service: {svc}\n"
             "Trigger: {tc} {label} in the last window\n"
@@ -205,12 +212,13 @@ class TelegramAlerter:
             "\n"
             "Review: <code>wp-guardian.py --auth-map {user}</code>"
         ).format(
+            dr=" — <b>[DRY-RUN]</b>" if dry_run else "",
             user=username, svc=service,
             tc=trigger_count, label=label,
             ips=counts.get('ips', 0),
             countries=counts.get('countries', 0),
             asns=counts.get('asns', 0),
-            b=ips_blocked,
+            b="{n} (simulated)".format(n=ips_blocked) if dry_run else ips_blocked,
             dl=disable_line,
             eid=event_id,
         )

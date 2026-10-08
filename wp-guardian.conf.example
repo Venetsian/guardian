@@ -289,6 +289,16 @@ enabled = false
 bot_token =
 chat_id =
 
+# Who may run commands (comma or space separated numeric Telegram user ids).
+# chat_id identifies the CHAT, not the sender: in a group chat every member
+# shares it, so on its own it would make every member an admin.
+#   empty (default) = accept commands in a private chat with the bot only;
+#                     group/supergroup commands are refused
+#   user ids        = accept commands only from these users, in any chat
+#                     matching chat_id. REQUIRED when chat_id is a group.
+# Messages from anonymous group admins or channels are always refused.
+allowed_user_ids =
+
 # Rate limiting
 max_alerts_per_minute = 10
 

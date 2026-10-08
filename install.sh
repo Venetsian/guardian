@@ -645,8 +645,19 @@ if [[ "$SKIP_CONFIG" == "false" ]]; then
         echo "  Only messages from your chat_id are processed."
         echo ""
         TELEGRAM_COMMANDS="false"
+        TELEGRAM_ALLOWED_USERS=""
         if ask_yn "  Enable Telegram commands?" "y"; then
             TELEGRAM_COMMANDS="true"
+            # v1.7.18: a group chat_id (starts with '-') is shared by every
+            # member, so commands there need an explicit sender allowlist.
+            if [[ "${TELEGRAM_CHAT_ID}" == -* ]]; then
+                echo ""
+                echo "  That chat ID is a group: every member could run admin commands."
+                echo "  List the numeric Telegram user IDs allowed to give commands"
+                echo "  (comma separated). Leave blank to refuse group commands."
+                read -rp "    Allowed user IDs: " TELEGRAM_ALLOWED_USERS
+                TELEGRAM_ALLOWED_USERS=$(echo "${TELEGRAM_ALLOWED_USERS}" | tr -cd '0-9, ')
+            fi
         fi
 
         # --- Alert mode (v1.4+) ---
@@ -1039,84 +1050,87 @@ emit("DET_MAILDIR", "maildir_template")
     fi
 
     # Update config with user's choices
-    sed -i "s|^backend = .*|backend = ${FIREWALL_BACKEND}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+    sed -i "s|^backend *=.*|backend = ${FIREWALL_BACKEND}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
 
     if [[ "$FIREWALL_BACKEND" == "mikrotik" ]]; then
-        sed -i "/^\[mikrotik\]/,/^\[/ s|^host = .*|host = ${MK_HOST}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
-        sed -i "/^\[mikrotik\]/,/^\[/ s|^port = .*|port = ${MK_PORT}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
-        sed -i "/^\[mikrotik\]/,/^\[/ s|^user = .*|user = ${MK_USER}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
-        sed -i "/^\[mikrotik\]/,/^\[/ s|^key_file = .*|key_file = ${MK_KEY}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
-        sed -i "/^\[mikrotik\]/,/^\[/ s|^friendly_list = .*|friendly_list = ${MK_FRIENDLY}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[mikrotik\]/,/^\[/ s|^host *=.*|host = ${MK_HOST}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[mikrotik\]/,/^\[/ s|^port *=.*|port = ${MK_PORT}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[mikrotik\]/,/^\[/ s|^user *=.*|user = ${MK_USER}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[mikrotik\]/,/^\[/ s|^key_file *=.*|key_file = ${MK_KEY}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[mikrotik\]/,/^\[/ s|^friendly_list *=.*|friendly_list = ${MK_FRIENDLY}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
     fi
 
     if [[ "$FIREWALL_BACKEND" == "pfsense" || "$FIREWALL_BACKEND" == "opnsense" ]]; then
-        sed -i "/^\[pfsense\]/,/^\[/ s|^host = .*|host = ${PF_HOST}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
-        sed -i "/^\[pfsense\]/,/^\[/ s|^port = .*|port = ${PF_PORT}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
-        sed -i "/^\[pfsense\]/,/^\[/ s|^api_key = .*|api_key = ${PF_KEY}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
-        sed -i "/^\[pfsense\]/,/^\[/ s|^api_secret = .*|api_secret = ${PF_SECRET}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
-        sed -i "/^\[pfsense\]/,/^\[/ s|^alias_name = .*|alias_name = ${PF_ALIAS}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
-        sed -i "/^\[pfsense\]/,/^\[/ s|^alias_cidr = .*|alias_cidr = ${PF_CIDR_ALIAS}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[pfsense\]/,/^\[/ s|^host *=.*|host = ${PF_HOST}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[pfsense\]/,/^\[/ s|^port *=.*|port = ${PF_PORT}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[pfsense\]/,/^\[/ s|^api_key *=.*|api_key = ${PF_KEY}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[pfsense\]/,/^\[/ s|^api_secret *=.*|api_secret = ${PF_SECRET}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[pfsense\]/,/^\[/ s|^alias_name *=.*|alias_name = ${PF_ALIAS}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[pfsense\]/,/^\[/ s|^alias_cidr *=.*|alias_cidr = ${PF_CIDR_ALIAS}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
         if [[ "$FIREWALL_BACKEND" == "opnsense" ]]; then
-            sed -i "/^\[pfsense\]/,/^\[/ s|^platform = .*|platform = opnsense|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+            sed -i "/^\[pfsense\]/,/^\[/ s|^platform *=.*|platform = opnsense|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
         else
-            sed -i "/^\[pfsense\]/,/^\[/ s|^platform = .*|platform = pfsense|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+            sed -i "/^\[pfsense\]/,/^\[/ s|^platform *=.*|platform = pfsense|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
         fi
     fi
 
     # Update Telegram section - find the [telegram] section and update within it
     if [[ -n "${TELEGRAM_TOKEN}" ]]; then
-        sed -i "/^\[telegram\]/,/^\[/ s|^bot_token = .*|bot_token = ${TELEGRAM_TOKEN}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[telegram\]/,/^\[/ s|^bot_token *=.*|bot_token = ${TELEGRAM_TOKEN}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
     fi
     if [[ -n "${TELEGRAM_CHAT_ID}" ]]; then
-        sed -i "/^\[telegram\]/,/^\[/ s|^chat_id = .*|chat_id = ${TELEGRAM_CHAT_ID}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[telegram\]/,/^\[/ s|^chat_id *=.*|chat_id = ${TELEGRAM_CHAT_ID}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
     fi
     if [[ "$TELEGRAM_ENABLED" == "true" ]]; then
-        sed -i "/^\[telegram\]/,/^\[/ s|^enabled = .*|enabled = true|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[telegram\]/,/^\[/ s|^enabled *=.*|enabled = true|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
     fi
     if [[ "${TELEGRAM_COMMANDS:-false}" == "true" ]]; then
-        sed -i "/^\[telegram\]/,/^\[/ s|^commands_enabled = .*|commands_enabled = true|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[telegram\]/,/^\[/ s|^commands_enabled *=.*|commands_enabled = true|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+    fi
+    if [[ -n "${TELEGRAM_ALLOWED_USERS:-}" ]]; then
+        sed -i "/^\[telegram\]/,/^\[/ s|^allowed_user_ids *=.*|allowed_user_ids = ${TELEGRAM_ALLOWED_USERS}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
     fi
     if [[ -n "${TELEGRAM_ALERT_MODE:-}" ]]; then
-        sed -i "/^\[telegram\]/,/^\[/ s|^alert_mode = .*|alert_mode = ${TELEGRAM_ALERT_MODE}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[telegram\]/,/^\[/ s|^alert_mode *=.*|alert_mode = ${TELEGRAM_ALERT_MODE}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
     fi
 
     # v1.4 — GeoIP
     if [[ "${GEOIP_ENABLED:-false}" == "true" ]]; then
-        sed -i "/^\[geoip\]/,/^\[/ s|^enabled = .*|enabled = true|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[geoip\]/,/^\[/ s|^enabled *=.*|enabled = true|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
     fi
 
     # v1.4 — Compromise detection
     if [[ "${COMPROMISE_ENABLED:-false}" == "true" ]]; then
-        sed -i "/^\[compromise_detection\]/,/^\[/ s|^enabled = .*|enabled = true|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[compromise_detection\]/,/^\[/ s|^enabled *=.*|enabled = true|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
     fi
 
     # v1.7.11 — per-rule enforcement + provisional disables
     if [[ -n "${COMPROMISE_ACTION_ASNS:-}" && "${COMPROMISE_ACTION_ASNS}" != "alert_only" ]]; then
-        sed -i "/^\[compromise_detection\]/,/^\[/ s|^action_asns = .*|action_asns = ${COMPROMISE_ACTION_ASNS}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[compromise_detection\]/,/^\[/ s|^action_asns *=.*|action_asns = ${COMPROMISE_ACTION_ASNS}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
     fi
     if [[ -n "${AUTO_REENABLE_HOURS:-}" && "${AUTO_REENABLE_HOURS}" != "4" ]]; then
-        sed -i "/^\[compromise_detection\]/,/^\[/ s|^auto_reenable_hours = .*|auto_reenable_hours = ${AUTO_REENABLE_HOURS}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[compromise_detection\]/,/^\[/ s|^auto_reenable_hours *=.*|auto_reenable_hours = ${AUTO_REENABLE_HOURS}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
     fi
 
     # v1.7.15 — outbound corroboration
     if [[ "${OUTBOUND_MONITORING:-true}" == "false" ]]; then
-        sed -i "/^\[compromise_detection\]/,/^\[/ s|^outbound_monitoring = .*|outbound_monitoring = false|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[compromise_detection\]/,/^\[/ s|^outbound_monitoring *=.*|outbound_monitoring = false|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
     fi
     if [[ -n "${OUTBOUND_FANOUT:-}" && "${OUTBOUND_FANOUT}" != "250" ]]; then
-        sed -i "/^\[compromise_detection\]/,/^\[/ s|^outbound_fanout_threshold = .*|outbound_fanout_threshold = ${OUTBOUND_FANOUT}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[compromise_detection\]/,/^\[/ s|^outbound_fanout_threshold *=.*|outbound_fanout_threshold = ${OUTBOUND_FANOUT}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
     fi
 
     # v1.7.9 — Block expiry reaper
     if [[ "${REAP_ENABLED:-true}" == "false" ]]; then
-        sed -i "/^\[escalation\]/,/^\[/ s|^reap_enabled = .*|reap_enabled = false|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[escalation\]/,/^\[/ s|^reap_enabled *=.*|reap_enabled = false|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
     fi
     if [[ -n "${REAP_BATCH_LIMIT:-}" && "${REAP_BATCH_LIMIT}" != "500" ]]; then
-        sed -i "/^\[escalation\]/,/^\[/ s|^reap_batch_limit = .*|reap_batch_limit = ${REAP_BATCH_LIMIT}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[escalation\]/,/^\[/ s|^reap_batch_limit *=.*|reap_batch_limit = ${REAP_BATCH_LIMIT}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
     fi
 
     # v1.7.10 — Suspicious PHP scanning tuning
     if [[ -n "${SUSPICIOUS_STATUSES:-}" && "${SUSPICIOUS_STATUSES}" != "404, 401, 403" ]]; then
-        sed -i "/^\[thresholds\]/,/^\[/ s|^suspicious_statuses = .*|suspicious_statuses = ${SUSPICIOUS_STATUSES}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[thresholds\]/,/^\[/ s|^suspicious_statuses *=.*|suspicious_statuses = ${SUSPICIOUS_STATUSES}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
     fi
     if [[ -n "${LEGIT_PHP_PATHS:-}" ]]; then
         # Shipped commented-out in the example — uncomment it with the value.
@@ -1125,12 +1139,12 @@ emit("DET_MAILDIR", "maildir_template")
 
     # v1.5 — POST-flood detector
     if [[ "${POST_FLOOD_ENABLED:-false}" == "true" ]]; then
-        sed -i "/^\[post_flood\]/,/^\[/ s|^enabled = .*|enabled = true|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[post_flood\]/,/^\[/ s|^enabled *=.*|enabled = true|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
     fi
 
     # v1.6 — /tmp cleanup
     if [[ -n "${TMP_CLEANUP_MODE:-}" && "${TMP_CLEANUP_MODE}" != "off" ]]; then
-        sed -i "/^\[tmp_cleanup\]/,/^\[/ s|^mode = .*|mode = ${TMP_CLEANUP_MODE}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[tmp_cleanup\]/,/^\[/ s|^mode *=.*|mode = ${TMP_CLEANUP_MODE}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
     fi
 
     # v1.4 — Mail backend
@@ -1185,7 +1199,7 @@ PYEOF
 
     # v1.4 — Profile
     if [[ -n "${PROFILE_MODE:-}" ]]; then
-        sed -i "/^\[profile\]/,/^\[/ s|^mode = .*|mode = ${PROFILE_MODE}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
+        sed -i "/^\[profile\]/,/^\[/ s|^mode *=.*|mode = ${PROFILE_MODE}|" "${INSTALL_DIR}/wp-guardian.conf" 2>/dev/null || true
     fi
 
     print_ok "Config generated"

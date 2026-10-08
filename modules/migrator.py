@@ -11,7 +11,7 @@ import logging
 logger = logging.getLogger('wp-guardian.migrator')
 
 # Current schema version — increment this when adding new migrations
-CURRENT_SCHEMA_VERSION = 11
+CURRENT_SCHEMA_VERSION = 12
 
 
 def get_schema_version(conn):

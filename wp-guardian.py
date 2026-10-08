@@ -7,6 +7,7 @@ Main entry point — initializes all modules and runs the monitoring loop.
 import sys
 import os
 import signal
+import html
 import logging
 import time
 import argparse
@@ -209,9 +210,21 @@ def discover_access_logs():
 # Main Guardian Daemon
 # ---------------------------------------------------------------------------
 class Guardian:
-    def __init__(self, config_path=None):
+    # Firewall-backend retry backoff while the backend is down (seconds).
+    FW_RETRY_INITIAL = 60
+    FW_RETRY_MAX = 600
+
+    def __init__(self, config_path=None, dry_run=False):
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
         self.config = load_config(config_path)
+        if dry_run:
+            # --dry-run must hold from the first component on. Applying it
+            # after construction (as main() used to) let the backend and its
+            # startup rule setup run live before the flag took effect. The
+            # effective flag stays readable as self.blocker.dry_run.
+            if not self.config.has_section('general'):
+                self.config.add_section('general')
+            self.config.set('general', 'dry_run', 'true')
         self.logger = setup_logging(self.config, self.base_dir)
         self.running = False
         self.tailers = []
@@ -231,13 +244,34 @@ class Guardian:
 
         # Initialize firewall backend
         backend_type = self.config.get('firewall', 'backend', fallback='csf')
+        # Set only when the backend failed and the operator did NOT ask for
+        # dry-run: start() raises the alert, the main loop retries.
+        self._fw_init_error = None
+        self._fw_outage_since = 0
+        self._fw_retry_delay = self.FW_RETRY_INITIAL
+        self._fw_next_retry = 0
         try:
             self.firewall = create_backend(self.config)
         except Exception as e:
-            self.logger.error(f"Firewall backend '{backend_type}' failed to initialize: {e}")
-            self.logger.error("Starting in dry-run mode (no blocking)")
             self.firewall = None
-            self.config.set('general', 'dry_run', 'true')
+            if self.config.getboolean('general', 'dry_run', fallback=False):
+                self.logger.error(f"Firewall backend '{backend_type}' failed to initialize: {e}")
+                self.logger.error("Dry-run is on: continuing without a firewall backend")
+            else:
+                # An outage, NOT a dry run. This used to flip dry_run on for
+                # the whole uptime: a boot where Guardian beat firewalld (or the
+                # router) to readiness then ran blind until the next restart,
+                # with no alert. Detection continues, blocks are refused (not
+                # recorded), and the main loop keeps retrying the backend.
+                self.logger.critical(
+                    f"Firewall backend '{backend_type}' failed to initialize: {e}"
+                )
+                self.logger.critical(
+                    "IP blocking is OFF until the backend comes up; "
+                    "detection continues and the backend will be retried"
+                )
+                self._fw_init_error = str(e)
+                self._fw_outage_since = time.time()
 
         # Initialize Telegram
         self.telegram = TelegramAlerter(self.config)
@@ -402,12 +436,19 @@ class Guardian:
             version=self.version,
         )
 
-        # Ensure firewall rules exist (backend-specific setup)
+        # Ensure firewall rules exist (backend-specific setup). Creating rules
+        # and sets is a firewall mutation, so a dry run does not do it.
         if self.firewall:
-            self.firewall.ensure_firewall_rules()
+            if self.blocker.dry_run:
+                self.logger.info(
+                    "[DRY-RUN] Skipping firewall ensure_firewall_rules() "
+                    "(would create rules/sets on the backend)"
+                )
+            else:
+                self.firewall.ensure_firewall_rules()
 
         # Log configuration summary
-        dry_run = self.config.getboolean('general', 'dry_run', fallback=False)
+        dry_run = self.blocker.dry_run
         self.logger.info(f"Dry-run mode: {dry_run}")
         self.logger.info(f"Firewall backend: {backend_type}")
         self.logger.info(f"Telegram: {'enabled' if self.telegram.enabled else 'disabled'}")
@@ -452,6 +493,83 @@ class Guardian:
                 self.config.add_section(section)
             self.config.set(section, key, value)
         self.logger.info("Migration profile overrides applied")
+
+    # ------------------------------------------------------------------
+    # Firewall backend outage handling
+    # ------------------------------------------------------------------
+    def _backend_type(self):
+        return self.config.get('firewall', 'backend', fallback='csf')
+
+    def _alert_firewall_down(self):
+        """The one CRITICAL alert at the start of a backend outage."""
+        err = html.escape((self._fw_init_error or 'unknown error')[:300])
+        self.telegram.send(
+            f"🚨 <b>WP-Guardian — FIREWALL BACKEND DOWN</b>\n"
+            f"Backend: <code>{html.escape(self._backend_type())}</code>\n"
+            f"Error: <code>{err}</code>\n"
+            f"Detection continues, <b>IP blocking is OFF</b>: blocks are "
+            f"refused and not recorded.\n"
+            f"Retrying every {self.FW_RETRY_INITIAL}s, backing off to "
+            f"{self.FW_RETRY_MAX // 60} min. You will get one message when "
+            f"it recovers.",
+            priority='CRITICAL'
+        )
+
+    def _attach_firewall(self, fw):
+        """Adopt a backend that came up after startup, wiring every holder.
+
+        Backend setup (rules, friendly list) runs BEFORE any holder sees the
+        backend: the blocker must not start pushing blocks into sets that do
+        not exist yet, and the whitelist must know the friendly IPs before the
+        blocker can race it. The blocker is attached last. If setup raises,
+        nothing is attached and the caller retries.
+        """
+        fw.ensure_firewall_rules()
+        if getattr(fw, 'supports_friendly_list', False):
+            fw.refresh_friendly_list()
+        self.firewall = fw
+        self.whitelist.firewall = fw
+        self.telegram_cmd.firewall = fw
+        self.blocker.firewall = fw
+
+    def _retry_firewall(self):
+        """One attempt to bring the backend up. Backs off 60s -> 600s.
+
+        Telegram hears about it once, on success. Failures only reach the log.
+        """
+        try:
+            self._attach_firewall(create_backend(self.config))
+        except Exception as e:
+            self._fw_retry_delay = min(self._fw_retry_delay * 2, self.FW_RETRY_MAX)
+            self._fw_next_retry = time.time() + self._fw_retry_delay
+            self.logger.error(
+                f"Firewall backend '{self._backend_type()}' still unavailable: {e} "
+                f"(next retry in {self._fw_retry_delay}s)"
+            )
+            return False
+
+        minutes = int((time.time() - self._fw_outage_since) / 60) if self._fw_outage_since else 0
+        events, ips = self.blocker.take_unenforced()
+        self._fw_init_error = None
+        self._fw_outage_since = 0
+        self._fw_retry_delay = self.FW_RETRY_INITIAL
+        self.logger.warning(
+            f"Firewall backend '{self._backend_type()}' recovered after {minutes} min; "
+            f"{events} block attempt(s) from {ips} IP(s) were not enforced"
+        )
+        try:
+            self.telegram.send(
+                f"✅ <b>WP-Guardian — firewall backend recovered</b>\n"
+                f"Backend: <code>{html.escape(self._backend_type())}</code>, back after "
+                f"{minutes} min. IP blocking is ON again.\n"
+                f"Not enforced during the outage: {events} block attempt(s) from "
+                f"{ips} distinct IP(s). Those IPs were <b>not</b> blocked; "
+                f"they will be if they trigger a rule again.",
+                priority='HIGH'
+            )
+        except Exception as e:
+            self.logger.error(f"Firewall recovery alert failed: {e}")
+        return True
 
     def _load_web_logs(self):
         """Load web access log paths from logfiles.txt."""
@@ -547,6 +665,16 @@ class Guardian:
         # Start Telegram command handler (polling thread)
         self.telegram_cmd.start()
 
+        # Backend down at startup (and not a dry run): say so now, retry later.
+        # Sent from start(), not __init__, so CLI invocations (--status ...)
+        # do not page the operator.
+        if self.firewall is None and not self.blocker.dry_run:
+            self._fw_next_retry = time.time() + self._fw_retry_delay
+            try:
+                self._alert_firewall_down()
+            except Exception as e:
+                self.logger.error(f"Firewall outage alert failed: {e}")
+
         # Periodic task settings
         last_cleanup = 0
         last_summary = 0
@@ -581,6 +709,12 @@ class Guardian:
                 # full periodic pass.
                 if not self.running:
                     break
+
+                # Backend outage: keep trying to bring it up (60s doubling to
+                # 600s). Never in dry-run, where no backend is expected.
+                if (self.firewall is None and not self.blocker.dry_run
+                        and now >= self._fw_next_retry):
+                    self._retry_firewall()
 
                 # Cleanup expired data
                 if now - last_cleanup > cleanup_interval:
@@ -1212,7 +1346,12 @@ class Guardian:
         print(f"  WP-Guardian v{self.version}")
         print("=" * 50)
         print(f"  Schema version:     {schema_version}")
-        print(f"  Firewall backend:   {backend_type}")
+        if self.firewall is None and not self.blocker.dry_run:
+            # Failed to initialise and the operator did not ask for dry-run:
+            # IP blocking is off, which --status must not paper over.
+            print(f"  Firewall backend:   {backend_type} -- UNAVAILABLE (IP blocking is OFF)")
+        else:
+            print(f"  Firewall backend:   {backend_type}")
         print(f"  IPs tracked:        {stats['total_ips_tracked']}")
         print(f"  Blocks today:       {stats['total_blocks_today']}")
         print(f"  Active Tier 1:      {stats['active_tier1']}")
@@ -1472,11 +1611,9 @@ def main():
 
     # --- Commands that need Guardian init ---
 
-    guardian = Guardian(args.config)
-
-    if args.dry_run:
-        guardian.config.set('general', 'dry_run', 'true')
-        guardian.blocker.dry_run = True
+    # --dry-run is handed to the constructor so it is in force before any
+    # component (or the backend's startup rule setup) runs.
+    guardian = Guardian(args.config, dry_run=args.dry_run)
 
     # Command modes
     if args.status:
@@ -1495,8 +1632,10 @@ def main():
                     print(f"  Block counts: {counts}")
             else:
                 print(f"  ✗ Connection FAILED")
+        elif guardian.blocker.dry_run:
+            print(f"  ✗ No firewall backend (dry-run)")
         else:
-            print(f"  ✗ No firewall backend configured")
+            print(f"  ✗ Backend '{backend_type}' is UNAVAILABLE (failed to initialize, see log)")
         return
 
     if args.import_tripwires:
@@ -1598,9 +1737,16 @@ def main():
         return
 
     if args.unblock:
-        guardian.blocker.unblock(args.unblock)
-        print(f"Unblocked {args.unblock}")
-        return
+        if guardian.blocker.unblock(args.unblock):
+            if guardian.blocker.dry_run:
+                print(f"[DRY-RUN] Would unblock {args.unblock} (nothing changed)")
+            else:
+                print(f"Unblocked {args.unblock}")
+            return
+        print(f"FAILED to unblock {args.unblock}: the firewall backend is "
+              f"unavailable or refused. Block state left unchanged "
+              f"(see the log).")
+        sys.exit(1)
 
     if args.reap_blocks:
         blocker = guardian.blocker
@@ -1898,6 +2044,9 @@ def main():
             else:
                 print("Mail backend not configured. Set [mail_backend] type in wp-guardian.conf.")
             return
+        if guardian.blocker.dry_run:
+            print(f"[DRY-RUN] Would disable mailbox {username} (nothing changed)")
+            return
         try:
             changed = guardian.mail_backend.disable_mailbox(username)
             # password_reset strategy records its own action (with hash);
@@ -1929,6 +2078,9 @@ def main():
                 print(f"Mail backend failed to initialize: {err}")
             else:
                 print("Mail backend not configured. Set [mail_backend] type in wp-guardian.conf.")
+            return
+        if guardian.blocker.dry_run:
+            print(f"[DRY-RUN] Would enable mailbox {username} (nothing changed)")
             return
         try:
             changed = guardian.mail_backend.enable_mailbox(username)

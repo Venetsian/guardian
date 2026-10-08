@@ -125,6 +125,15 @@ class CompromiseAction:
                        fallback='8075, 15169, 714')
         )
 
+    def _dry_run(self):
+        """Global dry-run flag, read at call time from the blocker.
+
+        Not cached at construction: the blocker is the single source of truth
+        for dry-run, and a test or a future runtime toggle must be honoured
+        by the very next event.
+        """
+        return bool(getattr(self.blocker, 'dry_run', False))
+
     @staticmethod
     def _read_action(config, key, fallback):
         """Read + validate one action key. Invalid values fail SAFE (weaker
@@ -237,6 +246,8 @@ class CompromiseAction:
 
         ips_blocked = 0
         mailbox_disabled = False
+        mailbox_simulated = False
+        dry_run = self._dry_run()
 
         # Block attacker IPs
         if action in ('block_ips', 'full'):
@@ -245,7 +256,18 @@ class CompromiseAction:
         # Disable mailbox
         if action in ('disable_mailbox', 'full'):
             if self.mail_backend and getattr(self.mail_backend, 'enabled', False):
-                mailbox_disabled = self._disable_mailbox(username, event_id, actor)
+                if dry_run:
+                    # Global dry-run covers this too. No backend call and no
+                    # mailbox_actions row: a simulated disable recorded as a
+                    # real one would make is_mailbox_disabled_by_guardian()
+                    # suppress real escalation for that account.
+                    mailbox_simulated = True
+                    logger.warning(
+                        "[DRY-RUN] would disable mailbox {u} (event {i}) — "
+                        "mail backend not called".format(u=username, i=event_id)
+                    )
+                else:
+                    mailbox_disabled = self._disable_mailbox(username, event_id, actor)
             else:
                 logger.warning(
                     "Cannot auto-disable {u}: mail_backend not configured".format(u=username)
@@ -265,7 +287,9 @@ class CompromiseAction:
             self.db.update_compromise_event(event_id, {
                 'mailbox_disabled': 1 if mailbox_disabled else 0,
                 'ips_blocked_count': ips_blocked,
-                'action_taken': self._summarize(ips_blocked, mailbox_disabled),
+                'action_taken': self._summarize(
+                    ips_blocked, mailbox_disabled,
+                    mailbox_simulated=mailbox_simulated, dry_run=dry_run),
             })
         except Exception as e:
             logger.error("Failed to update compromise event {i}: {e}".format(i=event_id, e=e))
@@ -283,6 +307,8 @@ class CompromiseAction:
                     event_id=event_id,
                     action=action,
                     corroboration=corroboration,
+                    dry_run=dry_run,
+                    mailbox_simulated=mailbox_simulated,
                 )
             else:
                 self.telegram.send(
@@ -414,6 +440,10 @@ class CompromiseAction:
         """
         result = {'restored': 0, 'failed': 0, 'skipped': 0, 'remaining': 0}
 
+        # Global dry-run must not issue real mailbox changes either (mirrors
+        # Blocker.reap_expired_blocks).
+        dry_run = dry_run or self._dry_run()
+
         if self.auto_reenable_seconds <= 0:
             return result
         if not (self.mail_backend and getattr(self.mail_backend, 'enabled', False)):
@@ -535,7 +565,19 @@ class CompromiseAction:
         return result
 
     @staticmethod
-    def _summarize(ips_blocked, mailbox_disabled):
+    def _summarize(ips_blocked, mailbox_disabled, mailbox_simulated=False,
+                   dry_run=False):
+        if dry_run:
+            # Nothing below really happened. Say so in the record -- 'full' or
+            # 'ips_blocked' on an event that touched no firewall or mailbox
+            # would mislead /compromises and any later review.
+            if mailbox_simulated and ips_blocked:
+                return 'dry_run_full'
+            if mailbox_simulated:
+                return 'dry_run_mailbox'
+            if ips_blocked:
+                return 'dry_run_ips'
+            return 'alert_only'
         if ips_blocked and mailbox_disabled:
             return 'full'
         if mailbox_disabled:

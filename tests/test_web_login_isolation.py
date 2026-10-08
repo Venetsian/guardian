@@ -159,7 +159,9 @@ class TestBrowserAssetSignal(unittest.TestCase):
         blocker = FakeBlocker()
         db = FakeDB()
         d = make_detector(db, blocker)
+        # A 302 alone only nominates a login; the admin page confirms it.
         d.process_line(line('192.0.2.12', 'POST', '/wp-login.php', '302'))
+        d.process_line(line('192.0.2.12', 'GET', '/wp-admin/', '200'))
         for _ in range(5):
             d.process_line(line('192.0.2.12', 'GET', '/wp-login.php', '200'))
         self.assertEqual(blocker.blocked, [])

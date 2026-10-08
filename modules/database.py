@@ -330,6 +330,26 @@ class GuardianDB:
 
         self.conn.commit()
 
+    # block_log.blocker value for simulated (dry-run) blocks.
+    DRY_RUN_BLOCKER = 'dry-run'
+
+    def record_simulated_block(self, ip, tier, reason, service, duration):
+        """Log a dry-run block for review WITHOUT creating enforcement state.
+
+        record_block() also sets ip_history.current_tier. For a simulated block
+        that was a trap: block() then short-circuits on "already blocked" for
+        a real detection of the same IP (tier 3 = never blocked, ever), and
+        determine_tier()/count_blocked_in_subnet() treat the simulation as
+        escalation evidence. So a dry run writes the review row and nothing
+        else -- ip_history is not touched.
+        """
+        now = int(time.time())
+        self.conn.execute("""
+            INSERT INTO block_log (ip, timestamp, tier, reason, service, blocker, duration)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (ip, now, tier, reason, service, self.DRY_RUN_BLOCKER, duration))
+        self.conn.commit()
+
     def count_blocked_in_subnet(self, subnet_prefix):
         """Count unique IPs with current_tier > 0 that start with the given prefix.
         subnet_prefix should be like '192.0.2.' for a /24 check."""
@@ -361,12 +381,16 @@ class GuardianDB:
         unblocking a false positive must reset the escalation ladder, not
         arm the next rung. Blocks retired by the reaper keep cleared_at = 0
         and still escalate on return, which is the point of the tier design.
+
+        Simulated (dry-run) rows are ignored too: a block that never reached
+        a firewall is not evidence that the attacker came back.
         """
         cutoff = int(time.time()) - lookback_seconds
         cursor = self.conn.execute(
             "SELECT * FROM block_log WHERE ip = ? AND timestamp > ? AND cleared_at = 0 "
+            "AND blocker != ? "
             "ORDER BY timestamp DESC LIMIT 1",
-            (ip, cutoff)
+            (ip, cutoff, self.DRY_RUN_BLOCKER)
         )
         return cursor.fetchone()
 

@@ -9,7 +9,9 @@ CMSRegistry.
 """
 
 import re
+import time
 import logging
+from urllib.parse import parse_qs
 
 from .base import HitTracker
 from .log_formats import parse_line
@@ -40,6 +42,76 @@ def is_browser_asset(clean_path):
     parse_line(), so a plain suffix test is enough.
     """
     return clean_path.endswith(_BROWSER_ASSET_EXT)
+
+
+# A 302 from `POST wp-login.php` is what a successful login looks like in the
+# access log, but it is not proof of one. Stock WordPress answers
+# `action=postpass` (with any same-site Referer) with a 302 whatever the
+# password, and because WordPress reads `action` from $_REQUEST the same can be
+# sent in the POST *body*, where the log never shows it. So the redirect only
+# nominates a login; trust is granted when the same client then gets a 200 from
+# an admin page an anonymous client cannot load (WebDetector._track_wp_login).
+LOGIN_CONFIRM_WINDOW = 120
+# Cap on unconfirmed candidates held in memory; scanners POST wp-login.php
+# from many addresses and most of those logins never confirm.
+MAX_PENDING_LOGINS = 5000
+# What WebDetector._track_wp_login reports for a login candidate.
+_LOGIN_FIRST = 'first'
+_LOGIN_REPEAT = 'repeat'
+
+# `action` values WordPress core routes to something other than the login
+# handler. Anything else — including unknown values — falls through to the
+# login handler in core, so those stay candidates.
+_NON_LOGIN_ACTIONS = frozenset((
+    'postpass', 'logout', 'lostpassword', 'retrievepassword', 'resetpass',
+    'rp', 'register', 'confirm_admin_email', 'confirmaction', 'checkemail',
+    'entered_recovery_mode',
+))
+
+# Admin screens that answer 200 only to a logged-in session (anonymous clients
+# are redirected to wp-login.php). Deliberately NOT listed, because they answer
+# 200 to anyone: admin-ajax.php, admin-post.php, load-styles.php,
+# load-scripts.php, install.php, upgrade.php, setup-config.php, maint/*, and
+# the static assets under /wp-admin/. `search`, not `match`, so /blog/wp-admin/
+# installs count.
+_ADMIN_SESSION_PAGE = re.compile(
+    r'/wp-admin/?$'
+    r'|/wp-admin/(?:index|admin|edit|post|post-new|upload|plugins|themes|users'
+    r'|profile|edit-comments|update-core|tools|options-general|nav-menus'
+    r'|widgets|customize|site-editor|edit-tags|plugin-install|theme-install'
+    r'|user-edit|about)\.php$'
+)
+
+
+# Endpoints under /wp-admin/ that serve anonymous front-end traffic.
+_PUBLIC_ADMIN_ENDPOINTS = ('/wp-admin/admin-ajax.php', '/wp-admin/admin-post.php')
+
+
+def is_login_candidate(method, path, clean_path, status):
+    """True when a request looks like a successful WordPress login.
+
+    A candidate is a POST answered 302 on wp-login.php itself (subdirectory
+    installs included, look-alikes such as /anything-wp-login.php excluded)
+    whose query-string `action` is not one of WordPress's non-login actions.
+    It is only a candidate: see LOGIN_CONFIRM_WINDOW.
+    """
+    if method != 'POST' or status != '302':
+        return False
+    if not clean_path.endswith('/wp-login.php'):
+        return False
+    query = path.partition('?')[2]
+    if query:
+        # Any occurrence counts: PHP keeps only the last duplicate, so which
+        # one WordPress acts on is not worth guessing at.
+        for value in parse_qs(query).get('action', ()):
+            if value.lower() in _NON_LOGIN_ACTIONS:
+                return False
+    return True
+
+
+def is_admin_session_page(clean_path):
+    """True for an admin page that only a logged-in session gets a 200 from."""
+    return _ADMIN_SESSION_PAGE.search(clean_path) is not None
 
 
 # Rejected, with the measurement, so nobody re-proposes it: treating
@@ -90,6 +162,8 @@ class WebDetector:
 
         # Auth tracking
         self.trust_duration = config.getint('auth_tracking', 'wp_trust_duration', fallback=24) * 3600
+        # (ip, site) -> time of a login candidate still awaiting confirmation.
+        self._pending_logins = {}
 
         # Hit trackers (separate per rule type)
         self.hits_login = HitTracker(self.time_window)
@@ -195,9 +269,7 @@ class WebDetector:
         # ----- WHITELIST EARLY BYPASS -----
         # Skip all detection for whitelisted IPs, but still record successful WP logins
         if self.whitelist and self.whitelist.is_whitelisted(ip):
-            if method == 'POST' and 'wp-login.php' in clean_path and status == '302':
-                wp_user = 'wp@{s}'.format(s=site) if site else 'wp@unknown'
-                self.db.record_auth(ip, 'wordpress', wp_user, site=site, country='', city='')
+            self._track_wp_login(ip, site, method, path, clean_path, status)
             return
 
         # ----- LOGIN ISOLATION: track browser assets (real browser signal) -----
@@ -212,16 +284,47 @@ class WebDetector:
             self.hits_success.add(ip)
 
         # ----- AUTHENTICATION TRACKING -----
-        if method == 'POST' and 'wp-login.php' in clean_path and status == '302':
-            wp_user = 'wp@{s}'.format(s=site) if site else 'wp@unknown'
-            self.db.record_auth(ip, 'wordpress', wp_user, site=site, country='', city='')
+        # Must run before the safe-path skip below: the confirming request is
+        # itself a /wp-admin/ page.
+        login_state = self._track_wp_login(ip, site, method, path, clean_path, status)
+        if login_state == _LOGIN_FIRST:
             return
+        # A repeat candidate falls through: the earlier one never confirmed, so
+        # it was a failed attempt and this line counts like any other wp-login
+        # POST (login isolation below, brute force further down).
+        repeat_login = login_state == _LOGIN_REPEAT
+
+        # ----- KNOWN WEBSHELLS (instant block, everyone) -----
+        # Ahead of the safe-path skip: /wp-admin/ and /wp-includes/ are the
+        # usual places to plant a shell, so exempting them hid the probes. No
+        # legitimate client ever asks for these names, so unlike the tripwire
+        # rules below a logged-in session does not buy an exemption.
+        if clean_path.endswith('.php'):
+            for pattern, description in self.instant_patterns:
+                if pattern.search(clean_path):
+                    if self.db.is_ip_authenticated(ip, self.trust_duration):
+                        logging.getLogger('wp-guardian.web').warning(
+                            f"Authenticated IP {ip} hit instant pattern: {description} ({clean_path}) — blocking anyway"
+                        )
+                    self.blocker.block(ip, f"{description}: {clean_path}", service='web', site=site, rule='instant')
+                    return
 
         # ----- TRIPWIRE RULES (instant block for non-authenticated) -----
 
-        # Skip safe paths (wp-admin, wp-includes — always legitimate)
+        # Skip safe paths (wp-admin, wp-includes — legitimate to browse), but
+        # still count PHP misses there: scanners probe these directories too.
+        # 404/401 only — 403 is what sites with an .htaccess IP restriction on
+        # wp-admin answer the operator's own secondary address with. The
+        # public AJAX endpoints are left out: front-end plugins poll them for
+        # anonymous visitors and some answer those with 401.
         for pattern in self.safe_path_patterns:
             if pattern.search(clean_path):
+                if (clean_path.endswith('.php') and status in ('404', '401')
+                        and not clean_path.endswith(_PUBLIC_ADMIN_ENDPOINTS)
+                        and not self.db.is_ip_authenticated(ip, self.trust_duration)):
+                    count = self.hits_php404.add(ip)
+                    if count >= self.php_404_threshold:
+                        self.blocker.block(ip, f"PHP scanning ({count} 404s in {self.time_window}s)", service='web', site=site, rule='php_scan')
                 return
 
         # Check structural tripwires first (e.g., PHP in uploads)
@@ -234,18 +337,6 @@ class WebDetector:
                     return
                 self.blocker.block(ip, f"PHP in uploads: {clean_path}", service='web', site=site, rule='structural')
                 return
-
-        # Check instant-block patterns (known webshells)
-        if clean_path.endswith('.php'):
-            for pattern, description in self.instant_patterns:
-                if pattern.search(clean_path):
-                    if self.db.is_ip_authenticated(ip, self.trust_duration):
-                        logging.getLogger('wp-guardian.web').warning(
-                            f"Authenticated IP {ip} hit instant pattern: {description} ({clean_path})"
-                        )
-                        return
-                    self.blocker.block(ip, f"{description}: {clean_path}", service='web', site=site, rule='instant')
-                    return
 
         # Check suspicious patterns (threshold-based)
         if clean_path.endswith('.php') and status in self.suspicious_statuses:
@@ -299,8 +390,9 @@ class WebDetector:
 
         # ----- THRESHOLD RULES -----
 
-        # wp-login.php brute force
-        if 'wp-login.php' in clean_path and method == 'POST' and status != '302':
+        # wp-login.php brute force. A 302 is normally a login, so it is not a
+        # failure — unless it repeats an earlier 302 that never confirmed.
+        if 'wp-login.php' in clean_path and method == 'POST' and (status != '302' or repeat_login):
             count = self.hits_login.add(ip)
             if count >= self.wp_login_threshold:
                 self.blocker.block(ip, f"wp-login brute force ({count} in {self.time_window}s)", service='web', site=site, rule='wp_login')
@@ -353,6 +445,49 @@ class WebDetector:
                     return
                 self.blocker.block(ip, f"{label} ({count} in {self.time_window}s)", service='web', site=site, rule='general_404')
             return
+
+    def _track_wp_login(self, ip, site, method, path, clean_path, status):
+        """Two-step WordPress login tracking.
+
+        A candidate (see is_login_candidate) is only remembered. The IP becomes
+        authenticated when a later 200 from an admin session page arrives for
+        the same (ip, site) inside LOGIN_CONFIRM_WINDOW, which also clears the
+        pending entry.
+
+        Returns _LOGIN_FIRST for a candidate with nothing pending: the caller
+        skips the rest of the pipeline, so one stray redirect (a real user's
+        mistyped password, say) is never counted. Returns _LOGIN_REPEAT for a
+        candidate while an earlier one is still pending, however old: that
+        earlier login evidently failed, so the caller keeps processing the
+        line as a failed attempt. Every other line returns None.
+        """
+        key = (ip, site)
+        started = self._pending_logins.get(key)
+        if started is not None and status == '200' and is_admin_session_page(clean_path):
+            del self._pending_logins[key]
+            if time.time() - started <= LOGIN_CONFIRM_WINDOW:
+                wp_user = 'wp@{s}'.format(s=site) if site else 'wp@unknown'
+                self.db.record_auth(ip, 'wordpress', wp_user, site=site, country='', city='')
+            return None
+
+        if is_login_candidate(method, path, clean_path, status):
+            self._remember_login_candidate(key)
+            return _LOGIN_FIRST if started is None else _LOGIN_REPEAT
+        return None
+
+    def _remember_login_candidate(self, key):
+        """Store a candidate, keeping the pending map bounded."""
+        pending = self._pending_logins
+        now = time.time()
+        pending[key] = now
+        if len(pending) > MAX_PENDING_LOGINS:
+            cutoff = now - LOGIN_CONFIRM_WINDOW
+            for stale in [k for k, ts in pending.items() if ts < cutoff]:
+                del pending[stale]
+            if len(pending) > MAX_PENDING_LOGINS:
+                oldest = sorted(pending, key=pending.get)[:len(pending) // 2]
+                for k in oldest:
+                    del pending[k]
 
     def _is_scanning_ratio(self, ip, bucket_count):
         """True when misses dominate this IP's traffic enough to be a scan.

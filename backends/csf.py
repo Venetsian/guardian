@@ -169,6 +169,18 @@ class CSFBackend(FirewallBackend):
         if success:
             unblocked = True
 
+        # Both removals fail when there is nothing to remove — typically a temp
+        # ban that already expired. Unblock is idempotent on every backend, and
+        # Blocker.unblock() trusts this result, so confirm with `csf -g` that
+        # the IP really is gone (a csf that cannot run at all still fails).
+        if not unblocked:
+            success, stdout, stderr = self._run_csf(['-g', ip])
+            if success and not any(
+                'deny' in line.lower() or 'Block' in line
+                for line in stdout.split('\n')
+            ):
+                unblocked = True
+
         if unblocked:
             logger.info(f"CSF UNBLOCKED {ip}")
         return unblocked
