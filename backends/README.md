@@ -144,6 +144,8 @@ python3 wp-guardian.py --status
 | `is_blocked(ip)` | No | Check if IP is currently blocked. |
 | `block_cidr(subnet, ...)` | No | Block a CIDR range (set `supports_cidr = True`). |
 | `is_cidr_blocked(subnet)` | No | Check if CIDR is blocked. |
+| `unblock_cidr(subnet)` | No (v1.7.19) | Remove a CIDR block. Must be idempotent: "nothing to remove" is success. The subnet reaper and `/unblock <cidr>` trust its result. |
+| `list_cidr_entries()` | No (v1.7.19) | The CIDR entries the firewall holds, or `None` if the backend cannot list. Raise on a failed query — never return an empty set for "could not read". Used by the startup reconcile. |
 | `is_friendly(ip)` | No | Check if IP is in never-block list. |
 | `is_friendly_subnet(subnet)` | No | Check if subnet contains friendly IPs. |
 | `ensure_firewall_rules()` | No | One-time setup on daemon start. |
@@ -195,6 +197,11 @@ expires_own_entries = False  # entries persist until unblock() removes them
 it, `block()` short-circuits on "already blocked at tier N" and a returning
 attacker is never re-pushed — even on a self-expiring backend that dropped the
 entry hours ago.
+
+Since v1.7.19 the same flag drives `Blocker.reap_expired_cidrs()` for subnet
+blocks: `True` means `block_cidr()` attaches the duration too (mikrotik
+`timeout=`, nftables element timeout, `csf -td`), so the reaper only closes
+the `cidr_blocks` row; `False` means it calls `unblock_cidr()`.
 
 Default is `False`. A wrong `True` leaves entries blocked at the firewall that
 the database no longer tracks — the worst failure direction — so only set it if

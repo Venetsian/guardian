@@ -28,13 +28,19 @@ class FirewallBackend(ABC):
     # firewall has already forgotten the IP, so the call would be a guaranteed
     # no-op. On MikroTik that no-op costs three SSH round-trips per IP.
     #
-    # Set it True ONLY if block() attaches a real expiry for tiers 1 and 2:
+    # It covers block_cidr() the same way (v1.7.19): the CIDR reaper skips
+    # unblock_cidr() on a True backend, because block_cidr() attaches the
+    # requested duration as a real expiry (a 'permanent' one has none, and the
+    # reaper never touches those).
+    #
+    # Set it True ONLY if block() attaches a real expiry for tiers 1 and 2
+    # AND block_cidr() does so for finite durations:
     #   mikrotik  timeout=24h / 30d on the address-list entry
     #   nftables  per-element `timeout` in the set
     #   csf       `csf -td <ip> <seconds>` temporary deny
     # Leave it False if entries persist until explicitly removed:
     #   firewalld ipset entries carry no TTL
-    #   pfsense   flat alias, tier is ignored
+    #   pfsense   flat alias, tier and duration are ignored
     # False is the safe default: a wrong True leaves entries blocked at the
     # firewall that the database no longer knows about.
     expires_own_entries = False
@@ -118,6 +124,33 @@ class FirewallBackend(ABC):
             True if blocked, False otherwise.
         """
         return False
+
+    def unblock_cidr(self, subnet):
+        """
+        Remove a CIDR subnet from the CIDR block list (v1.7.19).
+
+        Only called if supports_cidr = True. Called by the CIDR reaper (on
+        backends that do not expire their own entries) and by /unblock <cidr>.
+
+        Returns:
+            True if removed or already absent (idempotent), False on failure.
+        """
+        return False
+
+    def list_cidr_entries(self):
+        """
+        List the subnets currently in the CIDR block list (v1.7.19).
+
+        Used at startup to reconcile the database against what the firewall
+        really holds. Optional.
+
+        Returns:
+            None when the backend cannot list its entries (the default).
+            Otherwise a set of CIDR strings. A backend that CAN list but failed
+            this time must raise rather than return an empty set: callers act
+            on "not in the set", so a failure must never read as "empty".
+        """
+        return None
 
     def is_friendly(self, ip):
         """

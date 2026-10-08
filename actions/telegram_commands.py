@@ -4,11 +4,14 @@ Polls for incoming Telegram messages and executes commands.
 Uses getUpdates long-polling — no webhooks, no open ports.
 """
 
+import html
 import logging
 import os
 import time
 import re
 import threading
+
+from modules.blocker import format_cidr_expiry
 
 logger = logging.getLogger('wp-guardian.telegram-cmd')
 
@@ -325,6 +328,8 @@ class TelegramCommander:
             '/resolve': self._cmd_resolve,
             # v1.7.11
             '/confirm': self._cmd_confirm,
+            # v1.7.19
+            '/cidrs': self._cmd_cidrs,
             # v1.4.1
             '/verbosity': self._cmd_verbosity,
             # v1.5 — remote troubleshooting
@@ -366,7 +371,8 @@ class TelegramCommander:
             "Total IPs tracked: {total_ips}\n"
             "Auth sessions today: {auth}\n"
             "Whitelist entries: {wl}\n"
-            "Active tripwires: {tw}"
+            "Active tripwires: {tw}\n"
+            "{cidr}"
         ).format(
             blocks_today=stats.get('total_blocks_today', 0),
             tier1=stats.get('active_tier1', 0),
@@ -376,13 +382,53 @@ class TelegramCommander:
             auth=stats.get('auth_sessions_today', 0),
             wl=stats.get('whitelist_count', 0),
             tw=stats.get('tripwire_count', 0),
+            cidr=self._cidr_status_line(),
         )
         self._reply(msg)
 
+    def _cidr_status_line(self):
+        """The subnet-block line for /status. Best effort: never fails /status."""
+        backend_count = None
+        try:
+            if self.firewall is not None:
+                backend_count = (self.firewall.get_block_counts() or {}).get('cidr')
+        except Exception as e:
+            logger.debug(f"/status: backend CIDR count unavailable: {e}")
+        try:
+            return self.blocker.cidr_status_line(backend_count)
+        except Exception as e:
+            logger.debug(f"/status CIDR line unavailable: {e}")
+            return "CIDR blocks: unavailable"
+
+    def _cidr_note(self, ip):
+        """Newline + the 'still covered by subnet block' note, or ''.
+
+        /unblock <ip> and /whitelist <ip> lift the per-IP block only; this tells
+        the operator when a subnet block still drops the address.
+        """
+        try:
+            note = self.blocker.cidr_cover_note(ip)
+        except Exception as e:
+            logger.debug(f"cidr_cover_note failed for {ip}: {e}")
+            return ''
+        return "\n" + html.escape(note) if note else ''
+
     def _cmd_unblock(self, args):
-        """Handle /unblock <ip> command."""
+        """Handle /unblock <ip|cidr> command."""
         if not args:
-            self._reply("Usage: /unblock &lt;ip&gt;\nExample: /unblock 192.0.2.50")
+            self._reply(
+                "Usage: /unblock &lt;ip|cidr&gt;\n"
+                "Example: /unblock 192.0.2.50\n"
+                "Example: /unblock 192.0.2.0/24 (lift a subnet block)"
+            )
+            return
+
+        # A subnet block has its own record and backend call.
+        if '/' in args[0]:
+            ok, msg = self.blocker.unblock_cidr_manual(
+                args[0], actor='telegram:{cid}'.format(cid=self.chat_id)
+            )
+            self._reply(("✅ " if ok else "⚠️ ") + html.escape(msg))
             return
 
         ip = args[0]
@@ -390,10 +436,13 @@ class TelegramCommander:
             self._reply("Invalid IP address: {ip}".format(ip=ip))
             return
 
+        # A subnet block over this IP is untouched by lifting the IP's own.
+        note = self._cidr_note(ip)
+
         # Check if IP is actually blocked
         ip_data = self.db.get_ip(ip)
         if not ip_data or ip_data['current_tier'] == 0:
-            self._reply("IP <code>{ip}</code> is not currently blocked.".format(ip=ip))
+            self._reply("IP <code>{ip}</code> is not currently blocked.".format(ip=ip) + note)
             return
 
         tier = ip_data['current_tier']
@@ -406,23 +455,24 @@ class TelegramCommander:
                     "❌ Failed to unblock <code>{ip}</code> (still tier {tier}): "
                     "the firewall backend is unavailable or refused. "
                     "Block state unchanged — see the log.".format(ip=ip, tier=tier)
+                    + note
                 )
             elif self._dry_run():
                 self._reply(
                     "[DRY-RUN] Would unblock <code>{ip}</code> (tier {tier}). "
-                    "Nothing changed.".format(ip=ip, tier=tier)
+                    "Nothing changed.".format(ip=ip, tier=tier) + note
                 )
             else:
                 self._reply(
                     "Unblocked <code>{ip}</code> (was tier {tier}).".format(
                         ip=ip, tier=tier
-                    )
+                    ) + note
                 )
         except Exception as e:
             self._reply(
                 "Failed to unblock <code>{ip}</code>: {err}".format(
                     ip=ip, err=str(e)
-                )
+                ) + note
             )
 
     def _cmd_block(self, args):
@@ -438,7 +488,7 @@ class TelegramCommander:
                 "/block 192.0.2.0/24 30d — for 30 days\n"
                 "\n"
                 "Duration: 24h / 7d / 30d / perm (default: permanent).\n"
-                "Reverse with /unblock &lt;ip&gt;."
+                "Reverse with /unblock &lt;ip|cidr&gt;."
             )
             return
 
@@ -569,7 +619,32 @@ class TelegramCommander:
                 "or refused): it stays blocked. Retry /unblock {ip} once the "
                 "backend is back.".format(ip=ip)
             )
+        # Whitelisting does not lift a subnet block that already covers the IP.
+        msg += self._cidr_note(ip)
         self._reply(msg)
+
+    def _cmd_cidrs(self, args):
+        """Handle /cidrs — subnet (CIDR) blocks and the repeat-offender watch."""
+        counts = self.db.cidr_counts()
+        upcoming = self.db.list_active_cidr_blocks(limit=10, include_overdue=False)
+
+        lines = [
+            "<b>Subnet (CIDR) blocks</b>",
+            "━━━━━━━━━━━━━━━━━━━━━",
+            "Active: {n} ({p} permanent)".format(
+                n=counts['active'], p=counts['permanent']),
+            "Overdue, awaiting release: {o}".format(o=counts['overdue']),
+            "Repeat-offender watch: {w}".format(w=counts['watch']),
+        ]
+        if upcoming:
+            lines.append("")
+            lines.append("<b>Soonest to expire</b>")
+            now = time.time()
+            for row in upcoming:
+                lines.append("<code>{subnet}</code> {source} — {when}".format(
+                    subnet=row['subnet'], source=row['source'],
+                    when=format_cidr_expiry(row['expires_at'], now)))
+        self._reply('\n'.join(lines))
 
     def _cmd_history(self, args):
         """Handle /history <ip> command."""
@@ -1415,7 +1490,8 @@ class TelegramCommander:
             "━━━━━━━━━━━━━━━━━━━━━\n"
             "/status — current block counts and stats\n"
             "/block &lt;ip|cidr&gt; [duration] — manually block (default: permanent)\n"
-            "/unblock &lt;ip&gt; — remove block and reset tier\n"
+            "/unblock &lt;ip|cidr&gt; — remove block and reset tier (cidr: lift a subnet block)\n"
+            "/cidrs — subnet blocks: active, soonest to expire, repeat-offender watch\n"
             "/whitelist &lt;ip&gt; [duration] — add to whitelist\n"
             "/whitelist remove &lt;ip&gt; — remove from whitelist\n"
             "/whitelist list — show all entries\n"

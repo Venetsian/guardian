@@ -72,6 +72,11 @@ DEFAULTS = {
     'trusted_skip':    'immediate',
     'compromise':      'immediate',
     'cidr':            'immediate',
+    # v1.7.19 -- a released /24 re-blocked because one more of its IPs was
+    # blocked. Deliberately NOT in ALWAYS_IMMEDIATE_RULES: after a backlog of
+    # old subnet blocks is released these can come in bursts, and the operator
+    # may want /verbosity cidr_reoffend digest.
+    'cidr_reoffend':   'immediate',
     'block_failed':    'immediate',
     'block':           'immediate',  # catch-all fallback
 }

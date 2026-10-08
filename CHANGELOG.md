@@ -1,5 +1,101 @@
 # WP-Guardian Changelog
 
+## v1.7.19 — subnet blocks end when they say they do, and repeat offenders come straight back (2026-10-08)
+
+### Subnet blocks never expired on firewalld
+
+`[cidr] duration = 30d` was logged with every subnet block and enforced by
+nothing on firewalld: `block_cidr()` ignored the duration, the ipset entry has
+no timeout, and no code ever removed a subnet. On the three firewalld hosts the
+sets held 70, 726 and 29 /24s; about 800 were past their 30 days, the oldest
+~174 days. pfSense had the same gap. On the self-expiring backends (MikroTik,
+nftables, CSF) the router did drop the entry on time, but Guardian kept an
+in-memory "already blocked" set that was lost on every restart and, until
+then, stopped the range from being re-aggregated after the router had already
+let it go.
+
+Every subnet block is now a row in a new `cidr_blocks` table (migration 013),
+and an hourly reaper ends them: on firewalld and pfSense it removes the entry
+(50 per sweep — each removal is two firewall-cmd calls), on MikroTik, nftables
+and CSF it only closes the record, because the firewall expires the entry
+itself. Permanent subnet blocks are never touched. Backends gained
+`unblock_cidr()`, and firewalld `list_cidr_entries()`.
+
+### Repeat offenders
+
+A /24 that earned a subnet block and served it out is remembered. The next
+time Guardian blocks **any** IP inside it, the whole /24 goes back for another
+`duration` — no threshold of five. The case for it, measured at upgrade time:
+on one host all 707 overdue /24s contained **zero** currently-blocked IPs
+(nothing from those ranges could reach the server while they were blocked, so
+their individual blocks had expired), so the threshold rule alone would have
+needed five fresh offenders per range. On the MikroTik host, whose router did
+expire subnets, 193 subnet blocks had already gone to 143 distinct ranges:
+about 50 ranges came back and earned a second one the slow way.
+
+Re-blocks alert under a new rule id, `cidr_reoffend` — immediate by default,
+but unlike `cidr` it can be moved to the digest (`/verbosity cidr_reoffend
+digest`) if the backlog release below gets noisy. An operator `/unblock <cidr>`
+clears the memory, the same way `/unblock <ip>` resets escalation: a range you
+release by hand is treated as a false positive. Turn the feature off with
+`[cidr] reblock_repeat_offenders = false`.
+
+### Upgrading
+
+On the first start after the upgrade Guardian rebuilds the records from
+`blocked.log` (latest event per subnet) and sends one Telegram summary:
+
+- on firewalld, entries still in the set become active records with their
+  original dates — the overdue ones are released at 50 per hour, so a host
+  with ~700 drains in about 14 hours, and each released range starts on
+  repeat-offender watch;
+- logged subnets missing from a firewalld set were removed by hand and are not
+  watched;
+- on self-expiring backends, blocks whose time has passed go straight onto the
+  watch;
+- set entries with no log record are adopted as **permanent** — Guardian
+  never releases something it has no record of.
+
+Every later start compares the firewalld set with the records: strays are
+adopted (permanent), missing active blocks are re-applied, and an expired block
+that reappeared (a removal whose permanent half failed, restored by a reload)
+is released again rather than adopted.
+
+### Commands
+
+- `/unblock <cidr>`, `--unblock <cidr>` — lift a subnet block (and its
+  repeat-offender memory)
+- `/cidrs` — active subnet blocks, soonest expiry first, overdue count,
+  repeat-offender watch
+- `/unblock <ip>` and `/whitelist <ip>` now say when a subnet block still
+  covers the IP — lifting the IP alone used to leave the client blocked by its
+  /24 without a word
+- `--status` / `/status` — one line of subnet-block counts
+- `/block <cidr>` on an already-blocked subnet re-applies it with the new
+  duration instead of answering "already blocked"
+
+### Config
+
+```ini
+[cidr]
+reblock_repeat_offenders = true
+```
+
+### Changed
+
+- `modules/blocker.py` — `cidr_blocks`-backed aggregation with the repeat-offender
+  trigger, `reap_expired_cidrs()`, `reconcile_cidrs()`, `unblock_cidr_manual()`,
+  covered-IP notes; the in-memory `_blocked_subnets` is gone
+- `modules/database.py`, `modules/migrator.py`, `migrations/013_cidr_blocks.sql` — schema 13
+- `backends/*.py` — `unblock_cidr()` everywhere, `list_cidr_entries()` on firewalld
+- `modules/verbosity.py` — `cidr_reoffend`
+- `actions/telegram_commands.py` — `/unblock <cidr>`, `/cidrs`, notes, `/status`
+- `wp-guardian.py` — reaper tick, startup reconcile, `--status`, `--unblock <cidr>`
+- `wp-guardian.conf.example`, `backends/README.md`
+- tests: `test_cidr_db_migration.py`, `test_cidr_lifecycle.py`,
+  `test_cidr_reconcile.py`, `test_cidr_commands.py`, `test_cidr_backends.py`,
+  `fakes_cidr.py`
+
 ## v1.7.18 — a redirect was a login, and a firewall outage was a silent dry run (2026-10-08)
 
 An external code audit, checked against the code and then measured on the

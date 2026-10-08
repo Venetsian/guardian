@@ -217,6 +217,16 @@ class MikroTikBackend(FirewallBackend):
             logger.error(f"MikroTik CIDR BLOCK FAILED for {subnet}")
             return False
 
+    def unblock_cidr(self, subnet):
+        """Remove a CIDR subnet from the CIDR address list."""
+        result = self._ssh_command(
+            f'/ip firewall address-list remove [find where list="{self.list_cidr}" address="{subnet}"]'
+        )
+        if result is not None:
+            logger.info(f"MikroTik CIDR UNBLOCKED {subnet}")
+            return True
+        return False
+
     def is_cidr_blocked(self, subnet):
         """Check if a CIDR subnet is already in the CIDR block list."""
         result = self._ssh_command(

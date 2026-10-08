@@ -227,6 +227,25 @@ class NftablesBackend(FirewallBackend):
         logger.info(f"nftables CIDR BLOCKED {subnet} reason={reason}{torn_note}")
         return True
 
+    def unblock_cidr(self, subnet):
+        """Remove a CIDR subnet from the blocked nets set."""
+        success, stdout, stderr = self._run_nft([
+            'delete', 'element', 'inet', NFT_TABLE, NFT_SET_CIDR,
+            '{{ {} }}'.format(subnet)
+        ])
+
+        if success:
+            logger.info(f"nftables CIDR UNBLOCKED {subnet}")
+            return True
+
+        combined = (stdout + stderr).lower()
+        if 'no such' in combined or 'not found' in combined:
+            logger.debug(f"nftables: {subnet} was not in the CIDR set")
+            return True
+
+        logger.error(f"nftables CIDR unblock failed for {subnet}: {stderr}")
+        return False
+
     def is_cidr_blocked(self, subnet):
         """Check if CIDR is in the blocked nets set."""
         success, stdout, stderr = self._run_nft([

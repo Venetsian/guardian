@@ -321,6 +321,26 @@ class PfSenseBackend(FirewallBackend):
         logger.error(f"{self.platform} CIDR block failed for {subnet}")
         return False
 
+    def unblock_cidr(self, subnet):
+        """Remove a CIDR subnet from the CIDR alias."""
+        tracked = subnet in self._blocked_cidrs
+        success = self._remove_from_alias(self.alias_cidr, subnet)
+
+        if success:
+            self._blocked_cidrs.discard(subnet)
+            logger.info(f"{self.platform} CIDR UNBLOCKED {subnet}")
+            return True
+
+        # The API errors on an entry that is not in the alias. Removal must be
+        # idempotent (the reaper retries until it succeeds), so an entry we
+        # have no record of in the alias counts as already gone.
+        if not tracked:
+            logger.debug(f"{self.platform}: {subnet} was not in the CIDR alias")
+            return True
+
+        logger.error(f"{self.platform} CIDR unblock failed for {subnet}")
+        return False
+
     def is_cidr_blocked(self, subnet):
         """Check if CIDR is blocked."""
         return subnet in self._blocked_cidrs

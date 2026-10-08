@@ -20,6 +20,9 @@ Strategy (v1.7.4+):
     this contract was documented here but never implemented, which made
     every "24h" block on firewalld permanent — if you disable
     ``[escalation] reap_enabled``, that is the behavior you get back.
+    The same goes for the /24 set: ``block_cidr()`` ignores its duration, and
+    ``Blocker.reap_expired_cidrs()`` (v1.7.19) calls ``unblock_cidr()`` when
+    the ``cidr_blocks`` record falls due.
 
 Operators upgrading from the pre-v1.7.4 rich-rule implementation should
 run ``python3 tools/migrate_firewalld_to_ipset.py`` once after the
@@ -252,9 +255,33 @@ class FirewalldBackend(FirewallBackend):
             logger.info(f"firewalld CIDR BLOCKED {subnet} reason={reason}{torn_note}")
         return ok
 
+    def unblock_cidr(self, subnet):
+        """Remove a CIDR subnet from wp_guardian_cidr (idempotent)."""
+        ok = self._remove_entry(IPSET_CIDR, subnet)
+        if ok:
+            logger.info(f"firewalld CIDR UNBLOCKED {subnet}")
+        return ok
+
     def is_cidr_blocked(self, subnet):
         """Check whether subnet is in wp_guardian_cidr."""
         return self._query_entry(IPSET_CIDR, subnet)
+
+    def list_cidr_entries(self):
+        """The subnets in wp_guardian_cidr, from the permanent config.
+
+        Permanent, not runtime: that is what survives a reboot, so it is the
+        durable truth the database is reconciled against. An empty set is a
+        valid answer (empty set); a failed query raises, because "could not
+        ask" must never read as "nothing is blocked".
+        """
+        success, stdout, stderr = self._run_cmd([
+            '--permanent', '--ipset={}'.format(IPSET_CIDR), '--get-entries'
+        ])
+        if not success:
+            raise RuntimeError(
+                "firewall-cmd could not list {}: {}".format(IPSET_CIDR, stderr or 'no output')
+            )
+        return set(stdout.split())
 
     def get_block_counts(self):
         """Count entries in the two ipsets."""

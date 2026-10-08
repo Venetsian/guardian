@@ -172,6 +172,10 @@ enabled = true
 threshold = 5
 # Duration for CIDR blocks (30d recommended, 'permanent' for aggressive mode)
 duration = 30d
+# Re-block a released subnet for another `duration` as soon as any IP in it is
+# blocked again (no threshold): it already earned one subnet block. An
+# operator /unblock <cidr> clears this memory, the same as /unblock <ip>.
+reblock_repeat_offenders = true
 
 [firewall]
 # Which firewall backend to use:

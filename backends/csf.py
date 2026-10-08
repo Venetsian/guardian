@@ -155,34 +155,46 @@ class CSFBackend(FirewallBackend):
         logger.error(f"CSF block failed for {ip}: {stderr}")
         return False
 
-    def unblock(self, ip):
-        """Remove an IP from CSF deny lists."""
+    def _remove_deny(self, target):
+        """Remove an IP or CIDR from both CSF deny lists. True if it is gone."""
         unblocked = False
 
         # Remove permanent deny
-        success, stdout, stderr = self._run_csf(['-dr', ip])
+        success, stdout, stderr = self._run_csf(['-dr', target])
         if success:
             unblocked = True
 
         # Remove temp deny
-        success, stdout, stderr = self._run_csf(['-tr', ip])
+        success, stdout, stderr = self._run_csf(['-tr', target])
         if success:
             unblocked = True
 
         # Both removals fail when there is nothing to remove — typically a temp
         # ban that already expired. Unblock is idempotent on every backend, and
         # Blocker.unblock() trusts this result, so confirm with `csf -g` that
-        # the IP really is gone (a csf that cannot run at all still fails).
+        # the target really is gone (a csf that cannot run at all still fails).
         if not unblocked:
-            success, stdout, stderr = self._run_csf(['-g', ip])
+            success, stdout, stderr = self._run_csf(['-g', target])
             if success and not any(
                 'deny' in line.lower() or 'Block' in line
                 for line in stdout.split('\n')
             ):
                 unblocked = True
 
+        return unblocked
+
+    def unblock(self, ip):
+        """Remove an IP from CSF deny lists."""
+        unblocked = self._remove_deny(ip)
         if unblocked:
             logger.info(f"CSF UNBLOCKED {ip}")
+        return unblocked
+
+    def unblock_cidr(self, subnet):
+        """Remove a CIDR subnet from CSF deny lists."""
+        unblocked = self._remove_deny(subnet)
+        if unblocked:
+            logger.info(f"CSF CIDR UNBLOCKED {subnet}")
         return unblocked
 
     def is_blocked(self, ip):

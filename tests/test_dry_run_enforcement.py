@@ -211,7 +211,9 @@ class TestMigration012(unittest.TestCase):
         self._poison('192.0.2.31', 'dry-run', tier=1)       # dry run, then real
         self._poison('192.0.2.31', 'firewalld', tier=2)
 
-        self.assertEqual(self._run_migration(), 1)
+        # 012, plus every newer migration (013 in v1.7.19): the runner applies
+        # all that are pending after the rolled-back stamp.
+        self.assertGreaterEqual(self._run_migration(), 1)
 
         self.assertEqual(self.fx.tier('192.0.2.10'), 0)
         self.assertEqual(self.fx.tier('192.0.2.11'), 0)
@@ -274,7 +276,7 @@ class TestMigration012(unittest.TestCase):
 
     def test_schema_version_matches_the_newest_migration_file(self):
         newest = max(v for v, _, _ in migrator._discover_migrations(MIGRATIONS_DIR))
-        self.assertEqual(newest, 12)
+        self.assertEqual(newest, 13)
         self.assertEqual(migrator.CURRENT_SCHEMA_VERSION, newest)
         self.assertEqual(self.db.get_schema_version(), newest,
                          "a fresh database is stamped current")

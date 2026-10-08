@@ -527,10 +527,29 @@ class Guardian:
         fw.ensure_firewall_rules()
         if getattr(fw, 'supports_friendly_list', False):
             fw.refresh_friendly_list()
+        # Subnet-block records are reconciled against the backend before the
+        # blocker can see it, so no block can write a row ahead of the import.
+        self._reconcile_cidrs(fw)
         self.firewall = fw
         self.whitelist.firewall = fw
         self.telegram_cmd.firewall = fw
         self.blocker.firewall = fw
+
+    def _reconcile_cidrs(self, fw):
+        """Bring the subnet-block records in line with the backend (v1.7.19).
+
+        Imports blocked.log on the first run after the upgrade and, on a
+        backend that lists its CIDR entries, adopts strays and re-applies
+        missing ones. Never raises: a failure here must not stop startup or a
+        backend recovery.
+        """
+        if not getattr(fw, 'supports_cidr', False):
+            return
+        try:
+            self.blocker.reconcile_cidrs(os.path.join(self.base_dir, 'logs'),
+                                         firewall=fw)
+        except Exception as e:
+            self.logger.error(f"CIDR reconcile failed: {e}")
 
     def _retry_firewall(self):
         """One attempt to bring the backend up. Backs off 60s -> 600s.
@@ -597,6 +616,12 @@ class Guardian:
         # Signal handlers
         signal.signal(signal.SIGTERM, self._shutdown)
         signal.signal(signal.SIGINT, self._shutdown)
+
+        # Subnet-block records first (v1.7.19): the import only runs on an
+        # empty table, so it must finish before a tailer can block anything.
+        # A backend that is down is reconciled by _attach_firewall() instead.
+        if self.firewall is not None:
+            self._reconcile_cidrs(self.firewall)
 
         # Start web log tailing
         web_logs = self._load_web_logs()
@@ -745,6 +770,13 @@ class Guardian:
                                 )
                         except Exception as e:
                             self.logger.error(f"Block reaper error: {e}")
+
+                        # Same for subnet blocks (v1.7.19). Not gated on
+                        # [cidr] enabled: blocks that exist must still end.
+                        try:
+                            self.blocker.reap_expired_cidrs()
+                        except Exception as e:
+                            self.logger.error(f"CIDR reaper error: {e}")
 
                     # Restore mailboxes whose provisional compromise disable
                     # expired unconfirmed (v1.7.11). Bounds the outage from a
@@ -1357,6 +1389,7 @@ class Guardian:
         print(f"  Active Tier 1:      {stats['active_tier1']}")
         print(f"  Active Tier 2:      {stats['active_tier2']}")
         print(f"  Active Tier 3:      {stats['active_tier3']}")
+        print("  " + self.blocker.cidr_status_line(fw_counts.get('cidr') if fw_counts else None))
         print(f"  Whitelist entries:  {stats['whitelist_count']}")
         print(f"  Tripwires:          {stats['tripwire_count']}")
         print(f"  Auth sessions today: {stats['auth_sessions_today']}")
@@ -1383,7 +1416,8 @@ def main():
     parser.add_argument('--whitelist-add', metavar='IP', help='Add IP to whitelist')
     parser.add_argument('--whitelist-remove', metavar='IP', help='Remove IP from whitelist')
     parser.add_argument('--whitelist-list', action='store_true', help='List all whitelist entries')
-    parser.add_argument('--unblock', metavar='IP', help='Unblock an IP from all systems')
+    parser.add_argument('--unblock', metavar='IP|CIDR',
+                        help='Unblock an IP from all systems, or lift a subnet block (192.0.2.0/24)')
     parser.add_argument('--block', metavar='TARGET',
                         help='Manually block an IP or CIDR (use --duration to set length; default permanent)')
     parser.add_argument('--duration', metavar='DUR', default=None,
@@ -1737,15 +1771,28 @@ def main():
         return
 
     if args.unblock:
+        if '/' in args.unblock:
+            # A subnet block: its own record, backend call and message.
+            ok, msg = guardian.blocker.unblock_cidr_manual(args.unblock, actor='cli')
+            print(msg)
+            if not ok:
+                sys.exit(1)
+            return
+        # Lifting the per-IP block does not lift a subnet block over it.
+        note = guardian.blocker.cidr_cover_note(args.unblock)
         if guardian.blocker.unblock(args.unblock):
             if guardian.blocker.dry_run:
                 print(f"[DRY-RUN] Would unblock {args.unblock} (nothing changed)")
             else:
                 print(f"Unblocked {args.unblock}")
+            if note:
+                print(note)
             return
         print(f"FAILED to unblock {args.unblock}: the firewall backend is "
               f"unavailable or refused. Block state left unchanged "
               f"(see the log).")
+        if note:
+            print(note)
         sys.exit(1)
 
     if args.reap_blocks:

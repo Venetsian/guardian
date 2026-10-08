@@ -23,7 +23,7 @@ WP-Guardian monitors web, SMTP, IMAP/POP3, and SSH logs, automatically blocks at
 - **Three-tier escalation** — 24h block, 30d block, permanent ban with automatic tier advancement. An hourly reaper (v1.7.9+) actually enforces those durations: tier-1/tier-2 blocks are released when they expire and the tier is reset so repeat offenders still escalate, while tier 3 stays permanent. Clearing a false positive with `--unblock` resets the escalation ladder rather than arming the next rung
 - **Cloud mail relay protection (v1.7.9+)** — IPs in a trusted ASN (Microsoft 365, Google Workspace, iCloud) are never firewall-dropped for mail rules or compromise handling. New Outlook syncs IMAP through Microsoft's cloud, so blocking a relay cuts off the legitimate client and stops no attacker — and per-IP whitelisting doesn't hold because those relays rotate. Scoped to mail services, so an Azure VM in the same ASN scanning `wp-login.php` is still blocked
 - **No self-inflicted lockouts (v1.7.9+)** — when Guardian disables a mailbox after a compromise event, the owner's mail client turns into a failed-auth generator on every retry. Those failures no longer feed the brute-force ladder, provided the IP is a known client of that account
-- **CIDR /24 aggregation** — auto-blocks entire subnets when coordinated scanning is detected
+- **CIDR /24 aggregation** — auto-blocks entire subnets when coordinated scanning is detected. Since v1.7.19 every subnet block is recorded and released when its duration ends (`/cidrs` lists them), and a released /24 is a **repeat offender**: the next blocked IP inside it re-blocks the whole range for another `duration`, no threshold needed (`[cidr] reblock_repeat_offenders`; `/unblock <cidr>` clears that memory)
 - **Authenticated user protection** — any successful login (WordPress, IMAP, POP3, SMTP, SSH) grants the IP a 24h grace period across all detectors, so a mail client with a wrong outgoing password can't get its working IMAP connection cut off. A WordPress login counts only once the client loads a logged-in admin page (v1.7.18) — a `wp-login.php` redirect alone can be produced without a password
 - **Telegram alerts** — real-time notifications for every block, with per-rule routing (v1.4.1+): mute noisy rules like `php_scan` / `general_404` / `author_enum`, digest others hourly, keep auth and compromise rules loud. Tune live via `/verbosity <rule> <level>` from chat — `compromise`, `cidr`, and `block_failed` are always-immediate and cannot be muted by accident
 - **Telegram commands** — manage blocks, whitelists, and compromise events remotely via Telegram chat (`/status`, `/block`, `/unblock`, `/whitelist`, `/history`, `/authmap`, `/suspects`, `/disable`, `/enable`, `/compromises`, `/resolve`, `/confirm`)
@@ -121,6 +121,7 @@ python3 wp-guardian.py --block 1.2.3.4 --duration 24h  # block for 24h (tier 1)
 python3 wp-guardian.py --block 1.2.3.0/24            # block a whole /24 (permanent)
 python3 wp-guardian.py --block 1.2.3.0/24 --duration 30d
 python3 wp-guardian.py --unblock 1.2.3.4            # remove block + reset escalation
+python3 wp-guardian.py --unblock 192.0.2.0/24       # lift a subnet block, clear its repeat-offender memory (v1.7.19)
 
 # Block expiry (v1.7.9+) — normally automatic on the hourly loop
 python3 wp-guardian.py --reap-blocks --dry-run       # preview what's overdue
@@ -156,7 +157,8 @@ When `commands_enabled = true` in your `[telegram]` config, WP-Guardian polls fo
 ```
 /status                      — block counts, IPs tracked, auth sessions, tripwires
 /block <ip|cidr> [duration]  — manually block (default: permanent; e.g. 24h, 30d)
-/unblock <ip>                — remove block and reset tier
+/unblock <ip|cidr>           — remove block and reset tier, or lift a subnet block (v1.7.19)
+/cidrs                       — (v1.7.19) active subnet blocks, soonest expiry first, repeat-offender watch
 /whitelist <ip>              — add permanently
 /whitelist <ip> <duration>   — add temporarily (24h, 7d, 30d)
 /whitelist remove <ip>       — remove from whitelist

@@ -7,6 +7,7 @@ import sqlite3
 import time
 import os
 import json
+import ipaddress
 import logging
 
 logger = logging.getLogger('wp-guardian.db')
@@ -228,6 +229,25 @@ class GuardianDB:
                 ON outbound_activity(username, timestamp);
             CREATE INDEX IF NOT EXISTS idx_outbound_time
                 ON outbound_activity(timestamp);
+
+            CREATE TABLE IF NOT EXISTS cidr_blocks (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                subnet      TEXT NOT NULL,
+                blocked_at  INTEGER NOT NULL,
+                expires_at  INTEGER NOT NULL DEFAULT 0,
+                duration    TEXT NOT NULL,
+                source      TEXT NOT NULL,
+                status      TEXT NOT NULL DEFAULT 'active',
+                ended_at    INTEGER DEFAULT 0,
+                reason      TEXT DEFAULT '',
+                service     TEXT DEFAULT '',
+                backend     TEXT DEFAULT ''
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_cidr_blocks_subnet
+                ON cidr_blocks(subnet);
+            CREATE INDEX IF NOT EXISTS idx_cidr_blocks_status_expires
+                ON cidr_blocks(status, expires_at);
         """)
 
         self.conn.commit()
@@ -488,6 +508,207 @@ class GuardianDB:
             "UPDATE ip_history SET current_tier = 0 WHERE ip = ?", (ip,)
         )
         self.conn.commit()
+
+    # ------------------------------------------------------------------
+    # CIDR block records (v1.7.19)
+    # ------------------------------------------------------------------
+    # One row per subnet block. status: 'active' (enforced, or overdue and
+    # waiting for the reaper), 'expired' (its duration ran out: a repeat-
+    # offender candidate) or 'removed' (an operator lifted it: never re-blocked
+    # on sight). expires_at = 0 is permanent.
+    def insert_cidr_block(self, subnet, expires_at, duration, source, reason='',
+                          service='', backend='', blocked_at=None,
+                          status='active', ended_at=0, commit=True):
+        """Record a subnet block and return its row id.
+
+        There is at most one 'active' row per subnet, and SQLite 3.7 has no
+        partial unique index to say so, so it is enforced here: inserting an
+        active row first retires any active row the subnet already has.
+        Callers that care how the old row ends (manual re-apply) end it
+        themselves before calling.
+        """
+        now = int(time.time())
+        if blocked_at is None:
+            blocked_at = now
+        if status == 'active':
+            self._end_active_cidr_rows(subnet, now)
+        cursor = self.conn.execute("""
+            INSERT INTO cidr_blocks
+                (subnet, blocked_at, expires_at, duration, source, status,
+                 ended_at, reason, service, backend)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (subnet, int(blocked_at), int(expires_at), duration, source, status,
+              int(ended_at), reason or '', service or '', backend or ''))
+        if commit:
+            self.conn.commit()
+        return cursor.lastrowid
+
+    def _end_active_cidr_rows(self, subnet, now):
+        """Retire a subnet's active rows. Overdue ones ended by their own
+        duration ('expired'), the rest were replaced ('removed')."""
+        rows = self.conn.execute(
+            "SELECT id, expires_at FROM cidr_blocks "
+            "WHERE subnet = ? AND status = 'active'", (subnet,)
+        ).fetchall()
+        for row in rows:
+            if 0 < row['expires_at'] <= now:
+                status, ended = 'expired', row['expires_at']
+            else:
+                status, ended = 'removed', now
+            self.conn.execute(
+                "UPDATE cidr_blocks SET status = ?, ended_at = ? WHERE id = ?",
+                (status, ended, row['id'])
+            )
+
+    def get_cidr_block(self, subnet):
+        """The active row for exactly this subnet, overdue or not."""
+        return self.conn.execute(
+            "SELECT * FROM cidr_blocks WHERE subnet = ? AND status = 'active' "
+            "ORDER BY id DESC LIMIT 1", (subnet,)
+        ).fetchone()
+
+    def get_latest_cidr_record(self, subnet):
+        """The newest row for exactly this subnet, whatever its status."""
+        return self.conn.execute(
+            "SELECT * FROM cidr_blocks WHERE subnet = ? ORDER BY id DESC LIMIT 1",
+            (subnet,)
+        ).fetchone()
+
+    def get_cidr_block_by_id(self, block_id):
+        return self.conn.execute(
+            "SELECT * FROM cidr_blocks WHERE id = ?", (block_id,)
+        ).fetchone()
+
+    def get_live_cidr_block(self, subnet, now=None):
+        """The active row for exactly this subnet that is not past expiry."""
+        now = int(time.time()) if now is None else int(now)
+        return self.conn.execute(
+            "SELECT * FROM cidr_blocks WHERE subnet = ? AND status = 'active' "
+            "AND (expires_at = 0 OR expires_at > ?) ORDER BY id DESC LIMIT 1",
+            (subnet, now)
+        ).fetchone()
+
+    def get_active_cidr_covering(self, ip, now=None, include_overdue=False):
+        """The active row whose range contains this IPv4, or None.
+
+        Auto blocks are /24s, so the exact /24 is one indexed lookup. Manual
+        blocks can be anything from /16 to /32, so the few active rows that are
+        not /24s are scanned and tested for real containment. include_overdue
+        also accepts rows past their expiry (a backend that cannot expire its
+        own entries is still dropping the range until the reaper gets there).
+        """
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            return None
+        if not isinstance(addr, ipaddress.IPv4Address):
+            return None
+        now = int(time.time()) if now is None else int(now)
+        live = "" if include_overdue else " AND (expires_at = 0 OR expires_at > ?)"
+        live_args = () if include_overdue else (now,)
+
+        octets = str(addr).split('.')
+        exact = '.'.join(octets[:3]) + '.0/24'
+        row = self.conn.execute(
+            "SELECT * FROM cidr_blocks WHERE subnet = ? AND status = 'active'"
+            + live + " ORDER BY id DESC LIMIT 1", (exact,) + live_args
+        ).fetchone()
+        if row:
+            return row
+
+        rows = self.conn.execute(
+            "SELECT * FROM cidr_blocks WHERE status = 'active' "
+            "AND subnet NOT LIKE '%/24'" + live + " ORDER BY id", live_args
+        ).fetchall()
+        for row in rows:
+            try:
+                if addr in ipaddress.ip_network(row['subnet'], strict=False):
+                    return row
+            except ValueError:
+                continue
+        return None
+
+    def get_overdue_cidr_blocks(self, now, limit):
+        """Active rows past their expiry, longest-overdue first (the reaper's queue)."""
+        return self.conn.execute(
+            "SELECT * FROM cidr_blocks WHERE status = 'active' "
+            "AND expires_at > 0 AND expires_at <= ? "
+            "ORDER BY expires_at ASC, id ASC LIMIT ?", (int(now), int(limit))
+        ).fetchall()
+
+    def count_overdue_cidr_blocks(self, now):
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM cidr_blocks WHERE status = 'active' "
+            "AND expires_at > 0 AND expires_at <= ?", (int(now),)
+        ).fetchone()[0]
+
+    def end_cidr_block(self, block_id, status, ended_at=None, commit=True):
+        """Close an active row as 'expired' or 'removed'. Returns rows changed
+        (0 when it was no longer active, so a lost race is harmless)."""
+        ended_at = int(time.time()) if ended_at is None else int(ended_at)
+        result = self.conn.execute(
+            "UPDATE cidr_blocks SET status = ?, ended_at = ? "
+            "WHERE id = ? AND status = 'active'", (status, ended_at, block_id)
+        )
+        if commit:
+            self.conn.commit()
+        return result.rowcount
+
+    def clear_cidr_memory(self, subnet):
+        """Forget that a subnet ever expired, so it is no longer a repeat-
+        offender candidate. The 'expired' rows become 'removed', the same as a
+        cleared false positive. Returns rows changed."""
+        result = self.conn.execute(
+            "UPDATE cidr_blocks SET status = 'removed', ended_at = ? "
+            "WHERE subnet = ? AND status = 'expired'", (int(time.time()), subnet)
+        )
+        self.conn.commit()
+        return result.rowcount
+
+    def get_expired_cidr(self, subnet):
+        """The most recent 'expired' row for a subnet (repeat-offender lookup)."""
+        return self.conn.execute(
+            "SELECT * FROM cidr_blocks WHERE subnet = ? AND status = 'expired' "
+            "ORDER BY ended_at DESC, id DESC LIMIT 1", (subnet,)
+        ).fetchone()
+
+    def cidr_table_empty(self):
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM cidr_blocks").fetchone()[0] == 0
+
+    def cidr_counts(self, now=None):
+        """{'active', 'permanent', 'overdue', 'watch'} for --status and /cidrs.
+
+        active counts every active row, overdue ones included. watch is the
+        number of subnets on repeat-offender probation: expired, with no
+        active row now.
+        """
+        now = int(time.time()) if now is None else int(now)
+        q = self.conn.execute
+        return {
+            'active': q("SELECT COUNT(*) FROM cidr_blocks "
+                        "WHERE status = 'active'").fetchone()[0],
+            'permanent': q("SELECT COUNT(*) FROM cidr_blocks WHERE status = 'active' "
+                           "AND expires_at = 0").fetchone()[0],
+            'overdue': self.count_overdue_cidr_blocks(now),
+            'watch': q(
+                "SELECT COUNT(DISTINCT e.subnet) FROM cidr_blocks e "
+                "WHERE e.status = 'expired' AND NOT EXISTS ("
+                "SELECT 1 FROM cidr_blocks a "
+                "WHERE a.subnet = e.subnet AND a.status = 'active')"
+            ).fetchone()[0],
+        }
+
+    def list_active_cidr_blocks(self, limit=None, now=None, include_overdue=True):
+        """Active rows, soonest-expiring first and permanent ones last."""
+        now = int(time.time()) if now is None else int(now)
+        live = "" if include_overdue else " AND (expires_at = 0 OR expires_at > ?)"
+        args = () if include_overdue else (now,)
+        return self.conn.execute(
+            "SELECT * FROM cidr_blocks WHERE status = 'active'" + live
+            + " ORDER BY (expires_at = 0), expires_at ASC, id ASC LIMIT ?",
+            args + (-1 if limit is None else int(limit),)
+        ).fetchall()
 
     # ------------------------------------------------------------------
     # Authenticated Sessions
